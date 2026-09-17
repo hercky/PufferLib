@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -127,6 +128,9 @@ typedef struct FishAgent {
     bool emits_eod;
     bool bite_action;
     bool was_bitten;
+    bool ate;         // trace only: ate a pellet this step
+    bool collided;    // trace only: move reverted by a fish collision this step
+    int bite_victim;  // trace only: index of fish bitten this step, -1 if none
     bool has_previous_food_distance;
     float previous_food_distance;
     float last_action[ACTION_SIZE];
@@ -218,6 +222,19 @@ struct Log {
     float n;
 };
 
+// Optional trajectory export for offline analysis. When the WEF_TRACE_DIR env var
+// is set, every env appends one WefTraceRow per (step, fish) to
+// $WEF_TRACE_DIR/env_<id>.bin. Unset → no I/O, and no effect on dynamics or RNG.
+// All fields are 4 bytes so the file loads as a flat numpy structured array.
+typedef struct WefTraceRow {
+    int32_t env_id, episode, tick, agent;
+    float x, y, orientation, size;
+    float move, turn;
+    int32_t eod, bite, bite_victim, was_bitten, ate, collided;
+    float reward, nearest_food, arena_x, arena_y;
+    int32_t food_left;
+} WefTraceRow;
+
 typedef struct Trace {
     Vec2 pos[TRACE_LENGTH];
     int index;
@@ -280,6 +297,9 @@ struct Env {
     float episode_return;
     float amp_intrinsic_baseline[NUM_AMPULLARY];
     Client* client;
+    int env_id;
+    int episode;
+    FILE* trace_file;
 };
 typedef Env Wef;
 
@@ -740,10 +760,36 @@ void puf_reset(Wef* env) {
     compute_observations(env);
 }
 
+void wef_trace_step(Wef* env) {
+    WefTraceRow rows[MAX_AGENTS];
+    for (int i = 0; i < env->num_agents; i++) {
+        FishAgent* agent = &env->fish[i];
+        rows[i] = (WefTraceRow){
+            .env_id = env->env_id, .episode = env->episode,
+            .tick = env->tick, .agent = i,
+            .x = agent->pos.x, .y = agent->pos.y,
+            .orientation = agent->orientation, .size = agent->size,
+            .move = agent->last_action[0], .turn = agent->last_action[1],
+            .eod = agent->emits_eod, .bite = agent->bite_action,
+            .bite_victim = agent->bite_victim, .was_bitten = agent->was_bitten,
+            .ate = agent->ate, .collided = agent->collided,
+            .reward = env->agents[i].rewards[0],
+            .nearest_food = agent->has_previous_food_distance
+                ? agent->previous_food_distance : -1.0f,
+            .arena_x = env->arena_size_x, .arena_y = env->arena_size_y,
+            .food_left = env->num_food - env->food_eaten,
+        };
+    }
+    fwrite(rows, sizeof(WefTraceRow), env->num_agents, env->trace_file);
+}
+
 void puf_step(Wef* env) {
     env->tick++;
     for (int i = 0; i < env->num_agents; i++) {
         env->fish[i].was_bitten = false;
+        env->fish[i].ate = false;
+        env->fish[i].collided = false;
+        env->fish[i].bite_victim = -1;
         env->agents[i].rewards[0] = 0.0f;
         env->agents[i].terminals[0] = 0.0f;
     }
@@ -786,6 +832,7 @@ void puf_step(Wef* env) {
                 env->food[f].active = false;
                 env->food_eaten++;
                 agent->eat_cooldown = EAT_COOLDOWN_STEPS;
+                agent->ate = true;
                 env->agents[i].rewards[0] += EAT_REWARD;
                 break;
             }
@@ -833,6 +880,7 @@ void puf_step(Wef* env) {
         float s = sinf(prev_ori);
         // rotate ground displacement into ego frame (angle -prev_ori)
         agent->disp_ego = (Vec2){c * gx + s * gy, -s * gx + c * gy};
+        agent->collided = collided;
         env->collisions_fish += collided ? 1 : 0;
         if (collided) {
             env->agents[i].rewards[0] += COLLISION_REWARD;
@@ -890,6 +938,7 @@ void puf_step(Wef* env) {
         }
         if (victim >= 0) {
             env->fish[victim].was_bitten = true;
+            attacker->bite_victim = victim;
             env->bites++;
             // Reference: is_bitten * (1 + size_diff), size_diff ∈ [-1, 1] → factor ∈ [0, 2]
             float size_difference = attacker->size - env->fish[victim].size;
@@ -904,9 +953,17 @@ void puf_step(Wef* env) {
         env->episode_return += env->agents[i].rewards[0];
     }
 
+    if (env->trace_file != NULL) {
+        wef_trace_step(env);
+    }
+
     compute_observations(env);
 
     if (env->tick >= env->episode_length || env->food_eaten == env->num_food) {
+        env->episode++;
+        if (env->trace_file != NULL) {
+            fflush(env->trace_file);
+        }
         env->log.episode_length += (float)env->tick;
         env->log.episode_return += env->episode_return;
         env->log.score += env->episode_return;
@@ -1253,6 +1310,10 @@ void puf_render(Wef* env) {
 }
 
 void puf_close(Wef* env) {
+    if (env->trace_file != NULL) {
+        fclose(env->trace_file);
+        env->trace_file = NULL;
+    }
     if (env->client) {
         if (IsWindowReady()) {
             CloseWindow();
@@ -1279,6 +1340,15 @@ void puf_init(Env* env, Dict* kwargs) {
     env->electric_field_radius_cm = dict_get(kwargs, "electric_field_radius");
     env->reflection_wall_range_cm = dict_get(kwargs, "reflection_wall_range");
     env->episode_length = dict_get(kwargs, "episode_length");
+    // The trainer seeds env->rng with the env index before puf_init.
+    env->env_id = (int)env->rng;
+    const char* trace_dir = getenv("WEF_TRACE_DIR");
+    if (trace_dir != NULL && trace_dir[0] != '\0') {
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/env_%05d.bin", trace_dir, env->env_id);
+        env->trace_file = fopen(path, "wb");
+        assert(env->trace_file != NULL && "WEF_TRACE_DIR must be an existing, writable dir");
+    }
     for (int i = 0; i < env->num_agents; i++) {
         env->agents[i].policy = 0;
         env->agents[i].action_mask = NULL;
