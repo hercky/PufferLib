@@ -1739,6 +1739,7 @@ void puf_render(Wef* env) {
         client->show_sensors = true;
         InitWindow(client->window_width, client->window_height, "Weakly Electric fish");
         SetTargetFPS(60);
+        HideCursor();
         env->client = client;
     }
     if (IsKeyDown(KEY_ESCAPE)) {
@@ -2007,15 +2008,23 @@ void puf_render(Wef* env) {
         env->tick, active_eods, env->num_agents),
         env->client->window_width - 285, 18, 18, WEF_COLOR_MIDGRAY);
     if (env->cleanup) {
-        DrawText(TextFormat("food %d active (%d eaten)  waste %d/%d  cleans %d",
-            env->food_active, env->food_eaten, env->waste_active, env->waste_max, env->cleans),
-            20, env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
+        // Longer status line: draw it right-aligned so it clears the field-radius text.
+        const char* status = TextFormat("food %d active (%d eaten)   waste %d/%d   cleans %d",
+            env->food_active, env->food_eaten, env->waste_active, env->waste_max, env->cleans);
+        DrawText(status, env->client->window_width - 70 - MeasureText(status, 18),
+            env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
+    } else if (env->regrow_p_max > 0.0f) {
+        const char* status = TextFormat("food %d active (%d eaten, %d regrown)",
+            env->food_active, env->food_eaten, env->regrown);
+        DrawText(status, env->client->window_width - 70 - MeasureText(status, 18),
+            env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
     } else {
         DrawText(TextFormat("food %d/%d", env->food_eaten, env->num_food),
             20, env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
     }
     DrawText(TextFormat("field radius %.0f cm", env->electric_field_radius_cm),
-        180, env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
+        env->cleanup || env->regrow_p_max > 0.0f ? 20 : 180,
+        env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
 
     if (env->client->show_field) {
         wef_draw_field_colorbar(
