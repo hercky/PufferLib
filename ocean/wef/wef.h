@@ -53,6 +53,7 @@ typedef float obs_t;
 #define BITING_RADIUS_CM 3.0f
 #define EATING_ANGLE (PI_F / 4.0f)
 #define MAX_PATCHES 90
+#define MAX_WASTE 64
 
 // Reward coefficients
 #define EAT_REWARD 1.0f
@@ -98,6 +99,7 @@ typedef float obs_t;
 #define WEF_COLOR_FISH_PULSE    ((Color){180, 150, 230, 140})
 #define WEF_COLOR_SENSOR        ((Color){184, 164, 224, 200})
 #define WEF_COLOR_FOOD          ((Color){0x7A, 0xEF, 0x9A, 200})  // lighter green
+#define WEF_COLOR_WASTE         ((Color){235, 150, 60, 220})     // inert debris (cleanup mode)
 #define WEF_COLOR_EOD_POS       ((Color){220, 60, 50, 255})
 #define WEF_COLOR_EOD_NEG       ((Color){60, 120, 255, 255})
 
@@ -131,6 +133,11 @@ typedef struct FishAgent {
     bool ate;         // trace only: ate a pellet this step
     bool collided;    // trace only: move reverted by a fish collision this step
     int bite_victim;  // trace only: index of fish bitten this step, -1 if none
+    int freeze;       // cleanup: steps left of the bitten timeout (0 unless bitten_freeze_steps > 0)
+    bool can_clean;   // cleanup: false for enforced free-riders (no_clean_agents)
+    int cleaned;      // trace only: waste items removed this step
+    float trace_nearest_food;  // trace only: nearest active pellet this step, -1 if none
+    int bot_dir;      // scripted roles: patrol direction (+1 / -1)
     bool has_previous_food_distance;
     float previous_food_distance;
     float last_action[ACTION_SIZE];
@@ -198,8 +205,15 @@ float conductor_scale(float radius_cm) {
         (4.0f / 3.0f) * PI_F * r * r * r;
 }
 
-// Caps: 2 EOD poles/agent; agent+food dipoles.
-enum { WEF_MAX_MONO = 2 * MAX_AGENTS, WEF_MAX_DIP = MAX_AGENTS + MAX_FOOD };
+// Same as conductor_scale with an explicit contrast (waste objects). Kept separate
+// so the baseline call sites and their constant folding are untouched.
+float conductor_scale_c(float radius_cm, float contrast) {
+    float r = radius_cm * CM_TO_M;
+    return 3.0f * EPSILON_0 * contrast * (4.0f / 3.0f) * PI_F * r * r * r;
+}
+
+// Caps: 2 EOD poles/agent; agent+food+waste dipoles.
+enum { WEF_MAX_MONO = 2 * MAX_AGENTS, WEF_MAX_DIP = MAX_AGENTS + MAX_FOOD + MAX_WASTE };
 
 // Electric sources for measure_field: position in meters, moments/charges SI.
 typedef struct { Vec2 p; float q; } Mono;
@@ -219,6 +233,21 @@ struct Log {
     float collisions_fish;
     float bites;
     float food_per_fish_area;
+    // Cleanup-mode metrics (docs/wef-cleanup-v0-design.md section 9). Per-episode means.
+    float collective_food;   // pellets eaten by all fish
+    float waste_frac;        // time-mean of waste_active / waste_max
+    float frac_open;         // fraction of steps with regrowth probability > 0
+    float cleans;            // waste items removed by fish (Hughes' public-good contribution)
+    float regrown;           // pellets spawned by regrowth
+    float equality;          // 1 - Gini of pellets eaten per fish
+    float clean_gini;        // Gini of cleaning contributions
+    float clean_max_share;   // largest single fish share of cleaning
+    float strip_frac;        // fraction of fish-steps spent in the waste strip
+    float bites_in_strip;
+    float freezes;
+    float policy_0_score;    // mean raw return of fish on policy 0 (match eval)
+    float policy_1_score;
+    float draw_rate;         // always 0; required by match eval
     float n;
 };
 
@@ -234,6 +263,25 @@ typedef struct WefTraceRow {
     float reward, nearest_food, arena_x, arena_y;
     int32_t food_left;
 } WefTraceRow;
+
+// Cleanup-mode trace row (file name env_<id>.v2.bin): WefTraceRow + cleanup state.
+typedef struct WefTraceRowV2 {
+    int32_t env_id, episode, tick, agent;
+    float x, y, orientation, size;
+    float move, turn;
+    int32_t eod, bite, bite_victim, was_bitten, ate, collided;
+    float reward, nearest_food, arena_x, arena_y;
+    int32_t food_left;
+    int32_t cleaned, waste_left, food_active, frozen, zone;  // zone: 0 mid, 1 strip, 2 orchard
+} WefTraceRowV2;
+
+// Object-event log for offline replay (env_<id>.obj.bin, written with the trace):
+// one row per pellet/waste state change. kind 0 pellet, 1 waste; event 0 present at
+// reset, 1 eaten/removed, 2 spawned/regrown.
+typedef struct WefObjEvent {
+    int32_t episode, tick, kind, index, event;
+    float x, y;
+} WefObjEvent;
 
 typedef struct Trace {
     Vec2 pos[TRACE_LENGTH];
@@ -257,6 +305,14 @@ typedef struct FishFood {
     Vec2 intrinsic_moment;
     Vec2 induced_moment;
 } FishFood;
+
+// Inert debris (cleanup mode): no intrinsic dipole (passively invisible), induced
+// dipole with its own radius/contrast so mormyromasts see it when emitting nearby.
+typedef struct Waste {
+    Vec2 pos;
+    bool active;
+    Vec2 induced_moment;
+} Waste;
 
 typedef enum FoodDistribution {
     FOOD_UNIFORM,
@@ -300,6 +356,64 @@ struct Env {
     int env_id;
     int episode;
     FILE* trace_file;
+    FILE* obj_file;
+    // --- Cleanup extension. Every field below is inert when cleanup == 0 and the
+    // other keys sit at their wef.ini defaults (docs/wef-cleanup-v0-design.md 10.3).
+    int cleanup;
+    float strip_cm;
+    float orchard_cm;
+    int spawn_band;
+    int waste_max;
+    int waste_start;
+    float waste_spawn_p;
+    int waste_spawn_delay;
+    float waste_theta;
+    float waste_radius_cm;
+    float waste_contrast;
+    float waste_sense_range_cm;
+    float regrow_p_max;
+    int regrow_mode;            // 0: waste-coupled (Cleanup), 1: density-dependent at the slot's position (Harvest)
+    float regrow_radius_cm;     // mode 1: neighbourhood radius for the density count
+    int food_start;
+    int clean_priority;
+    int clean_max_items;
+    int clean_cooldown_steps;
+    float clean_radius_cm;
+    float clean_reward;
+    float clean_reward_anneal_steps;
+    int bitten_freeze_steps;
+    float bitten_reward;
+    float bite_reward;
+    float eod_cost;
+    float reward_share;
+    float proximity_shaping;
+    int obs_extra;
+    float size_min;
+    float size_max;
+    int desync_first_episode;
+    int policy1_agents;
+    int no_clean_agents;
+    int first_episode_len;
+    int cur_episode_length;
+    int roles[MAX_AGENTS];      // scripted roles (eval only): 0 policy, 1 cleaner, 2 eater, 3 shift, 4 random
+    int bot_shift_steps;
+    int bot_oracle;             // 1: bots target items anywhere; 0: only within sensing range
+    Waste waste[MAX_WASTE];
+    int waste_active;
+    int food_active;
+    float regrow_q;             // cleanup: current regrowth multiplier (water quality)
+    int cleans;
+    int regrown;
+    int freezes;
+    int bites_in_strip;
+    int open_steps;
+    float waste_frac_sum;
+    float raw_return_sum;
+    int cleans_by[MAX_AGENTS];
+    int food_by[MAX_AGENTS];
+    int strip_steps_by[MAX_AGENTS];
+    int clean_pending[MAX_AGENTS];
+    float return_by[MAX_AGENTS];
 };
 typedef Env Wef;
 
@@ -308,19 +422,31 @@ float random_uniform(Wef* env, float low, float high) {
     return low + (high - low) * unit;
 }
 
+void wef_obj_event(Wef* env, int kind, int index, int event, Vec2 pos) {
+    if (env->obj_file == NULL) {
+        return;
+    }
+    WefObjEvent row = {env->episode, env->tick, kind, index, event, pos.x, pos.y};
+    fwrite(&row, sizeof(row), 1, env->obj_file);
+}
+
 // Probe in cm. Sources (Mono/Dipole.p) already meters.
 // Monos are always agent EODs → agent_range. Dipoles: first n_agent_dips are
-// agents, the rest food → agent_range / food_range (paper sensor cutoffs).
+// agents, the next n_food_dips food, the rest waste → agent_range / food_range /
+// waste_range (paper sensor cutoffs; waste only exists in cleanup mode).
 // wall_range_cm=0 → no image charges.
 Vec2 measure_field(Env* env, Vec2 probe_cm, const Mono* mono, int n_mono,
-    const Dipole* dip, int n_dip, int n_agent_dips,
-    float agent_range_cm, float food_range_cm, float wall_range_cm) {
+    const Dipole* dip, int n_dip, int n_agent_dips, int n_food_dips,
+    float agent_range_cm, float food_range_cm, float waste_range_cm,
+    float wall_range_cm) {
     float pmx = probe_cm.x * CM_TO_M;
     float pmy = probe_cm.y * CM_TO_M;
     float agent_r = agent_range_cm * CM_TO_M;
     float food_r = food_range_cm * CM_TO_M;
+    float waste_r = waste_range_cm * CM_TO_M;
     float agent_range2 = agent_r * agent_r;
     float food_range2 = food_r * food_r;
+    float waste_range2 = waste_r * waste_r;
     float eps_m = FIELD_EPS_M;
     float field_x = 0.0f;
     float field_y = 0.0f;
@@ -374,7 +500,8 @@ Vec2 measure_field(Env* env, Vec2 probe_cm, const Mono* mono, int n_mono,
     for (int i = 0; i < n_dip; i++) {
         float sx = dip[i].p.x;
         float sy = dip[i].p.y;
-        float range2 = (i < n_agent_dips) ? agent_range2 : food_range2;
+        float range2 = (i < n_agent_dips) ? agent_range2
+            : (i < n_agent_dips + n_food_dips) ? food_range2 : waste_range2;
         float dx = pmx - sx;
         float dy = pmy - sy;
         if (dx * dx + dy * dy > range2) {
@@ -469,8 +596,8 @@ void compute_observations(Wef* env) {
         if (!agent->emits_eod) {
             // Induced by nearby EODs (conspecific EOD → body, morm agent range).
             Vec2 f = measure_field(
-                env, agent->pos, eod, n_eod, NULL, 0, 0,
-                MORM_AGENT_RANGE_CM, MORM_FOOD_RANGE_CM, 0.0f
+                env, agent->pos, eod, n_eod, NULL, 0, 0, 0,
+                MORM_AGENT_RANGE_CM, MORM_FOOD_RANGE_CM, 0.0f, 0.0f
             );
             moment_x = f.x * body_scale;
             moment_y = f.y * body_scale;
@@ -496,14 +623,32 @@ void compute_observations(Wef* env) {
             fc * FOOD_INTRINSIC_MOMENT_C_M,
         };
         Vec2 f = measure_field(
-            env, env->food[i].pos, eod, n_eod, NULL, 0, 0,
-            MORM_AGENT_RANGE_CM, MORM_FOOD_RANGE_CM, 0.0f
+            env, env->food[i].pos, eod, n_eod, NULL, 0, 0, 0,
+            MORM_AGENT_RANGE_CM, MORM_FOOD_RANGE_CM, 0.0f, 0.0f
         );
         env->food[i].induced_moment = (Vec2){f.x * food_scale, f.y * food_scale};
     }
-    // Induced + intrinsic dipoles as AoS for measure_field
-    Dipole induced[MAX_AGENTS + MAX_FOOD];
-    Dipole intrinsic[MAX_AGENTS + MAX_FOOD];
+    // Waste (cleanup mode): induced dipole only, from nearby EODs.
+    if (env->cleanup) {
+        float waste_scale = conductor_scale_c(env->waste_radius_cm, env->waste_contrast);
+        // Both EOD poles of any fish whose sensors can reach the item must be in the
+        // inducing set, or the reading spikes at the sensing edge (one-pole field).
+        float mono_range = env->waste_sense_range_cm + BODY_RADIUS_CM + 2.0f * EOD_POLE_OFFSET_CM;
+        for (int i = 0; i < env->waste_max; i++) {
+            if (!env->waste[i].active) {
+                env->waste[i].induced_moment = (Vec2){0};
+                continue;
+            }
+            Vec2 f = measure_field(
+                env, env->waste[i].pos, eod, n_eod, NULL, 0, 0, 0,
+                mono_range, MORM_FOOD_RANGE_CM, 0.0f, 0.0f
+            );
+            env->waste[i].induced_moment = (Vec2){f.x * waste_scale, f.y * waste_scale};
+        }
+    }
+    // Induced + intrinsic dipoles as AoS for measure_field: [agents..., food..., waste...]
+    Dipole induced[WEF_MAX_DIP];
+    Dipole intrinsic[WEF_MAX_DIP];
     int n_induced = 0;
     int n_intrinsic = 0;
     for (int a = 0; a < env->num_agents; a++) {
@@ -525,10 +670,30 @@ void compute_observations(Wef* env) {
             to_m(env->food[f].pos), env->food[f].intrinsic_moment
         };
     }
+    int n_food_staged = n_induced - env->num_agents;
+    int n_waste_staged = 0;
+    if (env->cleanup) {
+        for (int w = 0; w < env->waste_max; w++) {
+            if (!env->waste[w].active) {
+                continue;
+            }
+            induced[n_induced++] = (Dipole){
+                to_m(env->waste[w].pos), env->waste[w].induced_moment
+            };
+            n_waste_staged++;
+        }
+    }
     for (int i = 0; i < env->num_agents; i++) {
         FishAgent* agent = &env->fish[i];
         obs_t* obs = env->agents[i].observations;
         int obs_idx = 0;
+        // Waste lives in the strip only: a fish farther than the sense range from
+        // it can skip the waste tail of the dipole list.
+        int n_dip_i = n_induced;
+        if (n_waste_staged > 0 && agent->pos.x >
+                env->strip_cm + env->waste_sense_range_cm + BODY_RADIUS_CM) {
+            n_dip_i = n_induced - n_waste_staged;
+        }
 
         bool cons_eod = false;
         for (int other = 0; other < env->num_agents; other++) {
@@ -541,8 +706,8 @@ void compute_observations(Wef* env) {
         for (int sensor_idx = 0; sensor_idx < NUM_MORMYROMASTS; sensor_idx++) {
             Sensor w = sensor_world(&g_morm[sensor_idx], agent);
             Vec2 f = measure_field(
-                env, w.p, NULL, 0, induced, n_induced, env->num_agents,
-                MORM_AGENT_RANGE_CM, MORM_FOOD_RANGE_CM,
+                env, w.p, NULL, 0, induced, n_dip_i, env->num_agents, n_food_staged,
+                MORM_AGENT_RANGE_CM, MORM_FOOD_RANGE_CM, env->waste_sense_range_cm,
                 env->reflection_wall_range_cm
             );
             float reading = f.x * w.n.x + f.y * w.n.y;
@@ -559,7 +724,8 @@ void compute_observations(Wef* env) {
             Sensor w = sensor_world(&g_amp[sensor_idx], agent);
             Vec2 f = measure_field(
                 env, w.p, NULL, 0, intrinsic, n_intrinsic, env->num_agents,
-                AMP_AGENT_RANGE_CM, AMP_FOOD_RANGE_CM,
+                n_intrinsic - env->num_agents,
+                AMP_AGENT_RANGE_CM, AMP_FOOD_RANGE_CM, 0.0f,
                 env->reflection_wall_range_cm
             );
             float noise = cons_eod ? 0.5f : 0.05f;
@@ -593,8 +759,8 @@ void compute_observations(Wef* env) {
                         },
                     };
                     Vec2 f = measure_field(
-                        env, w.p, eod, 2, NULL, 0, 0,
-                        KNOLLEN_AGENT_RANGE_CM, 0.0f, 0.0f
+                        env, w.p, eod, 2, NULL, 0, 0, 0,
+                        KNOLLEN_AGENT_RANGE_CM, 0.0f, 0.0f, 0.0f
                     );
                     float raw = (f.x * w.n.x + f.y * w.n.y) *
                         random_uniform(env, 0.95f, 1.05f);
@@ -625,23 +791,59 @@ void compute_observations(Wef* env) {
         for (int action_idx = 0; action_idx < ACTION_SIZE; action_idx++) {
             obs[obs_idx++] = agent->last_action[action_idx];
         }
-        obs[obs_idx++] = 0.0f;
+        // Slot 103: baseline constant 0; cleanup obs_extra 1 = global waste
+        // fraction ("water quality" cue), 2 = normalized x position.
+        float extra = 0.0f;
+        if (env->obs_extra == 1 && env->waste_max > 0) {
+            extra = (float)env->waste_active / (float)env->waste_max;
+        } else if (env->obs_extra == 2) {
+            extra = 2.0f * agent->pos.x / env->arena_size_x - 1.0f;
+        }
+        obs[obs_idx++] = extra;
         obs[obs_idx++] = agent->was_bitten ? 1.0f : 0.0f;
         obs[obs_idx++] = agent->size;
-        obs[obs_idx++] = (float)agent->bite_cooldown / (float)BITE_COOLDOWN_STEPS;
+        {
+            int cd_max = env->clean_cooldown_steps > BITE_COOLDOWN_STEPS
+                ? env->clean_cooldown_steps : BITE_COOLDOWN_STEPS;
+            obs[obs_idx++] = (float)agent->bite_cooldown / (float)cd_max;
+        }
         obs[obs_idx++] = clamp(
             agent->disp_ego.x / agent->max_linear_velocity, -1.0f, 1.0f);
         obs[obs_idx++] = clamp(
             agent->disp_ego.y / agent->max_linear_velocity, -1.0f, 1.0f);
-        obs[obs_idx++] = (float)agent->eat_cooldown / (float)EAT_COOLDOWN_STEPS;
+        obs[obs_idx++] = agent->freeze > 0 ? 1.0f
+            : (float)agent->eat_cooldown / (float)EAT_COOLDOWN_STEPS;
     }
+}
+
+// Cleanup mode: pellet `i` uniformly in the orchard band at the far wall.
+void wef_spawn_pellet(Wef* env, int i) {
+    env->food[i] = (FishFood){
+        .pos = {
+            random_uniform(env, env->arena_size_x - env->orchard_cm, env->arena_size_x),
+            random_uniform(env, 0.0f, env->arena_size_y),
+        },
+        .orientation = random_uniform(env, 0.0f, 2.0f * PI_F),
+        .active = true,
+    };
+}
+
+// Cleanup mode: waste item `i` uniformly in the strip along the x = 0 wall.
+void wef_spawn_waste(Wef* env, int i) {
+    env->waste[i] = (Waste){
+        .pos = {
+            random_uniform(env, 0.0f, env->strip_cm),
+            random_uniform(env, 0.0f, env->arena_size_y),
+        },
+        .active = true,
+    };
 }
 
 void puf_reset(Wef* env) {
     // Sample arena size from configured min/max
     env->arena_size_x = random_uniform(env, env->min_arena_size_x, env->max_arena_size_x);
     env->arena_size_y = random_uniform(env, env->min_arena_size_y, env->max_arena_size_y);
-    
+
     // Select food distribution mode; if random, choose uniform or patchy
     FoodDistribution mode = env->food_distribution;
     if (mode == FOOD_RANDOM) {
@@ -653,15 +855,39 @@ void puf_reset(Wef* env) {
     env->collisions_fish = 0;
     env->bites = 0;
     env->episode_return = 0.0f;
+    env->waste_active = 0;
+    env->food_active = 0;
+    env->cleans = 0;
+    env->regrown = 0;
+    env->freezes = 0;
+    env->bites_in_strip = 0;
+    env->open_steps = 0;
+    env->waste_frac_sum = 0.0f;
+    env->raw_return_sum = 0.0f;
+    for (int i = 0; i < MAX_AGENTS; i++) {
+        env->cleans_by[i] = 0;
+        env->food_by[i] = 0;
+        env->strip_steps_by[i] = 0;
+        env->clean_pending[i] = 0;
+        env->return_by[i] = 0.0f;
+    }
+    // Only the first episode of an env can be shortened (desync_first_episode).
+    env->cur_episode_length = env->episode == 0 ? env->first_episode_len : env->episode_length;
 
     // Spawn fish without body overlap; place sensors in local frame
+    float spawn_lo_x = 3.0f;
+    float spawn_hi_x = env->arena_size_x - 3.0f;
+    if (env->spawn_band) {
+        spawn_lo_x = env->strip_cm + 3.0f;
+        spawn_hi_x = env->arena_size_x - env->orchard_cm - 3.0f;
+    }
     for (int i = 0; i < env->num_agents; i++) {
         FishAgent agent = {0};
-        agent.size = random_uniform(env, 0.0f, 1.0f);
+        agent.size = random_uniform(env, env->size_min, env->size_max);
         Vec2 pos = {0};
         for (int attempts = 0; attempts < 1000; attempts++) {
             pos = (Vec2){
-                random_uniform(env, 3.0f, env->arena_size_x - 3.0f),
+                random_uniform(env, spawn_lo_x, spawn_hi_x),
                 random_uniform(env, 3.0f, env->arena_size_y - 3.0f),
             };
             bool overlap = false;
@@ -685,12 +911,34 @@ void puf_reset(Wef* env) {
         agent.max_linear_velocity = (MAX_LINEAR_VELOCITY_CM_S / SIMULATION_HZ) * size_mult;
         agent.max_angular_velocity = (MAX_ANGULAR_VELOCITY_RAD_S / SIMULATION_HZ) * size_mult;
         agent.emits_eod = true;
+        agent.bite_victim = -1;
+        agent.can_clean = i < env->num_agents - env->no_clean_agents;
         env->fish[i] = agent;
     }
 
     // Distribute food
     env->num_food = env->configured_num_food;
-    if (mode == FOOD_UNIFORM) {
+    if (env->cleanup) {
+        // Cleanup: food_start pellets in the orchard, the rest inactive slots that
+        // regrowth can fill; waste_start items in the strip.
+        int n_start = env->food_start < 0 ? env->num_food : env->food_start;
+        for (int i = 0; i < env->num_food; i++) {
+            if (i < n_start) {
+                wef_spawn_pellet(env, i);
+            } else {
+                env->food[i] = (FishFood){0};
+            }
+        }
+        env->food_active = n_start;
+        for (int i = 0; i < env->waste_max; i++) {
+            if (i < env->waste_start) {
+                wef_spawn_waste(env, i);
+            } else {
+                env->waste[i] = (Waste){0};
+            }
+        }
+        env->waste_active = env->waste_start;
+    } else if (mode == FOOD_UNIFORM) {
         for (int i = 0; i < env->num_food; i++) {
             env->food[i] = (FishFood){
                 .pos = {
@@ -701,6 +949,7 @@ void puf_reset(Wef* env) {
                 .active = true,
             };
         }
+        env->food_active = env->num_food;
     } else {
         // Patchy: random circular patches, food sampled uniformly in a patch disk
         float centers_x[MAX_PATCHES];
@@ -736,6 +985,7 @@ void puf_reset(Wef* env) {
                 .active = true,
             };
         }
+        env->food_active = env->num_food;
     }
     // Ampullary baseline: unit intrinsic dipole at arena center
     Vec2 center = {env->arena_size_x * 0.5f, env->arena_size_y * 0.5f};
@@ -746,25 +996,52 @@ void puf_reset(Wef* env) {
             center.y + g_amp[i].p.y,
         };
         Vec2 f = measure_field(
-            env, probe, NULL, 0, baseline_dip, 1, 1,
-            AMP_AGENT_RANGE_CM, AMP_FOOD_RANGE_CM,
+            env, probe, NULL, 0, baseline_dip, 1, 1, 0,
+            AMP_AGENT_RANGE_CM, AMP_FOOD_RANGE_CM, 0.0f,
             env->reflection_wall_range_cm
         );
         env->amp_intrinsic_baseline[i] = f.x * g_amp[i].n.x + f.y * g_amp[i].n.y;
     }
-    
+
     // Record food density per fish area
     float arena_area = env->arena_size_x * env->arena_size_y;
     env->food_per_fish_area = (float)env->num_food / (arena_area * (float)env->num_agents);
-    
+
+    if (env->obj_file != NULL) {
+        for (int i = 0; i < env->num_food; i++) {
+            if (env->food[i].active) {
+                wef_obj_event(env, 0, i, 0, env->food[i].pos);
+            }
+        }
+        for (int i = 0; i < env->waste_max; i++) {
+            if (env->waste[i].active) {
+                wef_obj_event(env, 1, i, 0, env->waste[i].pos);
+            }
+        }
+        fflush(env->obj_file);
+    }
+
     compute_observations(env);
 }
 
+int wef_zone(const Wef* env, Vec2 p) {
+    if (!env->cleanup) {
+        return 0;
+    }
+    if (p.x < env->strip_cm) {
+        return 1;
+    }
+    if (p.x > env->arena_size_x - env->orchard_cm) {
+        return 2;
+    }
+    return 0;
+}
+
 void wef_trace_step(Wef* env) {
-    WefTraceRow rows[MAX_AGENTS];
+    WefTraceRowV2 rows[MAX_AGENTS];
     for (int i = 0; i < env->num_agents; i++) {
         FishAgent* agent = &env->fish[i];
-        rows[i] = (WefTraceRow){
+        rows[i] = (WefTraceRowV2){
             .env_id = env->env_id, .episode = env->episode,
             .tick = env->tick, .agent = i,
             .x = agent->pos.x, .y = agent->pos.y,
@@ -774,13 +1051,237 @@ void wef_trace_step(Wef* env) {
             .bite_victim = agent->bite_victim, .was_bitten = agent->was_bitten,
             .ate = agent->ate, .collided = agent->collided,
             .reward = env->agents[i].rewards[0],
-            .nearest_food = agent->has_previous_food_distance
-                ? agent->previous_food_distance : -1.0f,
+            .nearest_food = env->cleanup ? agent->trace_nearest_food
+                : (agent->has_previous_food_distance ? agent->previous_food_distance : -1.0f),
             .arena_x = env->arena_size_x, .arena_y = env->arena_size_y,
             .food_left = env->num_food - env->food_eaten,
+            .cleaned = agent->cleaned, .waste_left = env->waste_active,
+            .food_active = env->food_active, .frozen = agent->freeze,
+            .zone = wef_zone(env, agent->pos),
         };
     }
-    fwrite(rows, sizeof(WefTraceRow), env->num_agents, env->trace_file);
+    if (env->cleanup || env->regrow_p_max > 0.0f) {
+        fwrite(rows, sizeof(WefTraceRowV2), env->num_agents, env->trace_file);
+    } else {
+        // Baseline format: the V2 row starts with the V1 fields, so write that prefix.
+        for (int i = 0; i < env->num_agents; i++) {
+            fwrite(&rows[i], sizeof(WefTraceRow), 1, env->trace_file);
+        }
+    }
+}
+
+// Harvest regrowth (Commons Harvest, Hughes 2018): number of active pellets within
+// regrow_radius_cm of slot f (excluding f itself).
+int wef_food_neighbours(const Wef* env, int f) {
+    float r2 = env->regrow_radius_cm * env->regrow_radius_cm;
+    int k = 0;
+    for (int g = 0; g < env->num_food; g++) {
+        if (g == f || !env->food[g].active) {
+            continue;
+        }
+        float dx = env->food[g].pos.x - env->food[f].pos.x;
+        float dy = env->food[g].pos.y - env->food[f].pos.y;
+        if (dx * dx + dy * dy <= r2) {
+            k++;
+        }
+    }
+    return k;
+}
+
+// Hughes 2018 Harvest table 0 / 0.005 / 0.02 / 0.05 for 0 / 1 / 2 / >=3 neighbours,
+// normalised to regrow_p_max.
+float wef_harvest_regrow_p(const Wef* env, int k) {
+    static const float table[4] = {0.0f, 0.1f, 0.4f, 1.0f};
+    return env->regrow_p_max * table[k > 3 ? 3 : k];
+}
+
+// Scripted roles (eval-only calibration, docs/wef-cleanup-v0-design.md 7): steer
+// straight at the nearest target using env-internal positions ("oracle"), bite
+// when it is inside the action cone. Writes the 4 raw action values.
+void wef_bot_action(Wef* env, int i, float* raw) {
+    FishAgent* fish = &env->fish[i];
+    int role = env->roles[i];
+    if (role == 3) {
+        int phase = (env->tick + i * (env->bot_shift_steps / MAX_AGENTS)) / env->bot_shift_steps;
+        role = (phase % 2 == 0) ? 1 : 2;
+    }
+    if (role == 4) {
+        raw[0] = random_uniform(env, -2.0f, 2.0f);
+        raw[1] = random_uniform(env, -2.0f, 2.0f);
+        raw[2] = 1.0f;
+        raw[3] = random_uniform(env, -1.0f, 1.0f);
+        return;
+    }
+    // Target: nearest item of the role's kind. bot_oracle = 0 limits the search to the
+    // sensing range (waste: waste_sense_range_cm, pellets: MORM_FOOD_RANGE_CM) so the
+    // rates measured are those of a fish that has to find things; 1 = env positions.
+    float sense = INFINITY;
+    if (!env->bot_oracle) {
+        sense = role == 1 ? env->waste_sense_range_cm : MORM_FOOD_RANGE_CM;
+    }
+    // Role 5 (Harvest cooperator): eat only pellets with >= 2 active neighbours, so
+    // patches are never harvested bare. Role 6 (Harvest defector): prefer dense
+    // pellets like role 5, but fall back to any pellet in range (a strict superset).
+    int min_neighbours = (role == 5 || role == 6) ? 2 : 0;
+    float sense2 = sense * sense;
+    Vec2 target = {0};
+    float nearest = INFINITY;
+    bool found = false;
+    if (role == 1) {
+        for (int w = 0; w < env->waste_max; w++) {
+            if (!env->waste[w].active) {
+                continue;
+            }
+            float dx = env->waste[w].pos.x - fish->pos.x;
+            float dy = env->waste[w].pos.y - fish->pos.y;
+            float d2 = dx * dx + dy * dy;
+            if (d2 < nearest && d2 <= sense2) {
+                nearest = d2;
+                target = env->waste[w].pos;
+                found = true;
+            }
+        }
+    } else {
+        for (int f = 0; f < env->num_food; f++) {
+            if (!env->food[f].active) {
+                continue;
+            }
+            float dx = env->food[f].pos.x - fish->pos.x;
+            float dy = env->food[f].pos.y - fish->pos.y;
+            float d2 = dx * dx + dy * dy;
+            if (d2 < nearest && d2 <= sense2
+                    && (min_neighbours == 0 || wef_food_neighbours(env, f) >= min_neighbours)) {
+                nearest = d2;
+                target = env->food[f].pos;
+                found = true;
+            }
+        }
+        if (!found && role == 6) {
+            for (int f = 0; f < env->num_food; f++) {
+                if (!env->food[f].active) {
+                    continue;
+                }
+                float dx = env->food[f].pos.x - fish->pos.x;
+                float dy = env->food[f].pos.y - fish->pos.y;
+                float d2 = dx * dx + dy * dy;
+                if (d2 < nearest && d2 <= sense2) {
+                    nearest = d2;
+                    target = env->food[f].pos;
+                    found = true;
+                }
+            }
+        }
+    }
+    if (!found) {
+        // Patrol the zone: sweep along y in a per-fish lane, reversing at the walls.
+        // Without an orchard (Harvest mode) eaters spread their lanes across the arena.
+        float lane;
+        if (role == 1) {
+            lane = env->strip_cm * 0.5f + ((float)i - 0.5f * (float)(env->num_agents - 1)) * 2.0f;
+        } else if (env->orchard_cm > 0.0f) {
+            lane = env->arena_size_x - env->orchard_cm * 0.5f
+                + ((float)i - 0.5f * (float)(env->num_agents - 1)) * 2.0f;
+        } else {
+            lane = env->arena_size_x * ((float)i + 0.5f) / (float)env->num_agents;
+        }
+        if (fish->bot_dir == 0) {
+            fish->bot_dir = 1;
+        }
+        if (fish->pos.y > env->arena_size_y - 4.0f) {
+            fish->bot_dir = -1;
+        } else if (fish->pos.y < 4.0f) {
+            fish->bot_dir = 1;
+        }
+        target = (Vec2){lane, fish->bot_dir > 0 ? env->arena_size_y - 2.0f : 2.0f};
+    }
+    float dist = sqrtf((target.x - fish->pos.x) * (target.x - fish->pos.x)
+        + (target.y - fish->pos.y) * (target.y - fish->pos.y));
+    float err = wrap_angle(atan2f(target.y - fish->pos.y, target.x - fish->pos.x) - fish->orientation);
+    // Collision avoidance: a fish within 3 cm and roughly ahead -> turn away from it
+    // (a reverted move keeps the new heading, so pure pursuit would lock head-on).
+    for (int j = 0; j < env->num_agents; j++) {
+        if (j == i) {
+            continue;
+        }
+        float dx = env->fish[j].pos.x - fish->pos.x;
+        float dy = env->fish[j].pos.y - fish->pos.y;
+        if (dx * dx + dy * dy > 9.0f) {
+            continue;
+        }
+        float bearing = wrap_angle(atan2f(dy, dx) - fish->orientation);
+        if (fabsf(bearing) < 1.22f) {
+            err = bearing > 0.0f ? -0.5f * PI_F : 0.5f * PI_F;
+            break;
+        }
+    }
+    float turn = clamp(err / fish->max_angular_velocity, -0.99f, 0.99f);
+    raw[1] = atanhf(turn);
+    raw[2] = 1.0f;
+    float radius = role == 1 ? env->clean_radius_cm : EATING_RADIUS_CM;
+    bool in_cone = found && in_forward_cone(fish, target, radius, EATING_ANGLE);
+    // Bite/eat are decided at the pre-move pose but a clean resolves after motion:
+    // stop when the item is inside the action radius, and turn in place when it is
+    // close but outside the cone (pure pursuit would orbit it).
+    bool aligned = fabsf(err) <= EATING_ANGLE * 0.5f;
+    if (found && (dist < radius || (dist < 2.0f * radius && !aligned))) {
+        raw[0] = -8.0f;                          // sigmoid -> 3e-4: no motion
+    } else {
+        raw[0] = fabsf(err) < 0.6f ? 2.2f : -0.85f;  // 0.9 when aligned, 0.3 while turning
+    }
+    // Eaters never bite (biting suppresses eating that step); cleaners bite on waste.
+    raw[3] = (role == 1 && in_cone) ? 1.0f : -1.0f;
+}
+
+// Cleanup: nearest active waste item inside the fish's clean cone, -1 if none.
+int wef_nearest_waste_in_cone(const Wef* env, const FishAgent* fish) {
+    int best = -1;
+    float nearest = INFINITY;
+    for (int w = 0; w < env->waste_max; w++) {
+        if (!env->waste[w].active) {
+            continue;
+        }
+        if (!in_forward_cone(fish, env->waste[w].pos, env->clean_radius_cm, EATING_ANGLE)) {
+            continue;
+        }
+        float dx = env->waste[w].pos.x - fish->pos.x;
+        float dy = env->waste[w].pos.y - fish->pos.y;
+        float dist2 = dx * dx + dy * dy;
+        if (dist2 < nearest) {
+            best = w;
+            nearest = dist2;
+        }
+    }
+    return best;
+}
+
+// Cleanup: private cleaning shaping, linearly annealed to 0 over
+// clean_reward_anneal_steps env-steps (0 = constant).
+float wef_clean_reward_eff(const Wef* env) {
+    if (env->clean_reward == 0.0f) {
+        return 0.0f;
+    }
+    if (env->clean_reward_anneal_steps <= 0.0f) {
+        return env->clean_reward;
+    }
+    float env_steps = (float)env->episode * (float)env->episode_length + (float)env->tick;
+    float frac = fmaxf(0.0f, 1.0f - env_steps / env->clean_reward_anneal_steps);
+    return env->clean_reward * frac;
+}
+
+// Gini coefficient of non-negative counts; 0 when the total is 0.
+float wef_gini(const int* x, int n) {
+    float total = 0.0f;
+    float abs_diff = 0.0f;
+    for (int i = 0; i < n; i++) {
+        total += (float)x[i];
+        for (int j = 0; j < n; j++) {
+            abs_diff += fabsf((float)x[i] - (float)x[j]);
+        }
+    }
+    if (total <= 0.0f) {
+        return 0.0f;
+    }
+    return abs_diff / (2.0f * (float)n * total);
 }
 
 void puf_step(Wef* env) {
@@ -790,6 +1291,8 @@ void puf_step(Wef* env) {
         env->fish[i].ate = false;
         env->fish[i].collided = false;
         env->fish[i].bite_victim = -1;
+        env->fish[i].cleaned = 0;
+        env->clean_pending[i] = 0;
         env->agents[i].rewards[0] = 0.0f;
         env->agents[i].terminals[0] = 0.0f;
     }
@@ -798,10 +1301,16 @@ void puf_step(Wef* env) {
     for (int i = 0; i < env->num_agents; i++) {
         FishAgent* agent = &env->fish[i];
         float* raw_action = env->agents[i].actions;
+        float bot_raw[ACTION_SIZE];
+        if (env->roles[i] != 0) {
+            wef_bot_action(env, i, bot_raw);
+            raw_action = bot_raw;
+        }
         float move = 1.0f / (1.0f + expf(-(float)raw_action[0]));
         float turn = tanhf((float)raw_action[1]);
         agent->emits_eod = raw_action[2] > 0.0f;
-        agent->bite_action = raw_action[3] > 0.0f && agent->bite_cooldown <= 0;
+        agent->bite_action = raw_action[3] > 0.0f && agent->bite_cooldown <= 0
+            && agent->freeze <= 0;
         if (agent->bite_action) {
             agent->bite_cooldown = BITE_COOLDOWN_STEPS;
         }
@@ -810,6 +1319,9 @@ void puf_step(Wef* env) {
         agent->last_action[2] = agent->emits_eod ? 1.0f : 0.0f;
         agent->last_action[3] = agent->bite_action ? 1.0f : 0.0f;
         env->eod_agent_steps += agent->emits_eod ? 1 : 0;
+        if (env->eod_cost != 0.0f && agent->emits_eod) {
+            env->agents[i].rewards[0] += env->eod_cost;
+        }
 
         // Effort penalty
         if (PENALIZE_EFFORT_OVER_FRAC < 1.0f) {
@@ -821,7 +1333,7 @@ void puf_step(Wef* env) {
         }
 
         // Eat first active pellet in forward 45° cone within 2 cm
-        if (!agent->bite_action && agent->eat_cooldown <= 0) {
+        if (!agent->bite_action && agent->eat_cooldown <= 0 && agent->freeze <= 0) {
             for (int f = 0; f < env->num_food; f++) {
                 if (!env->food[f].active) {
                     continue;
@@ -831,6 +1343,9 @@ void puf_step(Wef* env) {
                 }
                 env->food[f].active = false;
                 env->food_eaten++;
+                env->food_active--;
+                env->food_by[i]++;
+                wef_obj_event(env, 0, f, 1, env->food[f].pos);
                 agent->eat_cooldown = EAT_COOLDOWN_STEPS;
                 agent->ate = true;
                 env->agents[i].rewards[0] += EAT_REWARD;
@@ -842,7 +1357,7 @@ void puf_step(Wef* env) {
         float prev_ori = agent->orientation;
         float lin = 0.0f;
         float ang = 0.0f;
-        if (agent->eat_cooldown <= 0) {
+        if (agent->eat_cooldown <= 0 && agent->freeze <= 0) {
             lin = move * agent->max_linear_velocity;
             ang = turn * agent->max_angular_velocity;
         }
@@ -885,8 +1400,11 @@ void puf_step(Wef* env) {
         if (collided) {
             env->agents[i].rewards[0] += COLLISION_REWARD;
         }
+        if (env->cleanup && agent->pos.x < env->strip_cm) {
+            env->strip_steps_by[i]++;
+        }
 
-        // Proximity shaping 
+        // Proximity shaping
         float nearest_food = INFINITY;
         bool any_food = false;
         for (int f = 0; f < env->num_food; f++) {
@@ -901,19 +1419,24 @@ void puf_step(Wef* env) {
                 nearest_food = d;
             }
         }
+        agent->trace_nearest_food = any_food ? nearest_food : -1.0f;
         if (any_food) {
             if (agent->has_previous_food_distance) {
                 float arena_sum = env->arena_size_x + env->arena_size_y;
-                env->agents[i].rewards[0] += PROXIMITY_SHAPING_REWARD
+                env->agents[i].rewards[0] += env->proximity_shaping
                     * (agent->previous_food_distance - nearest_food)
                     / arena_sum;
             }
             agent->previous_food_distance = nearest_food;
             agent->has_previous_food_distance = true;
+        } else if (env->cleanup || env->regrow_p_max > 0.0f) {
+            // No pellet to measure against: forget the stale distance so the next
+            // spawn does not pay a windfall.
+            agent->has_previous_food_distance = false;
         }
     }
 
-    // Bites after all fish have moved
+    // Bites (and, in cleanup mode, cleans) after all fish have moved
     for (int i = 0; i < env->num_agents; i++) {
         FishAgent* attacker = &env->fish[i];
         if (!attacker->bite_action) {
@@ -924,6 +1447,9 @@ void puf_step(Wef* env) {
         for (int j = 0; j < env->num_agents; j++) {
             if (i == j) {
                 continue;
+            }
+            if (env->fish[j].freeze > 0) {
+                continue;  // immunity while frozen
             }
             if (!in_forward_cone(attacker, env->fish[j].pos, BITING_RADIUS_CM, EATING_ANGLE)) {
                 continue;
@@ -936,43 +1462,201 @@ void puf_step(Wef* env) {
                 nearest = dist2;
             }
         }
-        if (victim >= 0) {
+        int waste_target = -1;
+        if (env->cleanup && attacker->can_clean) {
+            waste_target = wef_nearest_waste_in_cone(env, attacker);
+        }
+        if (waste_target >= 0 && (env->clean_priority == 1 || victim < 0)) {
+            // CLEAN: remove up to clean_max_items nearest items; no reward here
+            // (clean_reward is applied privately after mixing).
+            int removed = 0;
+            while (waste_target >= 0 && removed < env->clean_max_items) {
+                env->waste[waste_target].active = false;
+                env->waste_active--;
+                wef_obj_event(env, 1, waste_target, 1, env->waste[waste_target].pos);
+                removed++;
+                waste_target = removed < env->clean_max_items
+                    ? wef_nearest_waste_in_cone(env, attacker) : -1;
+            }
+            env->cleans += removed;
+            env->cleans_by[i] += removed;
+            attacker->cleaned = removed;
+            env->clean_pending[i] = removed;
+            attacker->bite_cooldown = env->clean_cooldown_steps;
+        } else if (victim >= 0) {
             env->fish[victim].was_bitten = true;
             attacker->bite_victim = victim;
             env->bites++;
             // Reference: is_bitten * (1 + size_diff), size_diff ∈ [-1, 1] → factor ∈ [0, 2]
             float size_difference = attacker->size - env->fish[victim].size;
-            env->agents[victim].rewards[0] += BITTEN_REWARD * (1.0f + size_difference);
-            env->agents[i].rewards[0] += BITE_REWARD;
+            env->agents[victim].rewards[0] += env->bitten_reward * (1.0f + size_difference);
+            env->agents[i].rewards[0] += env->bite_reward;
+            if (env->bitten_freeze_steps > 0) {
+                env->fish[victim].freeze = env->bitten_freeze_steps;
+                env->freezes++;
+            }
+            if (env->cleanup && attacker->pos.x < env->strip_cm) {
+                env->bites_in_strip++;
+            }
+        }
+    }
+
+    // Cleanup dynamics: waste inflow (DirtSpawner) and pellet regrowth (AppleGrow)
+    if (env->cleanup) {
+        if (env->waste_spawn_p > 0.0f && env->tick > env->waste_spawn_delay
+                && env->waste_active < env->waste_max
+                && random_uniform(env, 0.0f, 1.0f) < env->waste_spawn_p) {
+            for (int w = 0; w < env->waste_max; w++) {
+                if (!env->waste[w].active) {
+                    wef_spawn_waste(env, w);
+                    env->waste_active++;
+                    wef_obj_event(env, 1, w, 2, env->waste[w].pos);
+                    break;
+                }
+            }
+        }
+        float q = 1.0f;
+        if (env->waste_max > 0) {
+            q = clamp(1.0f - (float)env->waste_active
+                / (env->waste_theta * (float)env->waste_max), 0.0f, 1.0f);
+        }
+        env->open_steps += q > 0.0f ? 1 : 0;
+        if (env->waste_max > 0) {
+            env->waste_frac_sum += (float)env->waste_active / (float)env->waste_max;
+        }
+        env->regrow_q = q;
+    }
+    if (env->regrow_p_max > 0.0f) {
+        bool any_spawned = false;
+        if (env->regrow_mode == 1) {
+            // Harvest: density-dependent regrowth at the slot's own position. Counts
+            // use the pre-regrowth state so slot order does not matter.
+            float p_slot[MAX_FOOD];
+            for (int f = 0; f < env->num_food; f++) {
+                p_slot[f] = env->food[f].active ? 0.0f
+                    : wef_harvest_regrow_p(env, wef_food_neighbours(env, f));
+            }
+            for (int f = 0; f < env->num_food; f++) {
+                if (p_slot[f] > 0.0f && random_uniform(env, 0.0f, 1.0f) < p_slot[f]) {
+                    env->food[f].active = true;
+                    env->food[f].orientation = random_uniform(env, 0.0f, 2.0f * PI_F);
+                    env->food_active++;
+                    env->regrown++;
+                    any_spawned = true;
+                    wef_obj_event(env, 0, f, 2, env->food[f].pos);
+                }
+            }
+        } else if (env->cleanup && env->regrow_q > 0.0f) {
+            // Cleanup: uniform in the orchard, rate set by water quality.
+            float p = env->regrow_p_max * env->regrow_q;
+            for (int f = 0; f < env->num_food; f++) {
+                if (env->food[f].active) {
+                    continue;
+                }
+                if (random_uniform(env, 0.0f, 1.0f) < p) {
+                    wef_spawn_pellet(env, f);
+                    env->food_active++;
+                    env->regrown++;
+                    any_spawned = true;
+                    wef_obj_event(env, 0, f, 2, env->food[f].pos);
+                }
+            }
+        }
+        if (any_spawned) {
+            for (int i = 0; i < env->num_agents; i++) {
+                env->fish[i].has_previous_food_distance = false;
+            }
         }
     }
 
     for (int i = 0; i < env->num_agents; i++) {
         env->fish[i].eat_cooldown -= env->fish[i].eat_cooldown > 0;
         env->fish[i].bite_cooldown -= env->fish[i].bite_cooldown > 0;
-        env->episode_return += env->agents[i].rewards[0];
+        env->fish[i].freeze -= env->fish[i].freeze > 0;
+        // Raw (pre-mixing, pre-shaping) per-fish return: what the metrics report.
+        env->return_by[i] += env->agents[i].rewards[0];
+        env->raw_return_sum += env->agents[i].rewards[0];
     }
 
     if (env->trace_file != NULL) {
         wef_trace_step(env);
     }
 
+    // Reward mixing (common / exchanged reward) and private cleaning shaping.
+    if (env->reward_share > 0.0f) {
+        float mean = 0.0f;
+        for (int i = 0; i < env->num_agents; i++) {
+            mean += env->agents[i].rewards[0];
+        }
+        mean /= (float)env->num_agents;
+        float w = env->reward_share;
+        for (int i = 0; i < env->num_agents; i++) {
+            env->agents[i].rewards[0] = (1.0f - w) * env->agents[i].rewards[0] + w * mean;
+        }
+    }
+    if (env->clean_reward != 0.0f) {
+        float eff = wef_clean_reward_eff(env);
+        for (int i = 0; i < env->num_agents; i++) {
+            if (env->clean_pending[i] > 0) {
+                env->agents[i].rewards[0] += (float)env->clean_pending[i] * eff;
+            }
+        }
+    }
+    for (int i = 0; i < env->num_agents; i++) {
+        env->episode_return += env->agents[i].rewards[0];
+    }
+
     compute_observations(env);
 
-    if (env->tick >= env->episode_length || env->food_eaten == env->num_food) {
+    if (env->tick >= env->cur_episode_length
+            || (!env->cleanup && env->regrow_p_max <= 0.0f && env->food_eaten == env->num_food)) {
         env->episode++;
         if (env->trace_file != NULL) {
             fflush(env->trace_file);
         }
-        env->log.episode_length += (float)env->tick;
+        if (env->obj_file != NULL) {
+            fflush(env->obj_file);
+        }
+        float ticks = (float)env->tick;
+        env->log.episode_length += ticks;
         env->log.episode_return += env->episode_return;
-        env->log.score += env->episode_return;
-        env->log.perf += (float)env->food_eaten / (float)env->num_food;
+        env->log.score += env->raw_return_sum;
+        float waste_frac = env->waste_max > 0 ? env->waste_frac_sum / ticks : 0.0f;
+        env->log.perf += env->cleanup ? 1.0f - waste_frac
+            : env->regrow_p_max > 0.0f ? (float)env->food_active / (float)env->num_food  // Harvest: stock left
+            : (float)env->food_eaten / (float)env->num_food;
         env->log.food_eaten_mean +=(float)env->food_eaten / (float)env->num_agents;
         env->log.eod_rate += (float)env->eod_agent_steps / (float)(env->tick * env->num_agents);
         env->log.collisions_fish += (float)env->collisions_fish;
         env->log.bites += (float)env->bites;
         env->log.food_per_fish_area += env->food_per_fish_area;
+        // Cleanup metrics (all zero-valued in baseline except equality)
+        env->log.collective_food += (float)env->food_eaten;
+        env->log.waste_frac += waste_frac;
+        env->log.frac_open += env->cleanup ? (float)env->open_steps / ticks : 1.0f;
+        env->log.cleans += (float)env->cleans;
+        env->log.regrown += (float)env->regrown;
+        env->log.equality += 1.0f - wef_gini(env->food_by, env->num_agents);
+        env->log.clean_gini += wef_gini(env->cleans_by, env->num_agents);
+        int max_cleans = 0;
+        int strip_steps = 0;
+        for (int i = 0; i < env->num_agents; i++) {
+            max_cleans = env->cleans_by[i] > max_cleans ? env->cleans_by[i] : max_cleans;
+            strip_steps += env->strip_steps_by[i];
+        }
+        env->log.clean_max_share += env->cleans > 0 ? (float)max_cleans / (float)env->cleans : 0.0f;
+        env->log.strip_frac += (float)strip_steps / (ticks * (float)env->num_agents);
+        env->log.bites_in_strip += (float)env->bites_in_strip;
+        env->log.freezes += (float)env->freezes;
+        float pol_sum[2] = {0.0f, 0.0f};
+        int pol_n[2] = {0, 0};
+        for (int i = 0; i < env->num_agents; i++) {
+            int p = env->agents[i].policy == 1 ? 1 : 0;
+            pol_sum[p] += env->return_by[i];
+            pol_n[p]++;
+        }
+        env->log.policy_0_score += pol_n[0] > 0 ? pol_sum[0] / (float)pol_n[0] : 0.0f;
+        env->log.policy_1_score += pol_n[1] > 0 ? pol_sum[1] / (float)pol_n[1] : 0.0f;
         env->log.n += 1.0f;
         puf_reset(env);
         for (int i = 0; i < env->num_agents; i++) {
@@ -1120,8 +1804,8 @@ void puf_render(Wef* env) {
 
     if (env->client->show_field) {
         Mono mono[WEF_MAX_MONO];
-        Dipole induced[MAX_AGENTS + MAX_FOOD];
-        Dipole intrinsic[MAX_AGENTS + MAX_FOOD];
+        Dipole induced[WEF_MAX_DIP];
+        Dipole intrinsic[WEF_MAX_DIP];
         int n_mono = 0;
         int n_ind = 0;
         int n_intr = 0;
@@ -1147,6 +1831,15 @@ void puf_render(Wef* env) {
             };
             intrinsic[n_intr++] = (Dipole){
                 to_m(env->food[f].pos), env->food[f].intrinsic_moment
+            };
+        }
+        int n_food_viz = n_ind - env->num_agents;
+        for (int w = 0; w < env->waste_max; w++) {
+            if (!env->waste[w].active) {
+                continue;
+            }
+            induced[n_ind++] = (Dipole){
+                to_m(env->waste[w].pos), env->waste[w].induced_moment
             };
         }
 
@@ -1178,12 +1871,14 @@ void puf_render(Wef* env) {
                 // Viz: knollen agent range for EODs; morm food range for food dips.
                 Vec2 f1 = measure_field(
                     env, pos, mono, n_mono, induced, n_ind, env->num_agents,
-                    KNOLLEN_AGENT_RANGE_CM, MORM_FOOD_RANGE_CM,
+                    n_food_viz,
+                    KNOLLEN_AGENT_RANGE_CM, MORM_FOOD_RANGE_CM, env->waste_sense_range_cm,
                     env->reflection_wall_range_cm
                 );
                 Vec2 f2 = measure_field(
                     env, pos, NULL, 0, intrinsic, n_intr, env->num_agents,
-                    KNOLLEN_AGENT_RANGE_CM, AMP_FOOD_RANGE_CM,
+                    n_intr - env->num_agents,
+                    KNOLLEN_AGENT_RANGE_CM, AMP_FOOD_RANGE_CM, 0.0f,
                     env->reflection_wall_range_cm
                 );
                 float fx = f1.x + f2.x;
@@ -1237,6 +1932,22 @@ void puf_render(Wef* env) {
         Vector2 position = world_to_screen(env, env->food[i].pos);
         float radius = fmaxf(2.5f, FOOD_RADIUS_CM * scale);
         DrawCircleV(position, radius, WEF_COLOR_FOOD);
+    }
+    if (env->cleanup) {
+        // Zone outlines and waste items
+        Vector2 s0 = world_to_screen(env, (Vec2){env->strip_cm, 0.0f});
+        Vector2 s1 = world_to_screen(env, (Vec2){env->strip_cm, env->arena_size_y});
+        DrawLineV(s0, s1, WEF_COLOR_MIDGRAY);
+        Vector2 o0 = world_to_screen(env, (Vec2){env->arena_size_x - env->orchard_cm, 0.0f});
+        Vector2 o1 = world_to_screen(env, (Vec2){env->arena_size_x - env->orchard_cm, env->arena_size_y});
+        DrawLineV(o0, o1, WEF_COLOR_MIDGRAY);
+        for (int i = 0; i < env->waste_max; i++) {
+            if (!env->waste[i].active) {
+                continue;
+            }
+            Vector2 position = world_to_screen(env, env->waste[i].pos);
+            DrawCircleV(position, fmaxf(3.0f, env->waste_radius_cm * scale), WEF_COLOR_WASTE);
+        }
     }
     for (int i = 0; i < env->num_agents; i++) {
         FishAgent* agent = &env->fish[i];
@@ -1295,8 +2006,14 @@ void puf_render(Wef* env) {
     DrawText(TextFormat("step %d   active EODs %d/%d",
         env->tick, active_eods, env->num_agents),
         env->client->window_width - 285, 18, 18, WEF_COLOR_MIDGRAY);
-    DrawText(TextFormat("food %d/%d", env->food_eaten, env->num_food),
-        20, env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
+    if (env->cleanup) {
+        DrawText(TextFormat("food %d active (%d eaten)  waste %d/%d  cleans %d",
+            env->food_active, env->food_eaten, env->waste_active, env->waste_max, env->cleans),
+            20, env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
+    } else {
+        DrawText(TextFormat("food %d/%d", env->food_eaten, env->num_food),
+            20, env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
+    }
     DrawText(TextFormat("field radius %.0f cm", env->electric_field_radius_cm),
         180, env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
 
@@ -1314,12 +2031,23 @@ void puf_close(Wef* env) {
         fclose(env->trace_file);
         env->trace_file = NULL;
     }
+    if (env->obj_file != NULL) {
+        fclose(env->obj_file);
+        env->obj_file = NULL;
+    }
     if (env->client) {
         if (IsWindowReady()) {
             CloseWindow();
         }
         free(env->client);
     }
+}
+
+// Optional [env] key: value if present in default.ini/wef.ini, else `fallback`.
+// (dict_get exits on a missing key; the cleanup keys must not be required.)
+double wef_cfg(Dict* kwargs, const char* key, double fallback) {
+    DictItem* item = dict_find(kwargs, key);
+    return item ? item->value : fallback;
 }
 
 void puf_init(Env* env, Dict* kwargs) {
@@ -1340,17 +2068,114 @@ void puf_init(Env* env, Dict* kwargs) {
     env->electric_field_radius_cm = dict_get(kwargs, "electric_field_radius");
     env->reflection_wall_range_cm = dict_get(kwargs, "reflection_wall_range");
     env->episode_length = dict_get(kwargs, "episode_length");
+
+    // Cleanup extension (docs/wef-cleanup-v0-design.md section 8). Defaults = baseline.
+    env->cleanup = wef_cfg(kwargs, "cleanup", 0);
+    env->strip_cm = wef_cfg(kwargs, "strip_cm", 0);
+    env->orchard_cm = wef_cfg(kwargs, "orchard_cm", 0);
+    env->spawn_band = wef_cfg(kwargs, "spawn_band", 0);
+    env->waste_max = wef_cfg(kwargs, "waste_max", 0);
+    env->waste_start = wef_cfg(kwargs, "waste_start", 0);
+    env->waste_spawn_p = wef_cfg(kwargs, "waste_spawn_p", 0);
+    env->waste_spawn_delay = wef_cfg(kwargs, "waste_spawn_delay", 0);
+    env->waste_theta = wef_cfg(kwargs, "waste_theta", 0.4);
+    env->waste_radius_cm = wef_cfg(kwargs, "waste_radius_cm", 0.5);
+    env->waste_contrast = wef_cfg(kwargs, "waste_contrast", 1.0);
+    env->waste_sense_range_cm = wef_cfg(kwargs, "waste_sense_range_cm", 10.0);
+    env->regrow_p_max = wef_cfg(kwargs, "regrow_p_max", 0);
+    env->regrow_mode = wef_cfg(kwargs, "regrow_mode", 0);
+    env->regrow_radius_cm = wef_cfg(kwargs, "regrow_radius_cm", 4.0);
+    env->food_start = wef_cfg(kwargs, "food_start", -1);
+    env->clean_priority = wef_cfg(kwargs, "clean_priority", 0);
+    env->clean_radius_cm = wef_cfg(kwargs, "clean_radius_cm", BITING_RADIUS_CM);
+    env->clean_max_items = wef_cfg(kwargs, "clean_max_items", 1);
+    env->clean_cooldown_steps = wef_cfg(kwargs, "clean_cooldown_steps", BITE_COOLDOWN_STEPS);
+    env->clean_reward = wef_cfg(kwargs, "clean_reward", 0);
+    env->clean_reward_anneal_steps = wef_cfg(kwargs, "clean_reward_anneal_steps", 0);
+    env->bitten_freeze_steps = wef_cfg(kwargs, "bitten_freeze_steps", 0);
+    env->bitten_reward = wef_cfg(kwargs, "bitten_reward", BITTEN_REWARD);
+    env->bite_reward = wef_cfg(kwargs, "bite_reward", BITE_REWARD);
+    env->eod_cost = wef_cfg(kwargs, "eod_cost", 0);
+    env->reward_share = wef_cfg(kwargs, "reward_share", 0);
+    env->proximity_shaping = wef_cfg(kwargs, "proximity_shaping", PROXIMITY_SHAPING_REWARD);
+    env->obs_extra = wef_cfg(kwargs, "obs_extra", 0);
+    env->size_min = wef_cfg(kwargs, "size_min", 0.0);
+    env->size_max = wef_cfg(kwargs, "size_max", 1.0);
+    env->desync_first_episode = wef_cfg(kwargs, "desync_first_episode", 0);
+    env->policy1_agents = wef_cfg(kwargs, "policy1_agents", 0);
+    env->no_clean_agents = wef_cfg(kwargs, "no_clean_agents", 0);
+    env->bot_shift_steps = wef_cfg(kwargs, "bot_shift_steps", 256);
+    env->bot_oracle = wef_cfg(kwargs, "bot_oracle", 0);
+    {
+        // roles = r0,r1,r2,r3 (comma list; a scalar applies to slot 0 only)
+        DictItem* item = dict_find(kwargs, "roles");
+        for (int i = 0; i < MAX_AGENTS; i++) {
+            env->roles[i] = 0;
+            if (item != NULL) {
+                if (item->len > 0 && i < item->len) {
+                    env->roles[i] = (int)item->values[i];
+                } else if (item->len == 0 && i == 0) {
+                    env->roles[i] = (int)item->value;
+                }
+            }
+        }
+    }
+    assert(env->bot_shift_steps >= MAX_AGENTS);
+    for (int i = 0; i < MAX_AGENTS; i++) {
+        assert(env->roles[i] >= 0 && env->roles[i] <= 6
+            && "roles: 0 policy, 1 cleaner, 2 eater, 3 shift, 4 random, 5 sustainable eater, 6 dense-first eater");
+    }
+    assert((int)wef_cfg(kwargs, "num_bots", 0) == 0 && "num_bots is not supported by wef");
+    assert(env->waste_max >= 0 && env->waste_max <= MAX_WASTE);
+    if (env->waste_max == 0) {
+        env->waste_start = 0;  // Harvest stage: no waste at all, whatever the preset says
+    }
+    assert(env->waste_start >= 0 && env->waste_start <= env->waste_max);
+    assert(env->reward_share >= 0.0f && env->reward_share <= 1.0f);
+    assert(env->waste_theta > 0.0f);
+    assert(env->clean_max_items >= 1);
+    assert(env->policy1_agents >= 0 && env->no_clean_agents >= 0
+        && env->policy1_agents + env->no_clean_agents < env->num_agents);
+    assert(env->food_start <= env->configured_num_food);
+    assert(env->size_min <= env->size_max);
+    if (env->cleanup) {
+        assert(env->strip_cm + env->orchard_cm + 6.0f <= env->min_arena_size_x
+            && "cleanup: strip + orchard must leave a >= 6 cm spawn band");
+        assert(env->orchard_cm > 0.0f && "cleanup: orchard_cm must be > 0");
+        assert((env->waste_max == 0 || env->strip_cm > 0.0f) && "cleanup: waste needs strip_cm > 0");
+    } else {
+        assert(env->waste_max == 0 && "waste needs cleanup = 1");
+        assert((env->regrow_p_max == 0.0f || env->regrow_mode == 1)
+            && "regrowth without cleanup needs regrow_mode = 1 (Harvest)");
+    }
+    assert(env->regrow_mode == 0 || env->regrow_mode == 1);
+    assert(env->regrow_radius_cm > 0.0f);
+
     // The trainer seeds env->rng with the env index before puf_init.
     env->env_id = (int)env->rng;
+    // desync_first_episode: stagger the first episode end so fixed-length episodes
+    // do not reset in lockstep across envs (rollouts would see one phase only).
+    env->first_episode_len = env->episode_length;
+    if (env->desync_first_episode) {
+        int offset = (env->env_id * 397) % env->episode_length;
+        env->first_episode_len = env->episode_length - offset;
+    }
     const char* trace_dir = getenv("WEF_TRACE_DIR");
     if (trace_dir != NULL && trace_dir[0] != '\0') {
         char path[4096];
-        snprintf(path, sizeof(path), "%s/env_%05d.bin", trace_dir, env->env_id);
+        bool v2 = env->cleanup || env->regrow_p_max > 0.0f;
+        snprintf(path, sizeof(path), v2 ? "%s/env_%05d.v2.bin" : "%s/env_%05d.bin",
+            trace_dir, env->env_id);
         env->trace_file = fopen(path, "wb");
         assert(env->trace_file != NULL && "WEF_TRACE_DIR must be an existing, writable dir");
+        snprintf(path, sizeof(path), "%s/env_%05d.obj.bin", trace_dir, env->env_id);
+        env->obj_file = fopen(path, "wb");
+        assert(env->obj_file != NULL);
     }
     for (int i = 0; i < env->num_agents; i++) {
-        env->agents[i].policy = 0;
+        // policy1_agents: last k fish on policy 1 (used by `match` eval only; training
+        // with one policy forces every agent to policy 0 in env_setup).
+        env->agents[i].policy = i >= env->num_agents - env->policy1_agents ? 1 : 0;
         env->agents[i].action_mask = NULL;
     }
 
@@ -1396,5 +2221,19 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "collisions_fish", log->collisions_fish);
     dict_set(out, "bites", log->bites);
     dict_set(out, "food_per_fish_area", log->food_per_fish_area);
+    dict_set(out, "collective_food", log->collective_food);
+    dict_set(out, "waste_frac", log->waste_frac);
+    dict_set(out, "frac_open", log->frac_open);
+    dict_set(out, "cleans", log->cleans);
+    dict_set(out, "regrown", log->regrown);
+    dict_set(out, "equality", log->equality);
+    dict_set(out, "clean_gini", log->clean_gini);
+    dict_set(out, "clean_max_share", log->clean_max_share);
+    dict_set(out, "strip_frac", log->strip_frac);
+    dict_set(out, "bites_in_strip", log->bites_in_strip);
+    dict_set(out, "freezes", log->freezes);
+    dict_set(out, "policy_0_score", log->policy_0_score);
+    dict_set(out, "policy_1_score", log->policy_1_score);
+    dict_set(out, "draw_rate", log->draw_rate);
     dict_set(out, "n", log->n);
 }
