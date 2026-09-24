@@ -398,6 +398,7 @@ struct Env {
     int roles[MAX_AGENTS];      // scripted roles (eval only): 0 policy, 1 cleaner, 2 eater, 3 shift, 4 random
     int bot_shift_steps;
     int bot_oracle;             // 1: bots target items anywhere; 0: only within sensing range
+    int render_field;           // renderer: 1 field arrows around each fish (upstream), 0 off
     Waste waste[MAX_WASTE];
     int waste_active;
     int food_active;
@@ -1667,13 +1668,15 @@ void puf_step(Wef* env) {
 
 Vector2 world_to_screen(const Wef* env, Vec2 p) {
     Client* client = env->client;
+    // Uniform scale (same as the body/pellet radii below), arena centred: upstream stretched
+    // x and y separately, which distorts every non-square arena.
     float usable_width = client->window_width - 2.0f * client->margin;
     float usable_height = client->window_height - 2.0f * client->margin;
-    return (Vector2){
-        client->margin + p.x / env->arena_size_x * usable_width,
-        client->window_height - client->margin -
-            p.y / env->arena_size_y * usable_height,
-    };
+    float scale = fminf(usable_width / env->arena_size_x, usable_height / env->arena_size_y);
+    float x0 = client->margin + 0.5f * (usable_width - env->arena_size_x * scale);
+    float y0 = client->window_height - client->margin -
+        0.5f * (usable_height - env->arena_size_y * scale);
+    return (Vector2){x0 + p.x * scale, y0 - p.y * scale};
 }
 
 static Color wef_lerp_color(Color a, Color b, float t) {
@@ -1735,7 +1738,7 @@ void puf_render(Wef* env) {
         client->window_width = 900;
         client->window_height = 900;
         client->margin = 55;
-        client->show_field = true;
+        client->show_field = env->render_field != 0;
         client->show_sensors = true;
         InitWindow(client->window_width, client->window_height, "Weakly Electric fish");
         SetTargetFPS(60);
@@ -2115,6 +2118,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->no_clean_agents = wef_cfg(kwargs, "no_clean_agents", 0);
     env->bot_shift_steps = wef_cfg(kwargs, "bot_shift_steps", 256);
     env->bot_oracle = wef_cfg(kwargs, "bot_oracle", 0);
+    env->render_field = wef_cfg(kwargs, "render_field", 1);
     {
         // roles = r0,r1,r2,r3 (comma list; a scalar applies to slot 0 only)
         DictItem* item = dict_find(kwargs, "roles");
