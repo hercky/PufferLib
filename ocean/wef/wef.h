@@ -102,6 +102,8 @@ typedef float obs_t;
 #define WEF_COLOR_WASTE         ((Color){235, 150, 60, 220})     // inert debris (cleanup mode)
 #define WEF_COLOR_EOD_POS       ((Color){220, 60, 50, 255})
 #define WEF_COLOR_EOD_NEG       ((Color){60, 120, 255, 255})
+#define WEF_COLOR_BITE          ((Color){255, 70, 70, 255})
+#define WEF_BITE_FLASH_FRAMES   30
 
 // Field arrows: yellow (min) → red (max) log gradient over WEF |E| in V/cm.
 #define WEF_FIELD_LOG_LO        (-7.0f)   // 1e-7 V/cm
@@ -300,6 +302,12 @@ typedef struct Client {
     bool show_field;
     bool show_sensors;
     Trace traces[MAX_AGENTS];
+    // Bite overlay: frames left of the victim's flash, who bit it, per-episode counts.
+    int bite_flash[MAX_AGENTS];
+    int bite_from[MAX_AGENTS];
+    int bites_given[MAX_AGENTS];
+    int bites_taken[MAX_AGENTS];
+    int bites_total;
 } Client;
 
 typedef struct FishFood {
@@ -1850,11 +1858,32 @@ void puf_render(Wef* env) {
         if (env->agents[i].terminals[0]) {
             trace->index = 0;
             trace->count = 0;
+            if (i == 0) {
+                for (int k = 0; k < MAX_AGENTS; k++) {
+                    env->client->bites_given[k] = 0;
+                    env->client->bites_taken[k] = 0;
+                    env->client->bite_flash[k] = 0;
+                }
+                env->client->bites_total = 0;
+            }
         }
         trace->pos[trace->index] = env->fish[i].pos;
         trace->index = (trace->index + 1) % TRACE_LENGTH;
         if (trace->count < TRACE_LENGTH) {
             trace->count++;
+        }
+    }
+
+    for (int i = 0; i < env->num_agents; i++) {
+        Client* c = env->client;
+        c->bite_flash[i] -= c->bite_flash[i] > 0;
+        int v = env->fish[i].bite_victim;
+        if (v >= 0) {
+            c->bite_flash[v] = WEF_BITE_FLASH_FRAMES;
+            c->bite_from[v] = i;
+            c->bites_given[i]++;
+            c->bites_taken[v]++;
+            c->bites_total++;
         }
     }
 
@@ -2018,10 +2047,27 @@ void puf_render(Wef* env) {
             DrawCircleV(position, fmaxf(3.0f, env->waste_radius_cm * scale), WEF_COLOR_WASTE);
         }
     }
+    // Bites: red line biter -> victim and a fading red ring on the victim.
+    for (int v = 0; v < env->num_agents; v++) {
+        int f = env->client->bite_flash[v];
+        if (f <= 0) {
+            continue;
+        }
+        float a = (float)f / (float)WEF_BITE_FLASH_FRAMES;
+        Vector2 vc = world_to_screen(env, env->fish[v].pos);
+        Vector2 bc = world_to_screen(env, env->fish[env->client->bite_from[v]].pos);
+        float r = BODY_RADIUS_CM * scale;
+        DrawLineEx(bc, vc, 3.0f, ColorAlpha(WEF_COLOR_BITE, a));
+        DrawRing(vc, r + 4.0f + 10.0f * (1.0f - a), r + 8.0f + 10.0f * (1.0f - a),
+            0.0f, 360.0f, 32, ColorAlpha(WEF_COLOR_BITE, a));
+    }
     for (int i = 0; i < env->num_agents; i++) {
         FishAgent* agent = &env->fish[i];
         Vector2 center = world_to_screen(env, agent->pos);
         float radius = BODY_RADIUS_CM * scale;
+        if (agent->freeze > 0) {
+            DrawCircleV(center, radius, ColorAlpha(WEF_COLOR_MIDGRAY, 0.8f));  // frozen (sanction)
+        }
 
         if (agent->emits_eod) {
             float pulse = radius + 5.0f +
@@ -2058,6 +2104,16 @@ void puf_render(Wef* env) {
         DrawText(TextFormat("%d", i + 1),
             (int)(center.x + radius + 4), (int)(center.y - radius), 16,
             WEF_COLOR_TEXT);
+        if (env->client->bites_given[i] > 0 || env->client->bites_taken[i] > 0) {
+            const char* tally = TextFormat("bit %d / bitten %d",
+                env->client->bites_given[i], env->client->bites_taken[i]);
+            int w = MeasureText(tally, 12);
+            int tx = (int)(center.x + radius + 4);
+            if (tx + w > env->client->window_width - 4) {
+                tx = (int)(center.x - radius - 4) - w;  // near the right edge: label on the left
+            }
+            DrawText(tally, tx, (int)(center.y - radius) + 16, 12, WEF_COLOR_BITE);
+        }
     }
 
     DrawRectangleLinesEx(
@@ -2072,9 +2128,11 @@ void puf_render(Wef* env) {
     for (int i = 0; i < env->num_agents; i++) {
         active_eods += env->fish[i].emits_eod ? 1 : 0;
     }
-    DrawText(TextFormat("step %d   active EODs %d/%d",
-        env->tick, active_eods, env->num_agents),
-        env->client->window_width - 285, 18, 18, WEF_COLOR_MIDGRAY);
+    {
+        const char* top = TextFormat("step %d   active EODs %d/%d   bites %d",
+            env->tick, active_eods, env->num_agents, env->client->bites_total);
+        DrawText(top, env->client->window_width - 20 - MeasureText(top, 18), 18, 18, WEF_COLOR_MIDGRAY);
+    }
     if (env->cleanup) {
         // Longer status line: draw it right-aligned so it clears the field-radius text.
         const char* status = TextFormat("food %d active (%d eaten)   waste %d/%d   cleans %d",
