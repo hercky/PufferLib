@@ -372,7 +372,7 @@ struct Env {
     float waste_contrast;
     float waste_sense_range_cm;
     float regrow_p_max;
-    int regrow_mode;            // 0: waste-coupled (Cleanup), 1: density-dependent at the slot's position (Harvest)
+    int regrow_mode;            // 0: waste-coupled (Cleanup), 1: density-dependent at the slot's position (Harvest), 2: global logistic stock, uniform placement (Commons)
     float regrow_radius_cm;     // mode 1: neighbourhood radius for the density count
     int food_start;
     int clean_priority;
@@ -398,6 +398,8 @@ struct Env {
     int roles[MAX_AGENTS];      // scripted roles (eval only): 0 policy, 1 cleaner, 2 eater, 3 shift, 4 random
     int bot_shift_steps;
     int bot_oracle;             // 1: bots target items anywhere; 0: only within sensing range
+    float bot_theta;            // role 7: eat only while food_active > bot_theta * num_food
+    float regrow_allee;         // commons: no regrowth while S <= regrow_allee * K (depensation)
     int render_field;           // renderer: 1 field arrows around each fish (upstream), 0 off
     Waste waste[MAX_WASTE];
     int waste_active;
@@ -799,6 +801,8 @@ void compute_observations(Wef* env) {
             extra = (float)env->waste_active / (float)env->waste_max;
         } else if (env->obs_extra == 2) {
             extra = 2.0f * agent->pos.x / env->arena_size_x - 1.0f;
+        } else if (env->obs_extra == 3) {
+            extra = (float)env->food_active / (float)env->num_food;  // commons stock S / K
         }
         obs[obs_idx++] = extra;
         obs[obs_idx++] = agent->was_bitten ? 1.0f : 0.0f;
@@ -1124,6 +1128,10 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     // patches are never harvested bare. Role 6 (Harvest defector): prefer dense
     // pellets like role 5, but fall back to any pellet in range (a strict superset).
     int min_neighbours = (role == 5 || role == 6) ? 2 : 0;
+    // Role 7 (Commons cooperator): a nearest-pellet eater that stops eating while the
+    // global stock is at or below bot_theta * K (the cue obs_extra = 3 gives a policy).
+    bool restrain = role == 7
+        && (float)env->food_active <= env->bot_theta * (float)env->num_food;
     float sense2 = sense * sense;
     Vec2 target = {0};
     float nearest = INFINITY;
@@ -1150,7 +1158,7 @@ void wef_bot_action(Wef* env, int i, float* raw) {
             float dx = env->food[f].pos.x - fish->pos.x;
             float dy = env->food[f].pos.y - fish->pos.y;
             float d2 = dx * dx + dy * dy;
-            if (d2 < nearest && d2 <= sense2
+            if (d2 < nearest && d2 <= sense2 && !restrain
                     && (min_neighbours == 0 || wef_food_neighbours(env, f) >= min_neighbours)) {
                 nearest = d2;
                 target = env->food[f].pos;
@@ -1231,6 +1239,11 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     }
     // Eaters never bite (biting suppresses eating that step); cleaners bite on waste.
     raw[3] = (role == 1 && in_cone) ? 1.0f : -1.0f;
+    if (restrain) {
+        // Eating is automatic on contact, so abstaining = holding still, not patrolling.
+        raw[0] = -8.0f;
+        raw[1] = 0.0f;
+    }
 }
 
 // Cleanup: nearest active waste item inside the fish's clean cone, -1 if none.
@@ -1546,6 +1559,33 @@ void puf_step(Wef* env) {
                     any_spawned = true;
                     wef_obj_event(env, 0, f, 2, env->food[f].pos);
                 }
+            }
+        } else if (env->regrow_mode == 2) {
+            // Commons: one global stock S with logistic growth. Each empty slot regrows
+            // w.p. p_max * S / K, so expected growth is p_max * S * (K - S) / K (zero at
+            // S = 0, max at K / 2); new pellets land uniformly in the arena, so what one
+            // fish leaves uneaten grows the stock for everyone. Depensation: no growth
+            // at or below the critical stock A = regrow_allee * K, so overharvesting
+            // past A collapses the commons for the rest of the episode.
+            float stock = (float)env->food_active;
+            float p = stock > env->regrow_allee * (float)env->num_food
+                ? env->regrow_p_max * stock / (float)env->num_food : 0.0f;
+            for (int f = 0; f < env->num_food; f++) {
+                if (env->food[f].active || random_uniform(env, 0.0f, 1.0f) >= p) {
+                    continue;
+                }
+                env->food[f] = (FishFood){
+                    .pos = {
+                        random_uniform(env, 0.0f, env->arena_size_x),
+                        random_uniform(env, 0.0f, env->arena_size_y),
+                    },
+                    .orientation = random_uniform(env, 0.0f, 2.0f * PI_F),
+                    .active = true,
+                };
+                env->food_active++;
+                env->regrown++;
+                any_spawned = true;
+                wef_obj_event(env, 0, f, 2, env->food[f].pos);
             }
         } else if (env->cleanup && env->regrow_q > 0.0f) {
             // Cleanup: uniform in the orchard, rate set by water quality.
@@ -2118,6 +2158,8 @@ void puf_init(Env* env, Dict* kwargs) {
     env->no_clean_agents = wef_cfg(kwargs, "no_clean_agents", 0);
     env->bot_shift_steps = wef_cfg(kwargs, "bot_shift_steps", 256);
     env->bot_oracle = wef_cfg(kwargs, "bot_oracle", 0);
+    env->bot_theta = wef_cfg(kwargs, "bot_theta", 0.5);
+    env->regrow_allee = wef_cfg(kwargs, "regrow_allee", 0.0);
     env->render_field = wef_cfg(kwargs, "render_field", 1);
     {
         // roles = r0,r1,r2,r3 (comma list; a scalar applies to slot 0 only)
@@ -2135,8 +2177,8 @@ void puf_init(Env* env, Dict* kwargs) {
     }
     assert(env->bot_shift_steps >= MAX_AGENTS);
     for (int i = 0; i < MAX_AGENTS; i++) {
-        assert(env->roles[i] >= 0 && env->roles[i] <= 6
-            && "roles: 0 policy, 1 cleaner, 2 eater, 3 shift, 4 random, 5 sustainable eater, 6 dense-first eater");
+        assert(env->roles[i] >= 0 && env->roles[i] <= 7
+            && "roles: 0 policy, 1 cleaner, 2 eater, 3 shift, 4 random, 5 sustainable eater, 6 dense-first eater, 7 stock-threshold eater");
     }
     assert((int)wef_cfg(kwargs, "num_bots", 0) == 0 && "num_bots is not supported by wef");
     assert(env->waste_max >= 0 && env->waste_max <= MAX_WASTE);
@@ -2158,10 +2200,10 @@ void puf_init(Env* env, Dict* kwargs) {
         assert((env->waste_max == 0 || env->strip_cm > 0.0f) && "cleanup: waste needs strip_cm > 0");
     } else {
         assert(env->waste_max == 0 && "waste needs cleanup = 1");
-        assert((env->regrow_p_max == 0.0f || env->regrow_mode == 1)
-            && "regrowth without cleanup needs regrow_mode = 1 (Harvest)");
+        assert((env->regrow_p_max == 0.0f || env->regrow_mode >= 1)
+            && "regrowth without cleanup needs regrow_mode = 1 (Harvest) or 2 (Commons)");
     }
-    assert(env->regrow_mode == 0 || env->regrow_mode == 1);
+    assert(env->regrow_mode >= 0 && env->regrow_mode <= 2);
     assert(env->regrow_radius_cm > 0.0f);
 
     // The trainer seeds env->rng with the env index before puf_init.

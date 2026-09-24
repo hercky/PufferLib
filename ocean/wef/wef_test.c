@@ -355,6 +355,42 @@ static void test_harvest(void) {
     dict_clear(&kw);
 }
 
+static void test_commons(void) {
+    printf("-- commons (global logistic stock) regrowth\n");
+    Dict kw = {0};
+    kw_base(&kw, 1);
+    kw_harvest(&kw);
+    dict_set(&kw, "regrow_mode", 2);
+    dict_set(&kw, "regrow_p_max", 0.05);
+    dict_set(&kw, "regrow_allee", 0.25);
+    dict_set(&kw, "obs_extra", 3);
+    Harness h = make(&kw, 1);
+    Env* env = h.env;
+    place_fish(env, 0, 5.0f, 60.0f, 0.0f);
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, -1.0f);
+    // At the critical stock A = 16 of K = 64 nothing regrows.
+    for (int f = 0; f < 64; f++) {
+        env->food[f].active = f < 16;
+    }
+    env->food_active = 16;
+    for (int t = 0; t < 200; t++) {
+        puf_step(env);
+    }
+    CHECK(env->food_active == 16, "no regrowth at the critical stock (S %d)", env->food_active);
+    CHECK(fabsf(env->agents[0].observations[103] - 0.25f) < 1e-6f, "obs[103] = S / K (%.3f)",
+        env->agents[0].observations[103]);
+    // Above it the stock grows toward K, with new pellets anywhere in the arena.
+    env->food[16].active = true;
+    env->food_active = 17;
+    int t = 0;
+    while (env->food_active < 48 && t < 2000) {
+        puf_step(env);
+        t++;
+    }
+    CHECK(env->food_active >= 48, "stock above A grows (S %d after %d steps)", env->food_active, t);
+    dict_clear(&kw);
+}
+
 static void test_baseline(void) {
     printf("-- baseline mode\n");
     Dict kw = {0};
@@ -479,6 +515,7 @@ int main(int argc, char** argv) {
     test_dynamics();
     test_actions();
     test_harvest();
+    test_commons();
     test_baseline();
     printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
     return g_fail ? 1 : 0;
