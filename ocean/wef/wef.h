@@ -107,12 +107,11 @@ typedef float obs_t;
 #define WEF_BITE_FLASH_FRAMES   30
 
 // Bite-selectivity metrics (Log): a fish is a "recent eater" for WEF_RECENT_STEPS after a
-// pellet; a "defector" if it recently ate while the stock was at or below
-// WEF_SUSTAIN_FRAC * K (regrowth modes) or ate without cleaning for WEF_CLEAN_MEMORY
+// pellet; a "defector" if it recently ate while the stock was at or below sustain_frac * K
+// (config key, default 0.5; regrowth modes) or ate without cleaning for WEF_CLEAN_MEMORY
 // steps (Cleanup).
 #define WEF_RECENT_STEPS 32
 #define WEF_CLEAN_MEMORY 256
-#define WEF_SUSTAIN_FRAC 0.5f
 
 // Field arrows: yellow (min) → red (max) log gradient over WEF |E| in V/cm.
 #define WEF_FIELD_LOG_LO        (-7.0f)   // 1e-7 V/cm
@@ -150,7 +149,7 @@ typedef struct FishAgent {
     float trace_nearest_food;  // trace only: nearest active pellet this step, -1 if none
     int bot_dir;      // scripted roles: patrol direction (+1 / -1)
     int eat_mark;     // metrics: tick of the last pellet eaten (0 = none this episode)
-    int low_eat_mark; // metrics: tick of the last pellet eaten with stock <= WEF_SUSTAIN_FRAC * K
+    int low_eat_mark; // metrics: tick of the last pellet eaten with stock <= sustain_frac * K
     int clean_mark;   // metrics: tick of the last cleaning bite
     Vec2 bot_last;    // scripted roles: position at the previous decision (stall detection)
     int bot_stall;    // scripted roles: consecutive decisions without moving
@@ -266,7 +265,7 @@ struct Log {
     // Bite selectivity (enforcement signal). Selectivity toward defectors =
     // (bites_on_defectors / bites) / defector_frac; > 1 means bites target defectors.
     float bites_on_eaters;   // victim ate within WEF_RECENT_STEPS
-    float bites_on_defectors;// victim is a "defector" (see WEF_SUSTAIN_FRAC / WEF_CLEAN_MEMORY)
+    float bites_on_defectors;// victim is a "defector" (see sustain_frac / WEF_CLEAN_MEMORY)
     float bites_at_risk;     // bite while the commons is at risk (stock <= K/2; Cleanup: quality < 0.5)
     float bites_top;         // bites by the single most-biting fish (share = bites_top / bites)
     float eater_frac;        // time-mean fraction of fish that are recent eaters
@@ -441,6 +440,7 @@ struct Env {
     float regrow_allee;         // commons: no regrowth while S <= regrow_allee * K (depensation)
     int render_field;           // renderer: 1 field arrows around each fish (upstream), 0 off
     float render_field_alpha;   // renderer: arrow opacity multiplier (1 = upstream)
+    float sustain_frac;         // metrics only: stock fraction at/below which eating counts as defecting
     int season_steps;           // regrow_mode 3: steps per season (stock grows only at season ends)
     float season_growth;        // regrow_mode 3: stock multiplier per season, capped at K (GovSim: 2)
     bool regrows;               // any regrowth mode active (fixed-length episodes, V2 traces, stock perf)
@@ -1401,7 +1401,7 @@ static inline int wef_at_risk(const Wef* env) {
         return env->regrow_q < 0.5f;
     }
     if (env->regrows) {
-        return (float)env->food_active <= WEF_SUSTAIN_FRAC * (float)env->num_food;
+        return (float)env->food_active <= env->sustain_frac * (float)env->num_food;
     }
     return 0;
 }
@@ -1465,7 +1465,7 @@ void puf_step(Wef* env) {
                 }
                 env->food[f].active = false;
                 agent->eat_mark = env->tick;
-                if ((float)env->food_active <= WEF_SUSTAIN_FRAC * (float)env->num_food) {
+                if ((float)env->food_active <= env->sustain_frac * (float)env->num_food) {
                     agent->low_eat_mark = env->tick;
                 }
                 env->food_eaten++;
@@ -2360,7 +2360,41 @@ double wef_cfg(Dict* kwargs, const char* key, double fallback) {
     return item ? item->value : fallback;
 }
 
+// Every [env] key the env reads (plus default.ini's shared "dr"). The trainer and the CPU
+// harness accept any --env.key, and wef_cfg falls back to a default for a missing key, so a
+// misspelled key would silently run the default: reject unknown keys instead.
+static const char* WEF_ENV_KEYS[] = {
+    "dr", "num_agents", "num_bots", "min_arena_width", "max_arena_width", "min_arena_height",
+    "max_arena_height", "food_distribution", "num_food", "patch_radius", "patch_radius_std",
+    "patch_density", "electric_field_radius", "reflection_wall_range", "episode_length",
+    "cleanup", "strip_cm", "orchard_cm", "spawn_band", "waste_max", "waste_start",
+    "waste_spawn_p", "waste_spawn_delay", "waste_theta", "waste_radius_cm", "waste_contrast",
+    "waste_sense_range_cm", "regrow_p_max", "regrow_mode", "regrow_allee", "season_steps",
+    "season_growth", "regrow_radius_cm", "food_start", "clean_priority", "clean_radius_cm",
+    "clean_max_items", "clean_cooldown_steps", "clean_reward", "clean_reward_anneal_steps",
+    "bitten_freeze_steps", "bitten_reward", "bite_reward", "eod_cost", "reward_share",
+    "proximity_shaping", "obs_extra", "size_min", "size_max", "desync_first_episode",
+    "policy1_agents", "no_clean_agents", "roles", "bot_shift_steps", "bot_oracle", "bot_theta",
+    "render_field", "render_field_alpha", "sustain_frac",
+};
+
+static void wef_check_keys(Dict* kwargs) {
+    int n_known = (int)(sizeof(WEF_ENV_KEYS) / sizeof(WEF_ENV_KEYS[0]));
+    for (int i = 0; i < kwargs->size; i++) {
+        bool known = false;
+        for (int k = 0; k < n_known && !known; k++) {
+            known = strcmp(kwargs->items[i].key, WEF_ENV_KEYS[k]) == 0;
+        }
+        if (!known) {
+            fprintf(stderr, "wef: unknown [env] key '%s' (misspelled? see config/wef.ini)\n",
+                kwargs->items[i].key);
+            exit(1);
+        }
+    }
+}
+
 void puf_init(Env* env, Dict* kwargs) {
+    wef_check_keys(kwargs);
     env->num_agents = dict_get(kwargs, "num_agents");
     assert(env->num_agents > 0 && env->num_agents <= MAX_AGENTS);
     env->min_arena_size_x = dict_get(kwargs, "min_arena_width");
@@ -2422,6 +2456,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->render_field_alpha = wef_cfg(kwargs, "render_field_alpha", 1.0);
     env->season_steps = wef_cfg(kwargs, "season_steps", 0);
     env->season_growth = wef_cfg(kwargs, "season_growth", 2.0);
+    env->sustain_frac = wef_cfg(kwargs, "sustain_frac", 0.5);
     {
         // roles = r0,r1,r2,r3 (comma list; a scalar applies to slot 0 only)
         DictItem* item = dict_find(kwargs, "roles");

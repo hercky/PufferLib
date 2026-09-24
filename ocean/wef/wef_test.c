@@ -500,6 +500,12 @@ static int run_calibration(int argc, char** argv) {
         }
         char key[64];
         char val[64];
+        if (strpbrk(argv[a], " \t") != NULL) {
+            // zsh does not word-split an unquoted $VAR: "k1=v1 k2=v2" arrives as one argv and
+            // sscanf would keep only k1, silently running the default preset for the rest.
+            fprintf(stderr, "argument contains whitespace (unsplit variable?): '%s'\n", argv[a]);
+            return 2;
+        }
         if (sscanf(argv[a], "%63[^=]=%63s", key, val) != 2) {
             fprintf(stderr, "bad arg %s\n", argv[a]);
             return 2;
