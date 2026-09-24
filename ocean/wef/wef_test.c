@@ -81,10 +81,12 @@ static void kw_harvest(Dict* kw) {
     dict_set(kw, "size_max", 0.5);
 }
 
+static unsigned int g_seed = 7;  // calibration: seed=N on the command line
+
 static Harness make(Dict* kw, int num_fish) {
     Harness h = {0};
     h.env = (Env*)calloc(1, sizeof(Env));
-    h.env->rng = 7;
+    h.env->rng = g_seed;
     puf_init(h.env, kw);
     h.obs = (obs_t*)calloc((size_t)num_fish * OBS_SIZE, sizeof(obs_t));
     h.act = (float*)calloc((size_t)num_fish * NUM_ATNS, sizeof(float));
@@ -504,6 +506,8 @@ static int run_calibration(int argc, char** argv) {
         }
         if (strcmp(key, "roles") == 0) {
             roles = argv[a] + 6;
+        } else if (strcmp(key, "seed") == 0) {
+            g_seed = (unsigned int)atoi(val);
         } else if (strcmp(key, "episodes") == 0) {
             episodes = atoi(val);
         } else if (strcmp(key, "oracle") == 0) {
