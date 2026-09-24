@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "raylib.h"
+#include "rlgl.h"  // rlReadScreenPixels / rlDrawRenderBatchActive (WEF_VIDEO_OUT capture)
 typedef float obs_t;
 #include "pufferenv.h"
 
@@ -331,6 +332,9 @@ typedef struct Client {
     int bites_given[MAX_AGENTS];
     int bites_taken[MAX_AGENTS];
     int bites_total;
+    // WEF_VIDEO_OUT: raw frames piped to ffmpeg, one per env step, first episode only.
+    FILE* video;
+    int video_frames;
 } Client;
 
 typedef struct FishFood {
@@ -1954,6 +1958,23 @@ void puf_render(Wef* env) {
         InitWindow(client->window_width, client->window_height, "Weakly Electric fish");
         SetTargetFPS(60);
         HideCursor();
+        // Deterministic recording: WEF_VIDEO_OUT=clip.mp4 pipes one frame per env step to
+        // ffmpeg (WEF_VIDEO_FPS frames/s, default 30) for the first episode, unthrottled;
+        // WEF_VIDEO_EXIT=1 exits once the file is written. Screen grabbing instead samples
+        // on its own clock and duplicates / drops steps (jerky motion).
+        const char* video_out = getenv("WEF_VIDEO_OUT");
+        if (video_out != NULL && video_out[0] != '\0') {
+            const char* fps_env = getenv("WEF_VIDEO_FPS");
+            int fps = fps_env != NULL && atoi(fps_env) > 0 ? atoi(fps_env) : 30;
+            char cmd[4600];
+            snprintf(cmd, sizeof(cmd),
+                "ffmpeg -loglevel error -y -f rawvideo -pix_fmt rgba -s %dx%d -r %d -i - "
+                "-c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p '%s'",
+                GetRenderWidth(), GetRenderHeight(), fps, video_out);
+            client->video = popen(cmd, "w");
+            assert(client->video != NULL && "WEF_VIDEO_OUT: could not start ffmpeg");
+            SetTargetFPS(0);
+        }
         env->client = client;
     }
     if (IsKeyDown(KEY_ESCAPE)) {
@@ -1996,6 +2017,13 @@ void puf_render(Wef* env) {
         if (env->agents[i].terminals[0]) {
             trace->index = 0;
             trace->count = 0;
+            if (i == 0 && env->client->video != NULL && env->client->video_frames > 0) {
+                pclose(env->client->video);  // waits for ffmpeg to finish the file
+                env->client->video = NULL;
+                if (getenv("WEF_VIDEO_EXIT") != NULL) {
+                    exit(0);
+                }
+            }
             if (i == 0) {
                 for (int k = 0; k < MAX_AGENTS; k++) {
                     env->client->bites_given[k] = 0;
@@ -2294,6 +2322,15 @@ void puf_render(Wef* env) {
         wef_draw_field_colorbar(
             env->client->window_width, env->client->window_height
         );
+    }
+    if (env->client->video != NULL) {
+        rlDrawRenderBatchActive();
+        int w = GetRenderWidth();
+        int h = GetRenderHeight();
+        unsigned char* pixels = rlReadScreenPixels(w, h);
+        fwrite(pixels, 1, (size_t)w * (size_t)h * 4, env->client->video);
+        free(pixels);
+        env->client->video_frames++;
     }
     EndDrawing();
     puf_web_vsync();
