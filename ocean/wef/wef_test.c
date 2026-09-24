@@ -391,6 +391,60 @@ static void test_commons(void) {
     dict_clear(&kw);
 }
 
+static void test_seasonal(void) {
+    printf("-- seasonal (GovSim-style) regrowth and bite metrics\n");
+    Dict kw = {0};
+    kw_base(&kw, 2);
+    kw_harvest(&kw);
+    dict_set(&kw, "regrow_mode", 3);
+    dict_set(&kw, "regrow_p_max", 0);
+    dict_set(&kw, "season_steps", 50);
+    dict_set(&kw, "season_growth", 2.0);
+    dict_set(&kw, "regrow_allee", 0.1);
+    Harness h = make(&kw, 2);
+    Env* env = h.env;
+    CHECK(env->regrows && env->cur_episode_length == 1024, "mode 3 counts as regrowth (fixed-length episode)");
+    clear_objects(env);
+    for (int f = 0; f < 20; f++) {
+        env->food[f] = (FishFood){.pos = {60.0f + 0.1f * f, 60.0f}, .active = true};
+    }
+    env->food_active = 20;
+    place_fish(env, 0, 5.0f, 5.0f, 0.0f);
+    place_fish(env, 1, 10.0f, 5.0f, 0.0f);
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, -1.0f);
+    set_action(&h, 1, -8.0f, 0.0f, 1.0f, -1.0f);
+    while (env->tick < 49) {
+        puf_step(env);
+    }
+    CHECK(env->food_active == 20, "no growth within a season (S %d)", env->food_active);
+    puf_step(env);
+    CHECK(env->food_active == 40 && !env->collapsed, "season end doubles the stock (S %d)", env->food_active);
+    // Drop the stock to the threshold (0.1 * 64 = 6.4): collapse at the next season end, for good.
+    for (int f = 6; f < 64; f++) {
+        env->food[f].active = false;
+    }
+    env->food_active = 6;
+    while (env->tick < 150) {
+        puf_step(env);
+    }
+    CHECK(env->collapsed && env->collapse_tick == 100 && env->food_active == 6,
+        "stock at the threshold collapses and never regrows (collapsed %d at %d, S %d)",
+        env->collapsed, env->collapse_tick, env->food_active);
+
+    // Bite metrics: fish 1 ate while the stock was <= K/2, then fish 0 bites it.
+    env->fish[1].eat_mark = env->tick;
+    env->fish[1].low_eat_mark = env->tick;
+    place_fish(env, 0, 20.0f, 20.0f, 0.0f);
+    place_fish(env, 1, 22.0f, 20.0f, 0.0f);
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, 1.0f);
+    puf_step(env);
+    CHECK(env->bites == 1 && env->bites_on_eaters == 1 && env->bites_on_defectors == 1
+        && env->bites_at_risk == 1 && env->bites_by[0] == 1,
+        "bite on a recent low-stock eater counts as eater/defector/at-risk (%d %d %d %d)",
+        env->bites, env->bites_on_eaters, env->bites_on_defectors, env->bites_at_risk);
+    dict_clear(&kw);
+}
+
 static void test_baseline(void) {
     printf("-- baseline mode\n");
     Dict kw = {0};
@@ -468,6 +522,8 @@ static int run_calibration(int argc, char** argv) {
     double open_frac = 0.0;
     double collective = 0.0;
     double stock_left = 0.0;
+    double collapsed = 0.0;
+    double survival = 0.0;
     const char* dbg = getenv("WEF_TEST_DEBUG");
     for (int e = 0; e < episodes; e++) {
         while (env->episode == e) {
@@ -487,14 +543,17 @@ static int run_calibration(int argc, char** argv) {
                 }
                 collective += env->food_eaten;
                 stock_left += env->food_active;
+                collapsed += env->collapsed ? 1.0 : 0.0;
+                survival += env->collapsed ? (double)env->collapse_tick / env->cur_episode_length : 1.0;
                 waste_frac += env->waste_frac_sum / env->cur_episode_length;
                 open_frac += (double)env->open_steps / env->cur_episode_length;
             }
         }
     }
     printf("roles=%s oracle=%d episodes=%d\n", roles, env->bot_oracle, episodes);
-    printf("  collective pellets/episode %.1f   waste_frac %.3f   open_frac %.3f   stock_left %.1f\n",
-        collective / episodes, waste_frac / episodes, open_frac / episodes, stock_left / episodes);
+    printf("  collective pellets/episode %.1f   waste_frac %.3f   open_frac %.3f   stock_left %.1f   collapsed %.2f   survival %.3f\n",
+        collective / episodes, waste_frac / episodes, open_frac / episodes, stock_left / episodes,
+        collapsed / episodes, survival / episodes);
     printf("  slot role pellets cleans strip%%  cleans/strip-step\n");
     for (int i = 0; i < 4; i++) {
         double strip_steps = strip[i] / episodes * env->episode_length;
@@ -516,6 +575,7 @@ int main(int argc, char** argv) {
     test_actions();
     test_harvest();
     test_commons();
+    test_seasonal();
     test_baseline();
     printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
     return g_fail ? 1 : 0;

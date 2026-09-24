@@ -105,6 +105,14 @@ typedef float obs_t;
 #define WEF_COLOR_BITE          ((Color){255, 70, 70, 255})
 #define WEF_BITE_FLASH_FRAMES   30
 
+// Bite-selectivity metrics (Log): a fish is a "recent eater" for WEF_RECENT_STEPS after a
+// pellet; a "defector" if it recently ate while the stock was at or below
+// WEF_SUSTAIN_FRAC * K (regrowth modes) or ate without cleaning for WEF_CLEAN_MEMORY
+// steps (Cleanup).
+#define WEF_RECENT_STEPS 32
+#define WEF_CLEAN_MEMORY 256
+#define WEF_SUSTAIN_FRAC 0.5f
+
 // Field arrows: yellow (min) → red (max) log gradient over WEF |E| in V/cm.
 #define WEF_FIELD_LOG_LO        (-7.0f)   // 1e-7 V/cm
 #define WEF_FIELD_LOG_HI        (-3.0f)   // 1e-3 V/cm
@@ -140,6 +148,9 @@ typedef struct FishAgent {
     int cleaned;      // trace only: waste items removed this step
     float trace_nearest_food;  // trace only: nearest active pellet this step, -1 if none
     int bot_dir;      // scripted roles: patrol direction (+1 / -1)
+    int eat_mark;     // metrics: tick of the last pellet eaten (0 = none this episode)
+    int low_eat_mark; // metrics: tick of the last pellet eaten with stock <= WEF_SUSTAIN_FRAC * K
+    int clean_mark;   // metrics: tick of the last cleaning bite
     Vec2 bot_last;    // scripted roles: position at the previous decision (stall detection)
     int bot_stall;    // scripted roles: consecutive decisions without moving
     int bot_escape;   // scripted roles: steps left of a random-heading escape
@@ -251,6 +262,18 @@ struct Log {
     float strip_frac;        // fraction of fish-steps spent in the waste strip
     float bites_in_strip;
     float freezes;
+    // Bite selectivity (enforcement signal). Selectivity toward defectors =
+    // (bites_on_defectors / bites) / defector_frac; > 1 means bites target defectors.
+    float bites_on_eaters;   // victim ate within WEF_RECENT_STEPS
+    float bites_on_defectors;// victim is a "defector" (see WEF_SUSTAIN_FRAC / WEF_CLEAN_MEMORY)
+    float bites_at_risk;     // bite while the commons is at risk (stock <= K/2; Cleanup: quality < 0.5)
+    float bites_top;         // bites by the single most-biting fish (share = bites_top / bites)
+    float eater_frac;        // time-mean fraction of fish that are recent eaters
+    float defector_frac;     // time-mean fraction of fish that are defectors
+    float frozen_frac;       // fraction of fish-steps spent frozen (bitten_freeze_steps)
+    // Commons collapse (GovSim-style): regrowth modes 2 and 3.
+    float collapsed;         // fraction of episodes in which the stock collapsed
+    float survival_frac;     // collapse tick / episode length (1 if it never collapsed)
     float policy_0_score;    // mean raw return of fish on policy 0 (match eval)
     float policy_1_score;
     float draw_rate;         // always 0; required by match eval
@@ -413,6 +436,19 @@ struct Env {
     float bot_theta;            // role 7: eat only while food_active > bot_theta * num_food
     float regrow_allee;         // commons: no regrowth while S <= regrow_allee * K (depensation)
     int render_field;           // renderer: 1 field arrows around each fish (upstream), 0 off
+    float render_field_alpha;   // renderer: arrow opacity multiplier (1 = upstream)
+    int season_steps;           // regrow_mode 3: steps per season (stock grows only at season ends)
+    float season_growth;        // regrow_mode 3: stock multiplier per season, capped at K (GovSim: 2)
+    bool regrows;               // any regrowth mode active (fixed-length episodes, V2 traces, stock perf)
+    bool collapsed;             // regrowth modes 2/3: stock fell to the collapse threshold (absorbing)
+    int collapse_tick;
+    int bites_by[MAX_AGENTS];
+    int bites_on_eaters;
+    int bites_on_defectors;
+    int bites_at_risk;
+    int eater_steps;
+    int defector_steps;
+    int frozen_steps;
     Waste waste[MAX_WASTE];
     int waste_active;
     int food_active;
@@ -878,6 +914,14 @@ void puf_reset(Wef* env) {
     env->regrown = 0;
     env->freezes = 0;
     env->bites_in_strip = 0;
+    env->bites_on_eaters = 0;
+    env->bites_on_defectors = 0;
+    env->bites_at_risk = 0;
+    env->eater_steps = 0;
+    env->defector_steps = 0;
+    env->frozen_steps = 0;
+    env->collapsed = false;
+    env->collapse_tick = 0;
     env->open_steps = 0;
     env->waste_frac_sum = 0.0f;
     env->raw_return_sum = 0.0f;
@@ -887,6 +931,7 @@ void puf_reset(Wef* env) {
         env->strip_steps_by[i] = 0;
         env->clean_pending[i] = 0;
         env->return_by[i] = 0.0f;
+        env->bites_by[i] = 0;
     }
     // Only the first episode of an env can be shortened (desync_first_episode).
     env->cur_episode_length = env->episode == 0 ? env->first_episode_len : env->episode_length;
@@ -1077,7 +1122,7 @@ void wef_trace_step(Wef* env) {
             .zone = wef_zone(env, agent->pos),
         };
     }
-    if (env->cleanup || env->regrow_p_max > 0.0f) {
+    if (env->cleanup || env->regrows) {
         fwrite(rows, sizeof(WefTraceRowV2), env->num_agents, env->trace_file);
     } else {
         // Baseline format: the V2 row starts with the V1 fields, so write that prefix.
@@ -1331,6 +1376,32 @@ float wef_gini(const int* x, int n) {
     return abs_diff / (2.0f * (float)n * total);
 }
 
+// Bite-selectivity helpers (metrics only; no effect on dynamics or RNG).
+static inline int wef_recent(const Wef* env, int mark, int window) {
+    return mark > 0 && env->tick - mark < window;
+}
+
+static inline int wef_is_defector(const Wef* env, const FishAgent* fish) {
+    if (env->cleanup) {
+        return wef_recent(env, fish->eat_mark, WEF_RECENT_STEPS)
+            && !wef_recent(env, fish->clean_mark, WEF_CLEAN_MEMORY);
+    }
+    if (env->regrows) {
+        return wef_recent(env, fish->low_eat_mark, WEF_RECENT_STEPS);
+    }
+    return 0;
+}
+
+static inline int wef_at_risk(const Wef* env) {
+    if (env->cleanup) {
+        return env->regrow_q < 0.5f;
+    }
+    if (env->regrows) {
+        return (float)env->food_active <= WEF_SUSTAIN_FRAC * (float)env->num_food;
+    }
+    return 0;
+}
+
 void puf_step(Wef* env) {
     env->tick++;
     for (int i = 0; i < env->num_agents; i++) {
@@ -1389,6 +1460,10 @@ void puf_step(Wef* env) {
                     continue;
                 }
                 env->food[f].active = false;
+                agent->eat_mark = env->tick;
+                if ((float)env->food_active <= WEF_SUSTAIN_FRAC * (float)env->num_food) {
+                    agent->low_eat_mark = env->tick;
+                }
                 env->food_eaten++;
                 env->food_active--;
                 env->food_by[i]++;
@@ -1476,7 +1551,7 @@ void puf_step(Wef* env) {
             }
             agent->previous_food_distance = nearest_food;
             agent->has_previous_food_distance = true;
-        } else if (env->cleanup || env->regrow_p_max > 0.0f) {
+        } else if (env->cleanup || env->regrows) {
             // No pellet to measure against: forget the stale distance so the next
             // spawn does not pay a windfall.
             agent->has_previous_food_distance = false;
@@ -1527,6 +1602,7 @@ void puf_step(Wef* env) {
             }
             env->cleans += removed;
             env->cleans_by[i] += removed;
+            attacker->clean_mark = env->tick;
             attacker->cleaned = removed;
             env->clean_pending[i] = removed;
             attacker->bite_cooldown = env->clean_cooldown_steps;
@@ -1534,6 +1610,10 @@ void puf_step(Wef* env) {
             env->fish[victim].was_bitten = true;
             attacker->bite_victim = victim;
             env->bites++;
+            env->bites_by[i]++;
+            env->bites_on_eaters += wef_recent(env, env->fish[victim].eat_mark, WEF_RECENT_STEPS);
+            env->bites_on_defectors += wef_is_defector(env, &env->fish[victim]);
+            env->bites_at_risk += wef_at_risk(env);
             // Reference: is_bitten * (1 + size_diff), size_diff ∈ [-1, 1] → factor ∈ [0, 2]
             float size_difference = attacker->size - env->fish[victim].size;
             env->agents[victim].rewards[0] += env->bitten_reward * (1.0f + size_difference);
@@ -1573,9 +1653,40 @@ void puf_step(Wef* env) {
         }
         env->regrow_q = q;
     }
-    if (env->regrow_p_max > 0.0f) {
+    if (env->regrows) {
         bool any_spawned = false;
-        if (env->regrow_mode == 1) {
+        if (env->regrow_mode == 3) {
+            // Seasonal (GovSim-style): no growth within a season; at each season end the
+            // stock is multiplied by season_growth (capped at K) unless it is at or below
+            // the collapse threshold regrow_allee * K, in which case it never regrows.
+            if (!env->collapsed && env->tick % env->season_steps == 0) {
+                int stock = env->food_active;
+                if ((float)stock <= env->regrow_allee * (float)env->num_food || stock == 0) {
+                    env->collapsed = true;
+                    env->collapse_tick = env->tick;
+                } else {
+                    int target = (int)floorf((float)stock * env->season_growth + 0.5f);
+                    target = target > env->num_food ? env->num_food : target;
+                    for (int f = 0; f < env->num_food && env->food_active < target; f++) {
+                        if (env->food[f].active) {
+                            continue;
+                        }
+                        env->food[f] = (FishFood){
+                            .pos = {
+                                random_uniform(env, 0.0f, env->arena_size_x),
+                                random_uniform(env, 0.0f, env->arena_size_y),
+                            },
+                            .orientation = random_uniform(env, 0.0f, 2.0f * PI_F),
+                            .active = true,
+                        };
+                        env->food_active++;
+                        env->regrown++;
+                        any_spawned = true;
+                        wef_obj_event(env, 0, f, 2, env->food[f].pos);
+                    }
+                }
+            }
+        } else if (env->regrow_mode == 1) {
             // Harvest: density-dependent regrowth at the slot's own position. Counts
             // use the pre-regrowth state so slot order does not matter.
             float p_slot[MAX_FOOD];
@@ -1641,8 +1752,19 @@ void puf_step(Wef* env) {
                 env->fish[i].has_previous_food_distance = false;
             }
         }
+        if (env->regrow_mode == 2 && !env->collapsed
+                && ((float)env->food_active <= env->regrow_allee * (float)env->num_food
+                    || env->food_active == 0)) {
+            env->collapsed = true;  // absorbing: growth is zero at or below the threshold
+            env->collapse_tick = env->tick;
+        }
     }
 
+    for (int i = 0; i < env->num_agents; i++) {
+        env->eater_steps += wef_recent(env, env->fish[i].eat_mark, WEF_RECENT_STEPS);
+        env->defector_steps += wef_is_defector(env, &env->fish[i]);
+        env->frozen_steps += env->fish[i].freeze > 0;
+    }
     for (int i = 0; i < env->num_agents; i++) {
         env->fish[i].eat_cooldown -= env->fish[i].eat_cooldown > 0;
         env->fish[i].bite_cooldown -= env->fish[i].bite_cooldown > 0;
@@ -1683,7 +1805,7 @@ void puf_step(Wef* env) {
     compute_observations(env);
 
     if (env->tick >= env->cur_episode_length
-            || (!env->cleanup && env->regrow_p_max <= 0.0f && env->food_eaten == env->num_food)) {
+            || (!env->cleanup && !env->regrows && env->food_eaten == env->num_food)) {
         env->episode++;
         if (env->trace_file != NULL) {
             fflush(env->trace_file);
@@ -1697,7 +1819,7 @@ void puf_step(Wef* env) {
         env->log.score += env->raw_return_sum;
         float waste_frac = env->waste_max > 0 ? env->waste_frac_sum / ticks : 0.0f;
         env->log.perf += env->cleanup ? 1.0f - waste_frac
-            : env->regrow_p_max > 0.0f ? (float)env->food_active / (float)env->num_food  // Harvest: stock left
+            : env->regrows ? (float)env->food_active / (float)env->num_food  // Harvest/Commons: stock left
             : (float)env->food_eaten / (float)env->num_food;
         env->log.food_eaten_mean +=(float)env->food_eaten / (float)env->num_agents;
         env->log.eod_rate += (float)env->eod_agent_steps / (float)(env->tick * env->num_agents);
@@ -1722,6 +1844,22 @@ void puf_step(Wef* env) {
         env->log.strip_frac += (float)strip_steps / (ticks * (float)env->num_agents);
         env->log.bites_in_strip += (float)env->bites_in_strip;
         env->log.freezes += (float)env->freezes;
+        {
+            float fish_steps = ticks * (float)env->num_agents;
+            int top = 0;
+            for (int i = 0; i < env->num_agents; i++) {
+                top = env->bites_by[i] > top ? env->bites_by[i] : top;
+            }
+            env->log.bites_on_eaters += (float)env->bites_on_eaters;
+            env->log.bites_on_defectors += (float)env->bites_on_defectors;
+            env->log.bites_at_risk += (float)env->bites_at_risk;
+            env->log.bites_top += (float)top;
+            env->log.eater_frac += (float)env->eater_steps / fish_steps;
+            env->log.defector_frac += (float)env->defector_steps / fish_steps;
+            env->log.frozen_frac += (float)env->frozen_steps / fish_steps;
+            env->log.collapsed += env->collapsed ? 1.0f : 0.0f;
+            env->log.survival_frac += env->collapsed ? (float)env->collapse_tick / ticks : 1.0f;
+        }
         float pol_sum[2] = {0.0f, 0.0f};
         int pol_n[2] = {0, 0};
         for (int i = 0; i < env->num_agents; i++) {
@@ -1994,9 +2132,9 @@ void puf_render(Wef* env) {
                     base.x - ux * arrow_len * 0.5f,
                     base.y - uy * arrow_len * 0.5f,
                 };
-                wef_draw_field_arrow(
-                    mid, ux, uy, arrow_len, wef_color_from_field(strength)
-                );
+                Color arrow = wef_color_from_field(strength);
+                arrow.a = (unsigned char)((float)arrow.a * clamp(env->render_field_alpha, 0.0f, 1.0f));
+                wef_draw_field_arrow(mid, ux, uy, arrow_len, arrow);
             }
         }
     }
@@ -2139,7 +2277,7 @@ void puf_render(Wef* env) {
             env->food_active, env->food_eaten, env->waste_active, env->waste_max, env->cleans);
         DrawText(status, env->client->window_width - 70 - MeasureText(status, 18),
             env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
-    } else if (env->regrow_p_max > 0.0f) {
+    } else if (env->regrows) {
         const char* status = TextFormat("food %d active (%d eaten, %d regrown)",
             env->food_active, env->food_eaten, env->regrown);
         DrawText(status, env->client->window_width - 70 - MeasureText(status, 18),
@@ -2149,7 +2287,7 @@ void puf_render(Wef* env) {
             20, env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
     }
     DrawText(TextFormat("field radius %.0f cm", env->electric_field_radius_cm),
-        env->cleanup || env->regrow_p_max > 0.0f ? 20 : 180,
+        env->cleanup || env->regrows ? 20 : 180,
         env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
 
     if (env->client->show_field) {
@@ -2244,6 +2382,9 @@ void puf_init(Env* env, Dict* kwargs) {
     env->bot_theta = wef_cfg(kwargs, "bot_theta", 0.5);
     env->regrow_allee = wef_cfg(kwargs, "regrow_allee", 0.0);
     env->render_field = wef_cfg(kwargs, "render_field", 1);
+    env->render_field_alpha = wef_cfg(kwargs, "render_field_alpha", 1.0);
+    env->season_steps = wef_cfg(kwargs, "season_steps", 0);
+    env->season_growth = wef_cfg(kwargs, "season_growth", 2.0);
     {
         // roles = r0,r1,r2,r3 (comma list; a scalar applies to slot 0 only)
         DictItem* item = dict_find(kwargs, "roles");
@@ -2284,9 +2425,12 @@ void puf_init(Env* env, Dict* kwargs) {
     } else {
         assert(env->waste_max == 0 && "waste needs cleanup = 1");
         assert((env->regrow_p_max == 0.0f || env->regrow_mode >= 1)
-            && "regrowth without cleanup needs regrow_mode = 1 (Harvest) or 2 (Commons)");
+            && "regrowth without cleanup needs regrow_mode = 1 (Harvest), 2 (Commons) or 3 (seasonal)");
     }
-    assert(env->regrow_mode >= 0 && env->regrow_mode <= 2);
+    assert(env->regrow_mode >= 0 && env->regrow_mode <= 3);
+    assert((env->regrow_mode != 3 || (env->season_steps > 0 && !env->cleanup))
+        && "regrow_mode 3 (seasonal) needs season_steps > 0 and cleanup = 0");
+    env->regrows = env->regrow_p_max > 0.0f || env->regrow_mode == 3;
     assert(env->regrow_radius_cm > 0.0f);
 
     // The trainer seeds env->rng with the env index before puf_init.
@@ -2301,7 +2445,7 @@ void puf_init(Env* env, Dict* kwargs) {
     const char* trace_dir = getenv("WEF_TRACE_DIR");
     if (trace_dir != NULL && trace_dir[0] != '\0') {
         char path[4096];
-        bool v2 = env->cleanup || env->regrow_p_max > 0.0f;
+        bool v2 = env->cleanup || env->regrows;
         snprintf(path, sizeof(path), v2 ? "%s/env_%05d.v2.bin" : "%s/env_%05d.bin",
             trace_dir, env->env_id);
         env->trace_file = fopen(path, "wb");
@@ -2370,6 +2514,15 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "strip_frac", log->strip_frac);
     dict_set(out, "bites_in_strip", log->bites_in_strip);
     dict_set(out, "freezes", log->freezes);
+    dict_set(out, "bites_on_eaters", log->bites_on_eaters);
+    dict_set(out, "bites_on_defectors", log->bites_on_defectors);
+    dict_set(out, "bites_at_risk", log->bites_at_risk);
+    dict_set(out, "bites_top", log->bites_top);
+    dict_set(out, "eater_frac", log->eater_frac);
+    dict_set(out, "defector_frac", log->defector_frac);
+    dict_set(out, "frozen_frac", log->frozen_frac);
+    dict_set(out, "collapsed", log->collapsed);
+    dict_set(out, "survival_frac", log->survival_frac);
     dict_set(out, "policy_0_score", log->policy_0_score);
     dict_set(out, "policy_1_score", log->policy_1_score);
     dict_set(out, "draw_rate", log->draw_rate);
