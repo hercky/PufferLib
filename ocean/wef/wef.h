@@ -138,6 +138,10 @@ typedef struct FishAgent {
     int cleaned;      // trace only: waste items removed this step
     float trace_nearest_food;  // trace only: nearest active pellet this step, -1 if none
     int bot_dir;      // scripted roles: patrol direction (+1 / -1)
+    Vec2 bot_last;    // scripted roles: position at the previous decision (stall detection)
+    int bot_stall;    // scripted roles: consecutive decisions without moving
+    int bot_escape;   // scripted roles: steps left of a random-heading escape
+    float bot_escape_turn;
     bool has_previous_food_distance;
     float previous_food_distance;
     float last_action[ACTION_SIZE];
@@ -1110,6 +1114,26 @@ void wef_bot_action(Wef* env, int i, float* raw) {
         int phase = (env->tick + i * (env->bot_shift_steps / MAX_AGENTS)) / env->bot_shift_steps;
         role = (phase % 2 == 0) ? 1 : 2;
     }
+    // Stall escape: collisions revert position but not heading, and the 3 cm avoidance
+    // turn below fights the pursuit turn, so two bots next to one pellet can pin each
+    // other for the rest of the episode. After 40 motionless decisions, swim off on a
+    // random heading for 25 steps (role 7 holding still on purpose resets the count).
+    float moved = fabsf(fish->pos.x - fish->bot_last.x) + fabsf(fish->pos.y - fish->bot_last.y);
+    fish->bot_last = fish->pos;
+    fish->bot_stall = (moved < 0.01f && !fish->ate) ? fish->bot_stall + 1 : 0;
+    if (fish->bot_stall > 40 && fish->bot_escape == 0) {
+        fish->bot_escape = 25;
+        fish->bot_escape_turn = random_uniform(env, -1.0f, 1.0f);
+    }
+    if (fish->bot_escape > 0 && role != 4) {
+        fish->bot_escape--;
+        fish->bot_stall = 0;
+        raw[0] = 2.2f;
+        raw[1] = fish->bot_escape_turn;
+        raw[2] = 1.0f;
+        raw[3] = -1.0f;
+        return;
+    }
     if (role == 4) {
         raw[0] = random_uniform(env, -2.0f, 2.0f);
         raw[1] = random_uniform(env, -2.0f, 2.0f);
@@ -1243,6 +1267,7 @@ void wef_bot_action(Wef* env, int i, float* raw) {
         // Eating is automatic on contact, so abstaining = holding still, not patrolling.
         raw[0] = -8.0f;
         raw[1] = 0.0f;
+        fish->bot_stall = 0;
     }
 }
 
