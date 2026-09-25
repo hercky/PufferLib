@@ -17,6 +17,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <time.h>
 
 #include "wef.h"
 
@@ -629,10 +631,123 @@ static int run_calibration(int argc, char** argv) {
     return 0;
 }
 
+// Bench mode (CPU, single thread): wef_test bench [steps=N] [preset=harvest] [seed=N] [key=value ...]
+// Steps one env with deterministic pseudo-random actions in the training default config
+// (4 fish, 30-400 cm arenas, 64 pellets, 512-step episodes) and prints microseconds per
+// env-step and per agent-step, the share spent in compute_observations, and an FNV-1a hash of
+// every observation and reward produced: two builds that print the same hash are bit-identical
+// on this trajectory (the check to run after any wef.h or compile-flag change).
+static uint64_t fnv1a(uint64_t h, const void* data, size_t n) {
+    const unsigned char* p = (const unsigned char*)data;
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
+static uint32_t g_xs = 0x9E3779B9u;
+static float xs_uniform(void) {  // xorshift32 -> [0, 1)
+    g_xs ^= g_xs << 13; g_xs ^= g_xs >> 17; g_xs ^= g_xs << 5;
+    return (float)(g_xs >> 8) * (1.0f / 16777216.0f);
+}
+
+static int run_bench(int argc, char** argv) {
+    Dict kw = {0};
+    kw_base(&kw, 4);
+    // training defaults from config/wef.ini
+    dict_set(&kw, "min_arena_width", 30);
+    dict_set(&kw, "max_arena_width", 400);
+    dict_set(&kw, "min_arena_height", 30);
+    dict_set(&kw, "max_arena_height", 400);
+    dict_set(&kw, "food_distribution", FOOD_RANDOM);
+    dict_set(&kw, "episode_length", 512);
+    long steps = 20000;
+    for (int a = 2; a < argc; a++) {
+        if (strcmp(argv[a], "preset=harvest") == 0) {
+            kw_harvest(&kw);
+            continue;
+        }
+        char key[64];
+        char val[64];
+        if (strpbrk(argv[a], " \t") != NULL || sscanf(argv[a], "%63[^=]=%63s", key, val) != 2) {
+            fprintf(stderr, "bad arg %s\n", argv[a]);
+            return 2;
+        }
+        if (strcmp(key, "steps") == 0) {
+            steps = atol(val);
+        } else if (strcmp(key, "seed") == 0) {
+            g_seed = (unsigned int)atoi(val);
+        } else {
+            dict_set(&kw, key, atof(val));
+        }
+    }
+    Harness h = make(&kw, 4);
+    Env* env = h.env;
+    int n = env->num_agents;
+    uint64_t hash = 1469598103934665603ULL;
+    double food_sum = 0.0;
+    double t0 = now_s();
+    for (long s = 0; s < steps; s++) {
+        for (int i = 0; i < n; i++) {
+            set_action(&h, i, 6.0f * xs_uniform() - 3.0f, 4.0f * xs_uniform() - 2.0f,
+                xs_uniform() < 0.86f ? 1.0f : -1.0f, xs_uniform() < 0.05f ? 1.0f : -1.0f);
+        }
+        puf_step(env);
+        hash = fnv1a(hash, h.obs, (size_t)n * OBS_SIZE * sizeof(obs_t));
+        hash = fnv1a(hash, h.rew, (size_t)n * sizeof(float));
+        food_sum += env->food_active;
+    }
+    double t_step = now_s() - t0;
+    // compute_observations alone (extra calls; they only advance the sensor-noise RNG)
+    long obs_steps = steps / 4 > 0 ? steps / 4 : 1;
+    double t_obs = 0.0;
+    for (long s = 0; s < obs_steps; s++) {
+        for (int i = 0; i < n; i++) {
+            set_action(&h, i, 6.0f * xs_uniform() - 3.0f, 4.0f * xs_uniform() - 2.0f,
+                xs_uniform() < 0.86f ? 1.0f : -1.0f, xs_uniform() < 0.05f ? 1.0f : -1.0f);
+        }
+        puf_step(env);
+        double a = now_s();
+        compute_observations(env);
+        t_obs += now_s() - a;
+    }
+    double us_step = 1e6 * t_step / (double)steps;
+    double us_obs = 1e6 * t_obs / (double)obs_steps;
+    printf("bench steps=%ld fish=%d mean_food_active=%.1f\n", steps, n, food_sum / (double)steps);
+    printf("  %.2f us/env-step  %.2f us/agent-step  %.0f agent-steps/s (1 thread)\n",
+        us_step, us_step / n, 1e6 * n / us_step);
+    printf("  compute_observations %.2f us/env-step (%.0f%% of step)\n", us_obs, 100.0 * us_obs / us_step);
+    printf("  hash %016llx\n", (unsigned long long)hash);
+    puf_close(env);
+    dict_clear(&kw);
+    return 0;
+}
+
+// The inlined glibc rand_r must produce the library's stream (env RNG bit-identity).
+static void test_rand_r(void) {
+    unsigned int a = 12345u, b = 12345u;
+    int same = 1;
+    for (int i = 0; i < 100000 && same; i++) {
+        same = wef_rand_r(&a) == rand_r(&b) && a == b;
+    }
+    CHECK(same, "wef_rand_r matches glibc rand_r over 100000 draws");
+}
+
 int main(int argc, char** argv) {
+    if (argc > 1 && strcmp(argv[1], "bench") == 0) {
+        return run_bench(argc, argv);
+    }
     if (argc > 1) {
         return run_calibration(argc, argv);
     }
+    test_rand_r();
     test_sensing();
     test_dynamics();
     test_actions();

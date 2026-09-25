@@ -240,6 +240,14 @@ else
     NVCC_OPT="-O2 --threads 0"
     LINK_OPT="-O2"
 fi
+# Host-code optimisation for the env step (wef-marl fork): -O3 with the portable AVX2/FMA
+# baseline, but IEEE evaluation kept (-ffp-contract=off, no fast-math) so observations
+# stay bit-identical to the -O2 build (checked by `wef_test bench` hashes and the E0
+# checkpoint hash). PUFFER_HOST_OPT=0 restores upstream's plain -O2 host compile.
+HOST_OPT=()
+if [ "${PUFFER_HOST_OPT:-1}" != "0" ] && [ -z "$DEBUG" ] && [ "$(uname -m)" = "x86_64" ]; then
+    HOST_OPT=(-Xcompiler=-O3 -Xcompiler=-march=x86-64-v3 -Xcompiler=-ffp-contract=off)
+fi
 # Dashboard / cache / trailer: compile SRC_FILE only (not puffercpu / CUDA / obs_t).
 if [ "$STANDALONE" = "1" ]; then
     if [ "$MODE" = "web" ] || [ "$MODE" = "profile" ]; then
@@ -513,6 +521,7 @@ if [ "$MODE" = "native" ]; then
 	    -DPUFFERLIB_BUILD_MAIN \
 	    -Xcompiler=-DPLATFORM_DESKTOP \
 	    -Xcompiler=-fopenmp \
+	    "${HOST_OPT[@]}" \
 	    "${NVCC_NARROW[@]}" \
 	    "${EXTRA_CFLAGS[@]}" \
 	    $PRECISION \

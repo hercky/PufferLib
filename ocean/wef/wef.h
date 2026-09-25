@@ -206,7 +206,22 @@ Sensor sensor_world(const Sensor* s, const FishAgent* fish) {
     };
 }
 
-bool in_forward_cone(const FishAgent* fish, Vec2 target,
+// Same as sensor_world with the fish's cos/sin passed in (hoisted out of the sensor loops;
+// the arithmetic is identical, so observations are bit-identical).
+static inline Sensor sensor_world_cs(const Sensor* s, const FishAgent* fish, float c, float sn) {
+    return (Sensor){
+        {
+            c * s->p.x - sn * s->p.y + fish->pos.x,
+            sn * s->p.x + c * s->p.y + fish->pos.y,
+        },
+        {
+            c * s->n.x - sn * s->n.y,
+            sn * s->n.x + c * s->n.y,
+        },
+    };
+}
+
+static inline bool in_forward_cone(const FishAgent* fish, Vec2 target,
         float radius_cm, float cone) {
     float dx = target.x - fish->pos.x;
     float dy = target.y - fish->pos.y;
@@ -344,6 +359,11 @@ typedef struct FishFood {
     bool active;
     Vec2 intrinsic_moment;
     Vec2 induced_moment;
+    // Cache for intrinsic_moment: valid while moment_set && moment_ori == orientation, so
+    // the 64 cosf/sinf pairs per step are computed once per (re)spawn. Designated
+    // initialisers zero both fields, which invalidates the cache.
+    bool moment_set;
+    float moment_ori;
 } FishFood;
 
 // Inert debris (cleanup mode): no intrinsic dipole (passively invisible), induced
@@ -480,8 +500,29 @@ struct Env {
 };
 typedef Env Wef;
 
+// glibc's rand_r (TYPE_0 LCG, unchanged since glibc 2.x; ocean/wef/wef_test.c checks it
+// against the library call): inlined so the ~400 sensor-noise draws per env-step skip the
+// PLT call. Same outputs bit for bit, so the sensor streams are unchanged.
+static inline int wef_rand_r(unsigned int* seed) {
+    unsigned int next = *seed;
+    int result;
+    next *= 1103515245;
+    next += 12345;
+    result = (unsigned int)(next / 65536) % 2048;
+    next *= 1103515245;
+    next += 12345;
+    result <<= 10;
+    result ^= (unsigned int)(next / 65536) % 1024;
+    next *= 1103515245;
+    next += 12345;
+    result <<= 10;
+    result ^= (unsigned int)(next / 65536) % 1024;
+    *seed = next;
+    return result;
+}
+
 float random_uniform(Wef* env, float low, float high) {
-    float unit = (float)rand_r(&env->rng) / (float)RAND_MAX;
+    float unit = (float)wef_rand_r(&env->rng) / (float)RAND_MAX;
     return low + (high - low) * unit;
 }
 
@@ -498,6 +539,36 @@ void wef_obj_event(Wef* env, int kind, int index, int event, Vec2 pos) {
 // agents, the next n_food_dips food, the rest waste → agent_range / food_range /
 // waste_range (paper sensor cutoffs; waste only exists in cleanup mode).
 // wall_range_cm=0 → no image charges.
+// Field of monopole sources only, no wall images: bit-identical to
+// measure_field(env, probe_cm, mono, n_mono, NULL, 0, 0, 0, range_cm, *, 0, 0) (same
+// operations in the same order) without that function's staging and range set-up. Used for
+// the knollenorgan (2 poles), pellet/waste induction (2A poles) and body induction calls,
+// which are ~200 of the ~450 field evaluations per env-step.
+static inline Vec2 wef_mono_field(Vec2 probe_cm, const Mono* mono, int n_mono, float range_cm) {
+    float pmx = probe_cm.x * CM_TO_M;
+    float pmy = probe_cm.y * CM_TO_M;
+    float agent_r = range_cm * CM_TO_M;
+    float agent_range2 = agent_r * agent_r;
+    float eps_m = FIELD_EPS_M;
+    float field_x = 0.0f;
+    float field_y = 0.0f;
+    for (int i = 0; i < n_mono; i++) {
+        float sx = mono[i].p.x;
+        float sy = mono[i].p.y;
+        float dx = pmx - sx;
+        float dy = pmy - sy;
+        if (dx * dx + dy * dy > agent_range2) {
+            continue;
+        }
+        float dist = sqrtf(dx * dx + dy * dy) + eps_m;
+        float inv_d = 1.0f / dist;
+        float w = K_COULOMB * mono[i].q * inv_d * inv_d * inv_d;
+        field_x += dx * w;
+        field_y += dy * w;
+    }
+    return (Vec2){field_x, field_y};
+}
+
 Vec2 measure_field(Env* env, Vec2 probe_cm, const Mono* mono, int n_mono,
     const Dipole* dip, int n_dip, int n_agent_dips, int n_food_dips,
     float agent_range_cm, float food_range_cm, float waste_range_cm,
@@ -625,6 +696,20 @@ Vec2 measure_field(Env* env, Vec2 probe_cm, const Mono* mono, int n_mono,
     }
     return (Vec2){field_x, field_y};
 }
+// True if any fish centre is within `range_cm` of p (cm). Used to skip field evaluations
+// whose every source is provably out of range (the result would be exactly zero).
+static inline int wef_any_fish_within(const Wef* env, Vec2 p, float range_cm) {
+    float r2 = range_cm * range_cm;
+    for (int i = 0; i < env->num_agents; i++) {
+        float dx = p.x - env->fish[i].pos.x;
+        float dy = p.y - env->fish[i].pos.y;
+        if (dx * dx + dy * dy <= r2) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void compute_observations(Wef* env) {
     // Build EOD poles + induced/intrinsic moments, then pack obs.
     Mono eod[WEF_MAX_MONO];
@@ -658,10 +743,7 @@ void compute_observations(Wef* env) {
         float moment_y = 0.0f;
         if (!agent->emits_eod) {
             // Induced by nearby EODs (conspecific EOD → body, morm agent range).
-            Vec2 f = measure_field(
-                env, agent->pos, eod, n_eod, NULL, 0, 0, 0,
-                MORM_AGENT_RANGE_CM, MORM_FOOD_RANGE_CM, 0.0f, 0.0f
-            );
+            Vec2 f = wef_mono_field(agent->pos, eod, n_eod, MORM_AGENT_RANGE_CM);
             moment_x = f.x * body_scale;
             moment_y = f.y * body_scale;
             float mag = sqrtf(moment_x * moment_x + moment_y * moment_y);
@@ -677,18 +759,25 @@ void compute_observations(Wef* env) {
         if (!env->food[i].active) {
             env->food[i].intrinsic_moment = (Vec2){0};
             env->food[i].induced_moment = (Vec2){0};
+            env->food[i].moment_set = false;
             continue;
         }
-        float fc = cosf(env->food[i].orientation);
-        float fs = sinf(env->food[i].orientation);
-        env->food[i].intrinsic_moment = (Vec2){
-            -fs * FOOD_INTRINSIC_MOMENT_C_M,
-            fc * FOOD_INTRINSIC_MOMENT_C_M,
-        };
-        Vec2 f = measure_field(
-            env, env->food[i].pos, eod, n_eod, NULL, 0, 0, 0,
-            MORM_AGENT_RANGE_CM, MORM_FOOD_RANGE_CM, 0.0f, 0.0f
-        );
+        if (!env->food[i].moment_set || env->food[i].moment_ori != env->food[i].orientation) {
+            float fc = cosf(env->food[i].orientation);
+            float fs = sinf(env->food[i].orientation);
+            env->food[i].intrinsic_moment = (Vec2){
+                -fs * FOOD_INTRINSIC_MOMENT_C_M,
+                fc * FOOD_INTRINSIC_MOMENT_C_M,
+            };
+            env->food[i].moment_set = true;
+            env->food[i].moment_ori = env->food[i].orientation;
+        }
+        // Poles sit EOD_POLE_OFFSET_CM from the fish centre: a pellet farther than
+        // (range + offset + margin) from every fish sees no pole and the field is exactly 0.
+        Vec2 f = {0.0f, 0.0f};
+        if (wef_any_fish_within(env, env->food[i].pos, MORM_AGENT_RANGE_CM + EOD_POLE_OFFSET_CM + 0.1f)) {
+            f = wef_mono_field(env->food[i].pos, eod, n_eod, MORM_AGENT_RANGE_CM);
+        }
         env->food[i].induced_moment = (Vec2){f.x * food_scale, f.y * food_scale};
     }
     // Waste (cleanup mode): induced dipole only, from nearby EODs.
@@ -702,10 +791,10 @@ void compute_observations(Wef* env) {
                 env->waste[i].induced_moment = (Vec2){0};
                 continue;
             }
-            Vec2 f = measure_field(
-                env, env->waste[i].pos, eod, n_eod, NULL, 0, 0, 0,
-                mono_range, MORM_FOOD_RANGE_CM, 0.0f, 0.0f
-            );
+            Vec2 f = {0.0f, 0.0f};
+            if (wef_any_fish_within(env, env->waste[i].pos, mono_range + EOD_POLE_OFFSET_CM + 0.1f)) {
+                f = wef_mono_field(env->waste[i].pos, eod, n_eod, mono_range);
+            }
             env->waste[i].induced_moment = (Vec2){f.x * waste_scale, f.y * waste_scale};
         }
     }
@@ -746,16 +835,49 @@ void compute_observations(Wef* env) {
             n_waste_staged++;
         }
     }
+    // Per-fish culling radii: every sensor sits on the BODY_RADIUS_CM ring around the fish
+    // centre, so a source farther than (range + ring + margin) from the centre is out of
+    // range for all 60 sensors and would be skipped by measure_field's own test. Culling once
+    // per fish instead of once per sensor removes ~60x(A+F) distance tests per fish and keeps
+    // the surviving sources in their original order, so the field sums are bit-identical.
+    // Mormyromast ranges are the wider ones (10/5 cm vs 8/4 cm ampullary), so one cull
+    // serves both organs.
+    const float cull_margin_cm = BODY_RADIUS_CM + 0.1f;
+    float cull_agent_m = (MORM_AGENT_RANGE_CM + cull_margin_cm) * CM_TO_M;
+    float cull_food_m = (MORM_FOOD_RANGE_CM + cull_margin_cm) * CM_TO_M;
+    float cull_waste_m = (env->waste_sense_range_cm + cull_margin_cm) * CM_TO_M;
+    float cull_agent2 = cull_agent_m * cull_agent_m;
+    float cull_food2 = cull_food_m * cull_food_m;
+    float cull_waste2 = cull_waste_m * cull_waste_m;
+    Dipole induced_c[WEF_MAX_DIP];
+    Dipole intrinsic_c[WEF_MAX_DIP];
     for (int i = 0; i < env->num_agents; i++) {
         FishAgent* agent = &env->fish[i];
         obs_t* obs = env->agents[i].observations;
         int obs_idx = 0;
-        // Waste lives in the strip only: a fish farther than the sense range from
-        // it can skip the waste tail of the dipole list.
-        int n_dip_i = n_induced;
-        if (n_waste_staged > 0 && agent->pos.x >
-                env->strip_cm + env->waste_sense_range_cm + BODY_RADIUS_CM) {
-            n_dip_i = n_induced - n_waste_staged;
+        float ori_c = cosf(agent->orientation);
+        float ori_s = sinf(agent->orientation);
+        Vec2 pm = to_m(agent->pos);
+        int n_ind_c = 0;
+        int n_int_c = 0;
+        int n_agent_c = 0;
+        int n_food_c = 0;
+        for (int k = 0; k < n_induced; k++) {
+            float dx = pm.x - induced[k].p.x;
+            float dy = pm.y - induced[k].p.y;
+            float d2 = dx * dx + dy * dy;
+            int is_agent = k < env->num_agents;
+            int is_food = !is_agent && k < env->num_agents + n_food_staged;
+            float cull2 = is_agent ? cull_agent2 : is_food ? cull_food2 : cull_waste2;
+            if (d2 > cull2) {
+                continue;
+            }
+            induced_c[n_ind_c++] = induced[k];
+            if (k < n_intrinsic) {
+                intrinsic_c[n_int_c++] = intrinsic[k];
+            }
+            n_agent_c += is_agent;
+            n_food_c += is_food;
         }
 
         bool cons_eod = false;
@@ -767,12 +889,15 @@ void compute_observations(Wef* env) {
         }
         // Mormyromasts: induced field.
         for (int sensor_idx = 0; sensor_idx < NUM_MORMYROMASTS; sensor_idx++) {
-            Sensor w = sensor_world(&g_morm[sensor_idx], agent);
-            Vec2 f = measure_field(
-                env, w.p, NULL, 0, induced, n_dip_i, env->num_agents, n_food_staged,
-                MORM_AGENT_RANGE_CM, MORM_FOOD_RANGE_CM, env->waste_sense_range_cm,
-                env->reflection_wall_range_cm
-            );
+            Sensor w = sensor_world_cs(&g_morm[sensor_idx], agent, ori_c, ori_s);
+            Vec2 f = {0.0f, 0.0f};
+            if (n_ind_c > 0) {
+                f = measure_field(
+                    env, w.p, NULL, 0, induced_c, n_ind_c, n_agent_c, n_food_c,
+                    MORM_AGENT_RANGE_CM, MORM_FOOD_RANGE_CM, env->waste_sense_range_cm,
+                    env->reflection_wall_range_cm
+                );
+            }
             float reading = f.x * w.n.x + f.y * w.n.y;
             if (!agent->emits_eod) {
                 reading *= 100.0f;
@@ -784,13 +909,16 @@ void compute_observations(Wef* env) {
         }
         // Ampullary: intrinsic.
         for (int sensor_idx = 0; sensor_idx < NUM_AMPULLARY; sensor_idx++) {
-            Sensor w = sensor_world(&g_amp[sensor_idx], agent);
-            Vec2 f = measure_field(
-                env, w.p, NULL, 0, intrinsic, n_intrinsic, env->num_agents,
-                n_intrinsic - env->num_agents,
-                AMP_AGENT_RANGE_CM, AMP_FOOD_RANGE_CM, 0.0f,
-                env->reflection_wall_range_cm
-            );
+            Sensor w = sensor_world_cs(&g_amp[sensor_idx], agent, ori_c, ori_s);
+            Vec2 f = {0.0f, 0.0f};
+            if (n_int_c > 0) {
+                f = measure_field(
+                    env, w.p, NULL, 0, intrinsic_c, n_int_c, n_agent_c,
+                    n_int_c - n_agent_c,
+                    AMP_AGENT_RANGE_CM, AMP_FOOD_RANGE_CM, 0.0f,
+                    env->reflection_wall_range_cm
+                );
+            }
             float noise = cons_eod ? 0.5f : 0.05f;
             float reading = (f.x * w.n.x + f.y * w.n.y -
                 env->amp_intrinsic_baseline[sensor_idx]) *
@@ -807,10 +935,25 @@ void compute_observations(Wef* env) {
                 continue;
             }
             bool valid = other < env->num_agents && env->fish[other].emits_eod;
+            // Both poles farther than (range + sensor ring + pole offset + margin) from
+            // this fish's centre are out of range for all 12 sensors: the field is exactly
+            // 0 (the sensor-noise draw is still made, so the RNG stream is unchanged).
+            bool in_reach = false;
+            if (valid) {
+                float dx = env->fish[other].pos.x - agent->pos.x;
+                float dy = env->fish[other].pos.y - agent->pos.y;
+                float reach = KNOLLEN_AGENT_RANGE_CM + BODY_RADIUS_CM + EOD_POLE_OFFSET_CM + 0.1f;
+                in_reach = dx * dx + dy * dy <= reach * reach;
+            }
             for (int sensor_idx = 0; sensor_idx < NUM_KNOLLEN; sensor_idx++) {
                 float value = 0.0f;
-                if (valid) {
-                    Sensor w = sensor_world(&g_knollen[sensor_idx], agent);
+                if (valid && !in_reach) {
+                    float raw = 0.0f * random_uniform(env, 0.95f, 1.05f);
+                    if (fabsf(raw) > KNOLLEN_MIN_VM) {
+                        value = raw < 0.0f ? -1.0f : 1.0f;
+                    }
+                } else if (valid) {
+                    Sensor w = sensor_world_cs(&g_knollen[sensor_idx], agent, ori_c, ori_s);
                     Mono eod[2] = {
                         {
                             to_m(env->fish[other].eod_pos[0]),
@@ -821,10 +964,7 @@ void compute_observations(Wef* env) {
                             env->fish[other].eod_charge[1]
                         },
                     };
-                    Vec2 f = measure_field(
-                        env, w.p, eod, 2, NULL, 0, 0, 0,
-                        KNOLLEN_AGENT_RANGE_CM, 0.0f, 0.0f, 0.0f
-                    );
+                    Vec2 f = wef_mono_field(w.p, eod, 2, KNOLLEN_AGENT_RANGE_CM);
                     float raw = (f.x * w.n.x + f.y * w.n.y) *
                         random_uniform(env, 0.95f, 1.05f);
                     if (fabsf(raw) > KNOLLEN_MIN_VM) {
