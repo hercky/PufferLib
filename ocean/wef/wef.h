@@ -155,6 +155,8 @@ typedef struct FishAgent {
     int bot_stall;    // scripted roles: consecutive decisions without moving
     int bot_escape;   // scripted roles: steps left of a random-heading escape
     float bot_escape_turn;
+    Vec2 bot_last_eat;  // scripted roles (bot_camp): where this fish last ate
+    bool bot_has_eat;
     bool has_previous_food_distance;
     float previous_food_distance;
     float last_action[ACTION_SIZE];
@@ -443,6 +445,7 @@ struct Env {
     float sustain_frac;         // metrics only: stock fraction at/below which eating counts as defecting
     int num_patches;            // patchy layout: patches per episode (0 = ceil(patch_density * area), upstream)
     int regrow_in_patches;      // commons (modes 2/3): regrown pellets land inside this episode's patches
+    float bot_camp;             // scripted eaters: > 0 = with no pellet in range, circle the last eating spot at this radius (cm) instead of patrolling
     Vec2 patch_center[MAX_PATCHES];   // this episode's patches (patchy layout only)
     float patch_radius_ep[MAX_PATCHES];
     int num_patches_ep;         // 0 when the episode is not patchy
@@ -1289,7 +1292,16 @@ void wef_bot_action(Wef* env, int i, float* raw) {
             }
         }
     }
-    if (!found) {
+    if (!found && role != 1 && env->bot_camp > 0.0f && fish->bot_has_eat) {
+        // Camp: circle the last eating spot (a learned fish remembers where food was; patches
+        // regrow in place). The orbit radius bot_camp plus the 5 cm sense range covers a patch.
+        float ang = 0.03f * (float)env->tick + 1.5f * (float)i;
+        target = (Vec2){
+            clamp(fish->bot_last_eat.x + env->bot_camp * cosf(ang), 2.0f, env->arena_size_x - 2.0f),
+            clamp(fish->bot_last_eat.y + env->bot_camp * sinf(ang), 2.0f, env->arena_size_y - 2.0f),
+        };
+        found = false;
+    } else if (!found) {
         // Patrol the zone: sweep along y in a per-fish lane, reversing at the walls.
         // Without an orchard (Harvest mode) eaters spread their lanes across the arena.
         float lane;
@@ -1501,6 +1513,8 @@ void puf_step(Wef* env) {
                 wef_obj_event(env, 0, f, 1, env->food[f].pos);
                 agent->eat_cooldown = EAT_COOLDOWN_STEPS;
                 agent->ate = true;
+                agent->bot_last_eat = agent->pos;
+                agent->bot_has_eat = true;
                 env->agents[i].rewards[0] += EAT_REWARD;
                 break;
             }
@@ -2397,6 +2411,7 @@ static const char* WEF_ENV_KEYS[] = {
     "proximity_shaping", "obs_extra", "size_min", "size_max", "desync_first_episode",
     "policy1_agents", "no_clean_agents", "roles", "bot_shift_steps", "bot_oracle", "bot_theta",
     "render_field", "render_field_alpha", "sustain_frac", "num_patches", "regrow_in_patches",
+    "bot_camp",
 };
 
 static void wef_check_keys(Dict* kwargs) {
@@ -2480,6 +2495,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->sustain_frac = wef_cfg(kwargs, "sustain_frac", 0.5);
     env->num_patches = wef_cfg(kwargs, "num_patches", 0);
     env->regrow_in_patches = wef_cfg(kwargs, "regrow_in_patches", 0);
+    env->bot_camp = wef_cfg(kwargs, "bot_camp", 0);
     {
         // roles = r0,r1,r2,r3 (comma list; a scalar applies to slot 0 only)
         DictItem* item = dict_find(kwargs, "roles");
