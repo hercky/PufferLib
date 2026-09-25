@@ -487,6 +487,17 @@ static void test_patchy_commons(void) {
     CHECK(env->regrown > 0 && outside == 0, "all %d regrown pellets landed inside a patch (%d outside)",
         env->regrown, outside);
     dict_clear(&kw);
+    // food_start in a commons mode: the episode starts with S0 active pellets.
+    Dict kw2 = {0};
+    kw_base(&kw2, 1);
+    kw_harvest(&kw2);
+    dict_set(&kw2, "regrow_mode", 2);
+    dict_set(&kw2, "regrow_p_max", 0.01);
+    dict_set(&kw2, "food_start", 24);
+    Harness h2 = make(&kw2, 1);
+    CHECK(h2.env->food_active == 24 && h2.env->num_food == 64, "commons food_start: %d of %d active at reset",
+        h2.env->food_active, h2.env->num_food);
+    dict_clear(&kw2);
 }
 
 static void test_baseline(void) {

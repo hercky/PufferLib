@@ -1083,6 +1083,15 @@ void puf_reset(Wef* env) {
         }
         env->food_active = env->num_food;
     }
+    if (!env->cleanup && env->regrows && env->food_start >= 0 && env->food_start < env->num_food) {
+        // Commons / Harvest: start below capacity (initial stock S0 = food_start); the other
+        // slots stay inactive for regrowth to fill. Positions were drawn as usual above, so
+        // the RNG sequence is unchanged; the reset object events below skip inactive slots.
+        for (int i = env->food_start; i < env->num_food; i++) {
+            env->food[i].active = false;
+        }
+        env->food_active = env->food_start;
+    }
     // Ampullary baseline: unit intrinsic dipole at arena center
     Vec2 center = {env->arena_size_x * 0.5f, env->arena_size_y * 0.5f};
     Dipole baseline_dip[1] = {{to_m(center), (Vec2){INTRINSIC_MOMENT_C_M, 0.0f}}};
