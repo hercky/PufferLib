@@ -441,6 +441,11 @@ struct Env {
     int render_field;           // renderer: 1 field arrows around each fish (upstream), 0 off
     float render_field_alpha;   // renderer: arrow opacity multiplier (1 = upstream)
     float sustain_frac;         // metrics only: stock fraction at/below which eating counts as defecting
+    int num_patches;            // patchy layout: patches per episode (0 = ceil(patch_density * area), upstream)
+    int regrow_in_patches;      // commons (modes 2/3): regrown pellets land inside this episode's patches
+    Vec2 patch_center[MAX_PATCHES];   // this episode's patches (patchy layout only)
+    float patch_radius_ep[MAX_PATCHES];
+    int num_patches_ep;         // 0 when the episode is not patchy
     int season_steps;           // regrow_mode 3: steps per season (stock grows only at season ends)
     float season_growth;        // regrow_mode 3: stock multiplier per season, capped at K (GovSim: 2)
     bool regrows;               // any regrowth mode active (fixed-length episodes, V2 traces, stock perf)
@@ -896,6 +901,24 @@ void wef_spawn_waste(Wef* env, int i) {
     };
 }
 
+// Commons (regrow modes 2/3): where a regrown pellet lands. Uniform in the arena (upstream
+// draw order: x, then y), or, with regrow_in_patches, uniform inside one of this episode's
+// patches so the shared stock is concentrated where fish can find it and meet.
+Vec2 wef_commons_spawn_pos(Wef* env) {
+    if (env->regrow_in_patches && env->num_patches_ep > 0) {
+        int p = (int)(rand_r(&env->rng) % (unsigned)env->num_patches_ep);
+        float angle = random_uniform(env, 0.0f, 2.0f * PI_F);
+        float r = env->patch_radius_ep[p] * sqrtf(random_uniform(env, 0.0f, 1.0f));
+        return (Vec2){
+            clamp(env->patch_center[p].x + r * cosf(angle), 0.0f, env->arena_size_x),
+            clamp(env->patch_center[p].y + r * sinf(angle), 0.0f, env->arena_size_y),
+        };
+    }
+    float x = random_uniform(env, 0.0f, env->arena_size_x);
+    float y = random_uniform(env, 0.0f, env->arena_size_y);
+    return (Vec2){x, y};
+}
+
 void puf_reset(Wef* env) {
     // Sample arena size from configured min/max
     env->arena_size_x = random_uniform(env, env->min_arena_size_x, env->max_arena_size_x);
@@ -1016,6 +1039,7 @@ void puf_reset(Wef* env) {
             };
         }
         env->food_active = env->num_food;
+        env->num_patches_ep = 0;
     } else {
         // Patchy: random circular patches, food sampled uniformly in a patch disk
         float centers_x[MAX_PATCHES];
@@ -1023,7 +1047,7 @@ void puf_reset(Wef* env) {
         float radii[MAX_PATCHES];
         float max_radius =
             fminf(env->arena_size_x, env->arena_size_y) * 0.5f;
-        int num_patches = (int)clamp(
+        int num_patches = env->num_patches > 0 ? env->num_patches : (int)clamp(
             ceilf(env->patch_density *
                 env->arena_size_x * env->arena_size_y),
             1, MAX_PATCHES
@@ -1037,7 +1061,10 @@ void puf_reset(Wef* env) {
                 ),
                 1.0f, max_radius
             );
+            env->patch_center[p] = (Vec2){centers_x[p], centers_y[p]};
+            env->patch_radius_ep[p] = radii[p];
         }
+        env->num_patches_ep = num_patches;
         for (int i = 0; i < env->num_food; i++) {
             int p = (int)(rand_r(&env->rng) % (unsigned)num_patches);
             float angle = random_uniform(env, 0.0f, 2.0f * PI_F);
@@ -1676,10 +1703,7 @@ void puf_step(Wef* env) {
                             continue;
                         }
                         env->food[f] = (FishFood){
-                            .pos = {
-                                random_uniform(env, 0.0f, env->arena_size_x),
-                                random_uniform(env, 0.0f, env->arena_size_y),
-                            },
+                            .pos = wef_commons_spawn_pos(env),
                             .orientation = random_uniform(env, 0.0f, 2.0f * PI_F),
                             .active = true,
                         };
@@ -1723,10 +1747,7 @@ void puf_step(Wef* env) {
                     continue;
                 }
                 env->food[f] = (FishFood){
-                    .pos = {
-                        random_uniform(env, 0.0f, env->arena_size_x),
-                        random_uniform(env, 0.0f, env->arena_size_y),
-                    },
+                    .pos = wef_commons_spawn_pos(env),
                     .orientation = random_uniform(env, 0.0f, 2.0f * PI_F),
                     .active = true,
                 };
@@ -2375,7 +2396,7 @@ static const char* WEF_ENV_KEYS[] = {
     "bitten_freeze_steps", "bitten_reward", "bite_reward", "eod_cost", "reward_share",
     "proximity_shaping", "obs_extra", "size_min", "size_max", "desync_first_episode",
     "policy1_agents", "no_clean_agents", "roles", "bot_shift_steps", "bot_oracle", "bot_theta",
-    "render_field", "render_field_alpha", "sustain_frac",
+    "render_field", "render_field_alpha", "sustain_frac", "num_patches", "regrow_in_patches",
 };
 
 static void wef_check_keys(Dict* kwargs) {
@@ -2457,6 +2478,8 @@ void puf_init(Env* env, Dict* kwargs) {
     env->season_steps = wef_cfg(kwargs, "season_steps", 0);
     env->season_growth = wef_cfg(kwargs, "season_growth", 2.0);
     env->sustain_frac = wef_cfg(kwargs, "sustain_frac", 0.5);
+    env->num_patches = wef_cfg(kwargs, "num_patches", 0);
+    env->regrow_in_patches = wef_cfg(kwargs, "regrow_in_patches", 0);
     {
         // roles = r0,r1,r2,r3 (comma list; a scalar applies to slot 0 only)
         DictItem* item = dict_find(kwargs, "roles");
@@ -2503,6 +2526,9 @@ void puf_init(Env* env, Dict* kwargs) {
     assert((env->regrow_mode != 3 || (env->season_steps > 0 && !env->cleanup))
         && "regrow_mode 3 (seasonal) needs season_steps > 0 and cleanup = 0");
     env->regrows = env->regrow_p_max > 0.0f || env->regrow_mode == 3;
+    assert(env->num_patches >= 0 && env->num_patches <= MAX_PATCHES);
+    assert((!env->regrow_in_patches || (env->regrow_mode >= 2 && env->food_distribution != FOOD_UNIFORM))
+        && "regrow_in_patches needs a commons mode (2/3) and a patchy food layout");
     assert(env->regrow_radius_cm > 0.0f);
 
     // The trainer seeds env->rng with the env index before puf_init.

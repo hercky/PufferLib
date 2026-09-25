@@ -447,6 +447,48 @@ static void test_seasonal(void) {
     dict_clear(&kw);
 }
 
+static void test_patchy_commons(void) {
+    printf("-- commons regrowth inside the episode's patches\n");
+    Dict kw = {0};
+    kw_base(&kw, 1);
+    kw_harvest(&kw);
+    dict_set(&kw, "regrow_mode", 2);
+    dict_set(&kw, "regrow_p_max", 0.2);
+    dict_set(&kw, "food_distribution", FOOD_PATCHY);
+    dict_set(&kw, "num_patches", 2);
+    dict_set(&kw, "patch_radius", 8);
+    dict_set(&kw, "patch_radius_std", 0);
+    dict_set(&kw, "regrow_in_patches", 1);
+    Harness h = make(&kw, 1);
+    Env* env = h.env;
+    CHECK(env->num_patches_ep == 2, "num_patches overrides the density count (%d patches)", env->num_patches_ep);
+    place_fish(env, 0, 5.0f, 5.0f, 0.0f);
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, -1.0f);
+    for (int f = 0; f < 32; f++) {
+        env->food[f].active = false;
+    }
+    env->food_active = 32;
+    for (int t = 0; t < 40; t++) {
+        puf_step(env);
+    }
+    int outside = 0;
+    for (int f = 0; f < env->num_food; f++) {
+        bool inside = false;
+        for (int p = 0; p < env->num_patches_ep; p++) {
+            float dx = env->food[f].pos.x - env->patch_center[p].x;
+            float dy = env->food[f].pos.y - env->patch_center[p].y;
+            inside |= dx * dx + dy * dy <= env->patch_radius_ep[p] * env->patch_radius_ep[p] + 1e-3f;
+        }
+        // Pellets clamped to the wall may sit just outside the disk.
+        bool clamped = env->food[f].pos.x <= 0.0f || env->food[f].pos.y <= 0.0f
+            || env->food[f].pos.x >= env->arena_size_x || env->food[f].pos.y >= env->arena_size_y;
+        outside += env->food[f].active && !inside && !clamped;
+    }
+    CHECK(env->regrown > 0 && outside == 0, "all %d regrown pellets landed inside a patch (%d outside)",
+        env->regrown, outside);
+    dict_clear(&kw);
+}
+
 static void test_baseline(void) {
     printf("-- baseline mode\n");
     Dict kw = {0};
@@ -586,6 +628,7 @@ int main(int argc, char** argv) {
     test_harvest();
     test_commons();
     test_seasonal();
+    test_patchy_commons();
     test_baseline();
     printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
     return g_fail ? 1 : 0;
