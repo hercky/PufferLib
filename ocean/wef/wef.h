@@ -170,6 +170,16 @@ typedef struct FishAgent {
     float eod_charge[2];
     Vec2 intrinsic_moment;
     Vec2 induced_moment;
+    // --- Allelopathic Harvest (allelo). All zero / unread on the default path.
+    int taste;             // 0 = A, 1 = B (set at reset from the size draw)
+    bool bite_upper;       // this step's bite magnitude landed in the upper bin (raw[3] > plant_split)
+    int last_plant_type;   // type of this fish's last conversion, -1 none
+    int plant_mark;        // tick of the last conversion (0 = none this episode; defector metric)
+    int last_eaten_slot;   // slot of the last bush eaten, -1 none (plant_proactive)
+    int last_eat_tick;
+    int trace_plant_type;  // trace only: 0 none / 1 A / 2 B converted this step
+    int trace_planted_slot;// trace only: slot converted this step, -1 none
+    int trace_ate_type;    // trace only: 0 none / 1 A / 2 B eaten this step
 } FishAgent;
 
 // Shared sensor layouts (body radius fixed → identical for every fish)
@@ -300,6 +310,33 @@ struct Log {
     float policy_0_score;    // mean raw return of fish on policy 0 (match eval)
     float policy_1_score;
     float draw_rate;         // always 0; required by match eval
+    // Allelopathic Harvest (docs/wef-allelopathic-harvest-v0-design.md 5.1); zero unless allelo.
+    float mono_frac;         // time-mean max(n_A, n_B) / num_food (the paper's m-bar; AH perf)
+    float mono_final;        // max(frac_a_final, 1 - frac_a_final)
+    float frac_a_final;      // n_A / num_food at the last tick
+    float frac_a_mean;       // time-mean n_A / num_food (signed composition)
+    float majority_frac_final; // fraction of bushes of the majority taste's type at the end; 0.5 on a tie
+    float conv_c;            // |frac_a_mean - g_A|, g_A = fraction of A-tasting fish (conventionality)
+    float time_to_convention;// first tick with max(n_A, n_B) >= conv_theta * num_food, / T; 1 if never
+    float ripened;           // ripening events
+    float ripe_frac;         // time-mean n_ripe / num_food
+    float plantings;         // conversions
+    float plantings_a;       // conversions by A-tasting planters
+    float plantings_b;
+    float plant_attempts;    // AH-mode bites that found no fish (conversions + no-ops + misses)
+    float plant_own_frac;    // conversions to the planter's own type / plantings
+    float plant_own_frac_a;
+    float plant_own_frac_b;
+    float plant_major_frac;  // conversions to the strictly more common type / plantings
+    float plant_proactive;   // conversions of a bush the planter did not eat within the previous 3 steps
+    float plant_noop;        // same-type-only planting bites
+    float plant_gini;        // Gini of plantings per fish
+    float eaten_match_frac;  // eats of the fish's own type / eats
+    float zaps_cross;        // fish bites with attacker taste != victim taste
+    float zaps_same;
+    float taste_a_return;    // mean raw return of A-tasting fish (0 if none)
+    float taste_b_return;
+    float taste_a_n;         // number of A-tasting fish
     float n;
 };
 
@@ -327,9 +364,30 @@ typedef struct WefTraceRowV2 {
     int32_t cleaned, waste_left, food_active, frozen, zone;  // zone: 0 mid, 1 strip, 2 orchard
 } WefTraceRowV2;
 
+// Allelopathic Harvest trace row (file name env_<id>.v3.bin): WefTraceRowV2 + AH state. In AH
+// mode the V2 food_active field and the V1 food_left field both carry n_ripe (bushes are
+// permanent and eaten repeatedly, so num_food - food_eaten would go negative).
+typedef struct WefTraceRowV3 {
+    int32_t env_id, episode, tick, agent;
+    float x, y, orientation, size;
+    float move, turn;
+    int32_t eod, bite, bite_victim, was_bitten, ate, collided;
+    float reward, nearest_food, arena_x, arena_y;
+    int32_t food_left;
+    int32_t cleaned, waste_left, food_active, frozen, zone;
+    int32_t taste;         // 0 A, 1 B
+    int32_t plant_type;    // 0 none / 1 A / 2 B converted this step
+    int32_t planted_slot;  // -1 none
+    int32_t ate_type;      // 0 none / 1 A / 2 B eaten this step
+    int32_t n_a, n_ripe;
+    int32_t hold;          // eat_cooldown while above EAT_COOLDOWN_STEPS (a planting hold), else 0
+} WefTraceRowV3;
+
 // Object-event log for offline replay (env_<id>.obj.bin, written with the trace):
 // one row per pellet/waste state change. kind 0 pellet, 1 waste; event 0 present at
-// reset, 1 eaten/removed, 2 spawned/regrown.
+// reset, 1 eaten/removed, 2 spawned/regrown. Allelopathic Harvest: kind = 2 + type of the
+// bush AFTER the event (2 = A, 3 = B); events 0 reset, 3 planted -> A, 4 planted -> B,
+// 5 ripened, 6 eaten (the bush stays). No AH event is emitted with kind 0 or 1.
 typedef struct WefObjEvent {
     int32_t episode, tick, kind, index, event;
     float x, y;
@@ -370,6 +428,11 @@ typedef struct FishFood {
     // initialisers zero both fields, which invalidates the cache.
     bool moment_set;
     float moment_ori;
+    // --- Allelopathic Harvest (allelo): a permanent "bush" with a type and a ripeness flag.
+    int8_t type;       // 0 = A (insulator, food_contrast_a), 1 = B (conductor, food_contrast_b)
+    bool ripe;         // only ripe bushes are eaten; planting targets unripe ones
+    float scale;       // induced-dipole scale for (type, ripe): conductor_scale_c(radius, contrast)
+    int ripen_wait;    // steps before this unripe bush may ripen (ripen_min_steps after an eat / planting)
 } FishFood;
 
 // Inert debris (cleanup mode): no intrinsic dipole (passively invisible), induced
@@ -503,6 +566,66 @@ struct Env {
     int strip_steps_by[MAX_AGENTS];
     int clean_pending[MAX_AGENTS];
     float return_by[MAX_AGENTS];
+    // --- Allelopathic Harvest (docs/wef-allelopathic-harvest-v0-design.md). Every field below
+    // is inert when allelo == 0 and the keys sit at their wef.ini defaults (section 4.3).
+    int allelo;                 // master gate: typed bushes, ripening, planting, taste, fixed length, V3 trace
+    float ripen_lin;            // F(x) = ripen_lin x + ripen_cubic x^ripen_pow, x = n_type / num_food
+    float ripen_cubic;
+    float ripen_pow;
+    int ripen_min_steps;        // minimum unripe time after an eat / planting
+    float start_frac_a;         // initial fraction of type-A bushes (slots 0 .. round(frac K) - 1)
+    float start_ripe_frac;      // bushes ripe at reset (curriculum only)
+    float food_contrast_a;      // induced-dipole contrast of type A (-0.5 = today's pellet)
+    float food_contrast_b;      // type B (+0.5 preset; +1.0 = the waste signature)
+    float food_radius_unripe_cm;// induced-dipole radius when unripe / ripe (FOOD_RADIUS_CM = 0.25)
+    float food_radius_ripe_cm;
+    float unripe_intrinsic;     // multiplier on FOOD_INTRINSIC_MOMENT_C_M for unripe / ripe bushes
+    float ripe_intrinsic;
+    float taste_match;          // eat reward for the fish's own type
+    float taste_other;          // eat reward for the other type
+    float taste_other_a;        // per-group other-type reward (-1 = inherit taste_other)
+    float taste_other_b;
+    float taste_split;          // taste_n_a == -1: size >= taste_split -> A
+    int taste_n_a;              // -1 free size draw; n: slots < n are A in band A, rest B in band B; -2 Bernoulli in-band
+    float size_a_min, size_a_max;   // size bands used when taste_n_a != -1
+    float size_b_min, size_b_max;
+    float size_speed_exp;       // speed exponent in AH mode (SIZE_SPEED_EXPONENT = 1; 0 = taste without speed)
+    int plant_mode;             // 0 planting off, 1 taste-relative bins, 2 own type only
+    float plant_split;          // bin boundary on raw[3]
+    int plant_bin_order;        // 0: upper bin = own type; 1: lower bin = own type
+    int plant_priority;         // bite with a fish and a bush in the cone: 0 fish first, 1 bush first, 2 nearest first
+    float plant_radius_cm;      // planting cone radius
+    int plant_steps;            // hold after a conversion (eat_cooldown: no motion, no eating)
+    int plant_cooldown_steps;   // bite cooldown after a planting bite (max with plant_steps on a conversion)
+    float plant_reward;         // private shaping per conversion, after mixing (curriculum only)
+    float plant_reward_anneal_steps;
+    int zap_cooldown_steps;     // bite cooldown after a fish bite (BITE_COOLDOWN_STEPS = 5)
+    int zap_steps;              // hold on the attacker after a zap (eat_cooldown), 0 = none
+    float conv_theta;           // metrics: monoculture fraction that counts as a convention
+    float bot_plant_theta;      // roles 8/9/11: plant only while n_type[target] / num_food < theta
+    int bot_plant_max;          // planter bots: conversions per episode (0 = unlimited)
+    float bot_plant_frac;       // planter bots: P(go planting | no ripe bush within the 5 cm sense range)
+    // AH episode state
+    int n_type[2];              // bushes of each type (ripe and unripe)
+    int n_ripe;
+    int ripened;
+    int plantings;
+    int plantings_by[MAX_AGENTS];
+    int plantings_g[2];         // by the planter's taste
+    int plant_own;              // conversions to the planter's own type (total, and by the planter's taste)
+    int plant_own_g[2];
+    int plant_major;
+    int plant_proactive;
+    int plant_noop;
+    int plant_attempts;
+    int eats_match;             // eats of the fish's own type
+    int zaps_cross;
+    int zaps_same;
+    int plant_pending[MAX_AGENTS];  // conversions this step (plant_reward)
+    float mono_frac_sum;
+    float frac_a_sum;
+    float ripe_frac_sum;
+    int convention_tick;        // first tick at or above conv_theta, 0 = never
 };
 typedef Env Wef;
 
@@ -771,9 +894,17 @@ void compute_observations(Wef* env) {
         if (!env->food[i].moment_set || env->food[i].moment_ori != env->food[i].orientation) {
             float fc = cosf(env->food[i].orientation);
             float fs = sinf(env->food[i].orientation);
+            // AH: ripe bushes carry ripe_intrinsic x the pellet moment, unripe unripe_intrinsic x
+            // (preset 3 / 0: the passive ripeness cue). Eat / ripen / plant reset moment_set so
+            // this cache is recomputed; the default path multiplies by the unchanged constant.
+            float moment = FOOD_INTRINSIC_MOMENT_C_M;
+            if (env->allelo) {
+                moment = FOOD_INTRINSIC_MOMENT_C_M
+                    * (env->food[i].ripe ? env->ripe_intrinsic : env->unripe_intrinsic);
+            }
             env->food[i].intrinsic_moment = (Vec2){
-                -fs * FOOD_INTRINSIC_MOMENT_C_M,
-                fc * FOOD_INTRINSIC_MOMENT_C_M,
+                -fs * moment,
+                fc * moment,
             };
             env->food[i].moment_set = true;
             env->food[i].moment_ori = env->food[i].orientation;
@@ -784,7 +915,9 @@ void compute_observations(Wef* env) {
         if (wef_any_fish_within(env, env->food[i].pos, MORM_AGENT_RANGE_CM + EOD_POLE_OFFSET_CM + 0.1f)) {
             f = wef_mono_field(env->food[i].pos, eod, n_eod, MORM_AGENT_RANGE_CM);
         }
-        env->food[i].induced_moment = (Vec2){f.x * food_scale, f.y * food_scale};
+        // AH: per-bush scale (type contrast x ripeness radius); default: the folded constant.
+        float scale_i = env->allelo ? env->food[i].scale : food_scale;
+        env->food[i].induced_moment = (Vec2){f.x * scale_i, f.y * scale_i};
     }
     // Waste (cleanup mode): induced dipole only, from nearby EODs.
     if (env->cleanup) {
@@ -1008,7 +1141,16 @@ void compute_observations(Wef* env) {
         } else if (env->obs_extra == 2) {
             extra = 2.0f * agent->pos.x / env->arena_size_x - 1.0f;
         } else if (env->obs_extra == 3) {
-            extra = (float)env->food_active / (float)env->num_food;  // commons stock S / K
+            // commons stock S / K; AH: the ripe stock n_ripe / K
+            extra = (float)(env->allelo ? env->n_ripe : env->food_active) / (float)env->num_food;
+        } else if (env->obs_extra == 4) {
+            extra = agent->taste == 0 ? 1.0f : -1.0f;              // AH: own taste
+        } else if (env->obs_extra == 5) {
+            extra = (float)(env->n_type[0] - env->n_type[1]) / (float)env->num_food;  // AH: convention cue
+        } else if (env->obs_extra == 6) {
+            extra = agent->last_plant_type < 0 ? -1.0f : agent->last_plant_type == 0 ? 0.0f : 1.0f;
+        } else if (env->obs_extra == 7) {
+            extra = (float)env->n_ripe / (float)env->num_food;      // AH: ripe fraction
         }
         obs[obs_idx++] = extra;
         obs[obs_idx++] = agent->was_bitten ? 1.0f : 0.0f;
@@ -1016,15 +1158,42 @@ void compute_observations(Wef* env) {
         {
             int cd_max = env->clean_cooldown_steps > BITE_COOLDOWN_STEPS
                 ? env->clean_cooldown_steps : BITE_COOLDOWN_STEPS;
+            if (env->allelo) {
+                // every bite cooldown the AH branches can set, so the slot stays <= 1
+                cd_max = cd_max > env->plant_cooldown_steps ? cd_max : env->plant_cooldown_steps;
+                cd_max = cd_max > env->zap_cooldown_steps ? cd_max : env->zap_cooldown_steps;
+                cd_max = cd_max > env->plant_steps ? cd_max : env->plant_steps;
+            }
             obs[obs_idx++] = (float)agent->bite_cooldown / (float)cd_max;
         }
         obs[obs_idx++] = clamp(
             agent->disp_ego.x / agent->max_linear_velocity, -1.0f, 1.0f);
         obs[obs_idx++] = clamp(
             agent->disp_ego.y / agent->max_linear_velocity, -1.0f, 1.0f);
-        obs[obs_idx++] = agent->freeze > 0 ? 1.0f
-            : (float)agent->eat_cooldown / (float)EAT_COOLDOWN_STEPS;
+        {
+            // AH: a planting hold (eat_cooldown up to plant_steps) reads 1 -> 0
+            int eat_max = EAT_COOLDOWN_STEPS;
+            if (env->allelo && env->plant_steps > eat_max) {
+                eat_max = env->plant_steps;
+            }
+            obs[obs_idx++] = agent->freeze > 0 ? 1.0f
+                : (float)agent->eat_cooldown / (float)eat_max;
+        }
     }
+}
+
+// Allelopathic Harvest: induced-dipole scale of a bush from its type (contrast) and ripeness
+// (radius). Called at reset and after every type / ripeness change.
+static inline void wef_bush_scale(const Wef* env, FishFood* bush) {
+    float radius = bush->ripe ? env->food_radius_ripe_cm : env->food_radius_unripe_cm;
+    float contrast = bush->type == 0 ? env->food_contrast_a : env->food_contrast_b;
+    bush->scale = conductor_scale_c(radius, contrast);
+}
+
+// AH: the other-type eat reward of a fish of the given taste (per-group override or taste_other).
+static inline float wef_taste_other(const Wef* env, int taste) {
+    float g = taste == 0 ? env->taste_other_a : env->taste_other_b;
+    return g < 0.0f ? env->taste_other : g;
 }
 
 // Cleanup mode: pellet `i` uniformly in the orchard band at the far wall.
@@ -1108,7 +1277,30 @@ void puf_reset(Wef* env) {
         env->clean_pending[i] = 0;
         env->return_by[i] = 0.0f;
         env->bites_by[i] = 0;
+        env->plantings_by[i] = 0;
+        env->plant_pending[i] = 0;
     }
+    env->n_type[0] = 0;
+    env->n_type[1] = 0;
+    env->n_ripe = 0;
+    env->ripened = 0;
+    env->plantings = 0;
+    env->plantings_g[0] = 0;
+    env->plantings_g[1] = 0;
+    env->plant_own = 0;
+    env->plant_own_g[0] = 0;
+    env->plant_own_g[1] = 0;
+    env->plant_major = 0;
+    env->plant_proactive = 0;
+    env->plant_noop = 0;
+    env->plant_attempts = 0;
+    env->eats_match = 0;
+    env->zaps_cross = 0;
+    env->zaps_same = 0;
+    env->mono_frac_sum = 0.0f;
+    env->frac_a_sum = 0.0f;
+    env->ripe_frac_sum = 0.0f;
+    env->convention_tick = 0;
     // Only the first episode of an env can be shortened (desync_first_episode).
     env->cur_episode_length = env->episode == 0 ? env->first_episode_len : env->episode_length;
 
@@ -1121,7 +1313,30 @@ void puf_reset(Wef* env) {
     }
     for (int i = 0; i < env->num_agents; i++) {
         FishAgent agent = {0};
-        agent.size = random_uniform(env, env->size_min, env->size_max);
+        agent.last_plant_type = -1;
+        agent.last_eaten_slot = -1;
+        agent.trace_planted_slot = -1;
+        // Size draw: exactly one random_uniform per fish in every mode, so the RNG stream of
+        // the default path is unchanged. AH taste (0 = A, 1 = B) follows size: taste_n_a == -1
+        // thresholds the free draw at taste_split; n >= 0 pins slots < n to band A and the rest
+        // to band B; -2 draws the group per fish (Bernoulli 1/2) and the size inside its band.
+        if (env->allelo && env->taste_n_a == -2) {
+            float u = random_uniform(env, 0.0f, 1.0f);
+            agent.taste = u < 0.5f ? 1 : 0;
+            float lo = agent.taste == 0 ? env->size_a_min : env->size_b_min;
+            float hi = agent.taste == 0 ? env->size_a_max : env->size_b_max;
+            agent.size = lo + (u - (agent.taste == 0 ? 0.5f : 0.0f)) * 2.0f * (hi - lo);
+        } else if (env->allelo && env->taste_n_a >= 0) {
+            agent.taste = i < env->taste_n_a ? 0 : 1;
+            agent.size = agent.taste == 0
+                ? random_uniform(env, env->size_a_min, env->size_a_max)
+                : random_uniform(env, env->size_b_min, env->size_b_max);
+        } else {
+            agent.size = random_uniform(env, env->size_min, env->size_max);
+            if (env->allelo) {
+                agent.taste = agent.size >= env->taste_split ? 0 : 1;
+            }
+        }
         Vec2 pos = {0};
         for (int attempts = 0; attempts < 1000; attempts++) {
             pos = (Vec2){
@@ -1144,8 +1359,10 @@ void puf_reset(Wef* env) {
         }
         agent.pos = pos;
         agent.orientation = random_uniform(env, -PI_F, PI_F);
-        // Agent's size determines its max linear/angular velocity (larger fish are faster)
-        float size_mult = powf(1.0f + agent.size, SIZE_SPEED_EXPONENT);
+        // Agent's size determines its max linear/angular velocity (larger fish are faster).
+        // AH: size_speed_exp (0 = taste without a speed edge); default keeps the folded constant.
+        float size_mult = env->allelo ? powf(1.0f + agent.size, env->size_speed_exp)
+            : powf(1.0f + agent.size, SIZE_SPEED_EXPONENT);
         agent.max_linear_velocity = (MAX_LINEAR_VELOCITY_CM_S / SIMULATION_HZ) * size_mult;
         agent.max_angular_velocity = (MAX_ANGULAR_VELOCITY_RAD_S / SIMULATION_HZ) * size_mult;
         agent.emits_eod = true;
@@ -1238,6 +1455,26 @@ void puf_reset(Wef* env) {
         }
         env->food_active = env->food_start;
     }
+    if (env->allelo) {
+        // Bushes: every slot stays active for the whole episode; slot i is type A for
+        // i < round(start_frac_a K) (positions are random, so types are interleaved); all
+        // unripe unless start_ripe_frac > 0 (curriculum: spread evenly over the slot index,
+        // hence over both types, with no RNG draw).
+        int n_a0 = (int)floorf(env->start_frac_a * (float)env->num_food + 0.5f);
+        int n_r0 = (int)floorf(env->start_ripe_frac * (float)env->num_food + 0.5f);
+        for (int i = 0; i < env->num_food; i++) {
+            FishFood* bush = &env->food[i];
+            bush->active = true;
+            bush->type = i < n_a0 ? 0 : 1;
+            bush->ripe = ((i + 1) * n_r0) / env->num_food > (i * n_r0) / env->num_food;
+            bush->ripen_wait = 0;
+            bush->moment_set = false;
+            wef_bush_scale(env, bush);
+            env->n_type[bush->type]++;
+            env->n_ripe += bush->ripe;
+        }
+        env->food_active = env->num_food;
+    }
     // Ampullary baseline: unit intrinsic dipole at arena center
     Vec2 center = {env->arena_size_x * 0.5f, env->arena_size_y * 0.5f};
     Dipole baseline_dip[1] = {{to_m(center), (Vec2){INTRINSIC_MOMENT_C_M, 0.0f}}};
@@ -1261,7 +1498,7 @@ void puf_reset(Wef* env) {
     if (env->obj_file != NULL) {
         for (int i = 0; i < env->num_food; i++) {
             if (env->food[i].active) {
-                wef_obj_event(env, 0, i, 0, env->food[i].pos);
+                wef_obj_event(env, env->allelo ? 2 + env->food[i].type : 0, i, 0, env->food[i].pos);
             }
         }
         for (int i = 0; i < env->waste_max; i++) {
@@ -1289,10 +1526,10 @@ int wef_zone(const Wef* env, Vec2 p) {
 }
 
 void wef_trace_step(Wef* env) {
-    WefTraceRowV2 rows[MAX_AGENTS];
+    WefTraceRowV3 rows[MAX_AGENTS];
     for (int i = 0; i < env->num_agents; i++) {
         FishAgent* agent = &env->fish[i];
-        rows[i] = (WefTraceRowV2){
+        rows[i] = (WefTraceRowV3){
             .env_id = env->env_id, .episode = env->episode,
             .tick = env->tick, .agent = i,
             .x = agent->pos.x, .y = agent->pos.y,
@@ -1305,14 +1542,24 @@ void wef_trace_step(Wef* env) {
             .nearest_food = env->cleanup ? agent->trace_nearest_food
                 : (agent->has_previous_food_distance ? agent->previous_food_distance : -1.0f),
             .arena_x = env->arena_size_x, .arena_y = env->arena_size_y,
-            .food_left = env->num_food - env->food_eaten,
+            // AH: the stock is the ripe count (bushes are eaten repeatedly)
+            .food_left = env->allelo ? env->n_ripe : env->num_food - env->food_eaten,
             .cleaned = agent->cleaned, .waste_left = env->waste_active,
-            .food_active = env->food_active, .frozen = agent->freeze,
+            .food_active = env->allelo ? env->n_ripe : env->food_active, .frozen = agent->freeze,
             .zone = wef_zone(env, agent->pos),
+            .taste = agent->taste, .plant_type = agent->trace_plant_type,
+            .planted_slot = agent->trace_planted_slot, .ate_type = agent->trace_ate_type,
+            .n_a = env->n_type[0], .n_ripe = env->n_ripe,
+            .hold = agent->eat_cooldown > EAT_COOLDOWN_STEPS ? agent->eat_cooldown : 0,
         };
     }
-    if (env->cleanup || env->regrows) {
-        fwrite(rows, sizeof(WefTraceRowV2), env->num_agents, env->trace_file);
+    if (env->allelo) {
+        fwrite(rows, sizeof(WefTraceRowV3), env->num_agents, env->trace_file);
+    } else if (env->cleanup || env->regrows) {
+        // V2: the V3 row starts with the V2 fields, so write that prefix.
+        for (int i = 0; i < env->num_agents; i++) {
+            fwrite(&rows[i], sizeof(WefTraceRowV2), 1, env->trace_file);
+        }
     } else {
         // Baseline format: the V2 row starts with the V1 fields, so write that prefix.
         for (int i = 0; i < env->num_agents; i++) {
@@ -1558,6 +1805,19 @@ float wef_clean_reward_eff(const Wef* env) {
     return env->clean_reward * frac;
 }
 
+// AH: private planting shaping (curriculum only), annealed like clean_reward.
+float wef_plant_reward_eff(const Wef* env) {
+    if (env->plant_reward == 0.0f) {
+        return 0.0f;
+    }
+    if (env->plant_reward_anneal_steps <= 0.0f) {
+        return env->plant_reward;
+    }
+    float env_steps = (float)env->episode * (float)env->episode_length + (float)env->tick;
+    float frac = fmaxf(0.0f, 1.0f - env_steps / env->plant_reward_anneal_steps);
+    return env->plant_reward * frac;
+}
+
 // Gini coefficient of non-negative counts; 0 when the total is 0.
 float wef_gini(const int* x, int n) {
     float total = 0.0f;
@@ -1584,6 +1844,11 @@ static inline int wef_is_defector(const Wef* env, const FishAgent* fish) {
         return wef_recent(env, fish->eat_mark, WEF_RECENT_STEPS)
             && !wef_recent(env, fish->clean_mark, WEF_CLEAN_MEMORY);
     }
+    if (env->allelo) {
+        // the paper's free rider: ate recently and has not planted within WEF_CLEAN_MEMORY
+        return wef_recent(env, fish->eat_mark, WEF_RECENT_STEPS)
+            && !wef_recent(env, fish->plant_mark, WEF_CLEAN_MEMORY);
+    }
     if (env->regrows) {
         return wef_recent(env, fish->low_eat_mark, WEF_RECENT_STEPS);
     }
@@ -1608,7 +1873,11 @@ void puf_step(Wef* env) {
         env->fish[i].collided = false;
         env->fish[i].bite_victim = -1;
         env->fish[i].cleaned = 0;
+        env->fish[i].trace_plant_type = 0;
+        env->fish[i].trace_planted_slot = -1;
+        env->fish[i].trace_ate_type = 0;
         env->clean_pending[i] = 0;
+        env->plant_pending[i] = 0;
         env->agents[i].rewards[0] = 0.0f;
         env->agents[i].terminals[0] = 0.0f;
     }
@@ -1634,6 +1903,14 @@ void puf_step(Wef* env) {
         agent->last_action[1] = turn;
         agent->last_action[2] = agent->emits_eod ? 1.0f : 0.0f;
         agent->last_action[3] = agent->bite_action ? 1.0f : 0.0f;
+        if (env->allelo) {
+            // Bin decode: the bite magnitude above plant_split is the upper bin. Obs slot
+            // 154 reports 0 / 0.5 (lower) / 1.0 (upper) so the fish knows where it landed.
+            agent->bite_upper = raw_action[3] > env->plant_split;
+            if (agent->bite_action) {
+                agent->last_action[3] = agent->bite_upper ? 1.0f : 0.5f;
+            }
+        }
         env->eod_agent_steps += agent->emits_eod ? 1 : 0;
         if (env->eod_cost != 0.0f && agent->emits_eod) {
             env->agents[i].rewards[0] += env->eod_cost;
@@ -1648,29 +1925,50 @@ void puf_step(Wef* env) {
             }
         }
 
-        // Eat first active pellet in forward 45° cone within 2 cm
+        // Eat first active pellet in forward 45° cone within 2 cm (AH: first ripe bush; it
+        // turns unripe in place and stays active, reward by taste)
         if (!agent->bite_action && agent->eat_cooldown <= 0 && agent->freeze <= 0) {
             for (int f = 0; f < env->num_food; f++) {
                 if (!env->food[f].active) {
                     continue;
                 }
+                if (env->allelo && !env->food[f].ripe) {
+                    continue;
+                }
                 if (!in_forward_cone(agent, env->food[f].pos, EATING_RADIUS_CM, EATING_ANGLE)) {
                     continue;
                 }
-                env->food[f].active = false;
-                agent->eat_mark = env->tick;
-                if ((float)env->food_active <= env->sustain_frac * (float)env->num_food) {
-                    agent->low_eat_mark = env->tick;
+                float eat_reward = EAT_REWARD;
+                if (env->allelo) {
+                    FishFood* bush = &env->food[f];
+                    bush->ripe = false;
+                    bush->ripen_wait = env->ripen_min_steps;
+                    bush->moment_set = false;
+                    wef_bush_scale(env, bush);
+                    env->n_ripe--;
+                    env->eats_match += bush->type == agent->taste;
+                    agent->last_eaten_slot = f;
+                    agent->last_eat_tick = env->tick;
+                    agent->trace_ate_type = 1 + bush->type;
+                    eat_reward = bush->type == agent->taste ? env->taste_match
+                        : wef_taste_other(env, agent->taste);
+                    wef_obj_event(env, 2 + bush->type, f, 6, bush->pos);
+                } else {
+                    env->food[f].active = false;
+                    if ((float)env->food_active <= env->sustain_frac * (float)env->num_food) {
+                        agent->low_eat_mark = env->tick;
+                    }
+                    env->food_active--;
+                    wef_obj_event(env, 0, f, 1, env->food[f].pos);
                 }
+                agent->eat_mark = env->tick;
                 env->food_eaten++;
-                env->food_active--;
                 env->food_by[i]++;
-                wef_obj_event(env, 0, f, 1, env->food[f].pos);
                 agent->eat_cooldown = EAT_COOLDOWN_STEPS;
                 agent->ate = true;
                 agent->bot_last_eat = agent->pos;
                 agent->bot_has_eat = true;
-                env->agents[i].rewards[0] += EAT_REWARD;
+                env->agents[i].rewards[0] += eat_reward;
                 break;
             }
         }
@@ -1733,6 +2031,9 @@ void puf_step(Wef* env) {
             if (!env->food[f].active) {
                 continue;
             }
+            if (env->allelo && !env->food[f].ripe) {
+                continue;  // shaping toward edible (ripe) bushes only
+            }
             any_food = true;
             float dx = agent->pos.x - env->food[f].pos.x;
             float dy = agent->pos.y - env->food[f].pos.y;
@@ -1751,7 +2052,7 @@ void puf_step(Wef* env) {
             }
             agent->previous_food_distance = nearest_food;
             agent->has_previous_food_distance = true;
-        } else if (env->cleanup || env->regrows) {
+        } else if (env->cleanup || env->regrows || env->allelo) {
             // No pellet to measure against: forget the stale distance so the next
             // spawn does not pay a windfall.
             agent->has_previous_food_distance = false;
@@ -1788,6 +2089,42 @@ void puf_step(Wef* env) {
         if (env->cleanup && attacker->can_clean) {
             waste_target = wef_nearest_waste_in_cone(env, attacker);
         }
+        // AH planting target (section 2.3): the nearest ACTIVE UNRIPE bush whose type differs
+        // from the planted type inside the plant cone; same-type bushes never shadow it.
+        int bush = -1;
+        float bush_d2 = INFINITY;
+        bool same_only = false;
+        int plant_type = -1;
+        if (env->allelo && env->plant_mode) {
+            int taste = attacker->taste;
+            plant_type = env->plant_mode == 2 ? taste
+                : ((attacker->bite_upper ^ env->plant_bin_order) ? taste : 1 - taste);
+            for (int f = 0; f < env->num_food; f++) {
+                FishFood* b = &env->food[f];
+                if (!b->active || b->ripe) {
+                    continue;
+                }
+                if (!in_forward_cone(attacker, b->pos, env->plant_radius_cm, EATING_ANGLE)) {
+                    continue;
+                }
+                if (b->type == plant_type) {
+                    same_only = true;
+                    continue;
+                }
+                float dx = b->pos.x - attacker->pos.x;
+                float dy = b->pos.y - attacker->pos.y;
+                float d2 = dx * dx + dy * dy;
+                if (d2 < bush_d2) {
+                    bush = f;
+                    bush_d2 = d2;
+                }
+            }
+        }
+        // plant_priority: 0 fish first (today's zap semantics), 1 bush first, 2 nearest first
+        bool zap = victim >= 0;
+        if (zap && bush >= 0) {
+            zap = env->plant_priority == 0 || (env->plant_priority == 2 && nearest <= bush_d2);
+        }
         if (waste_target >= 0 && (env->clean_priority == 1 || victim < 0)) {
             // CLEAN: remove up to clean_max_items nearest items; no reward here
             // (clean_reward is applied privately after mixing).
@@ -1806,7 +2143,7 @@ void puf_step(Wef* env) {
             attacker->cleaned = removed;
             env->clean_pending[i] = removed;
             attacker->bite_cooldown = env->clean_cooldown_steps;
-        } else if (victim >= 0) {
+        } else if (zap) {
             env->fish[victim].was_bitten = true;
             attacker->bite_victim = victim;
             env->bites++;
@@ -1819,12 +2156,64 @@ void puf_step(Wef* env) {
             env->agents[victim].rewards[0] += env->bitten_reward * (1.0f + size_difference);
             env->agents[i].rewards[0] += env->bite_reward;
             if (env->bitten_freeze_steps > 0) {
-                env->fish[victim].freeze = env->bitten_freeze_steps;
+                // AH: the freeze stacks on any planting hold the victim is serving (section
+                // 2.5), so a zap early in a hold still costs the planter the full sanction.
+                env->fish[victim].freeze = env->bitten_freeze_steps
+                    + (env->allelo ? env->fish[victim].eat_cooldown : 0);
                 env->freezes++;
             }
             if (env->cleanup && attacker->pos.x < env->strip_cm) {
                 env->bites_in_strip++;
             }
+            if (env->allelo) {
+                attacker->bite_cooldown = env->zap_cooldown_steps;
+                if (env->zap_steps > attacker->eat_cooldown) {
+                    attacker->eat_cooldown = env->zap_steps;  // head-butt recovery (pricing lever)
+                }
+                if (env->fish[victim].taste != attacker->taste) {
+                    env->zaps_cross++;
+                } else {
+                    env->zaps_same++;
+                }
+            }
+        } else if (bush >= 0) {
+            // PLANT (conversion): recolour the bush, hold the planter for plant_steps through
+            // eat_cooldown (no motion, no eating), bite cooldown max(plant_cooldown, hold).
+            FishFood* b = &env->food[bush];
+            int old_type = b->type;
+            int major = env->n_type[0] > env->n_type[1] ? 0 : env->n_type[1] > env->n_type[0] ? 1 : -1;
+            b->type = (int8_t)plant_type;
+            b->ripen_wait = env->ripen_min_steps;
+            b->moment_set = false;
+            wef_bush_scale(env, b);
+            env->n_type[old_type]--;
+            env->n_type[plant_type]++;
+            env->plantings++;
+            env->plantings_by[i]++;
+            env->plantings_g[attacker->taste]++;
+            env->plant_own += plant_type == attacker->taste;
+            env->plant_own_g[attacker->taste] += plant_type == attacker->taste;
+            env->plant_major += plant_type == major;
+            env->plant_proactive += !(bush == attacker->last_eaten_slot
+                && env->tick - attacker->last_eat_tick <= 3);
+            env->plant_pending[i]++;
+            attacker->last_plant_type = plant_type;
+            attacker->plant_mark = env->tick;
+            attacker->trace_plant_type = 1 + plant_type;
+            attacker->trace_planted_slot = bush;
+            wef_obj_event(env, 2 + plant_type, bush, 3 + plant_type, b->pos);
+            if (env->plant_steps > attacker->eat_cooldown) {
+                attacker->eat_cooldown = env->plant_steps;  // THE HOLD
+            }
+            attacker->bite_cooldown = env->plant_cooldown_steps > env->plant_steps
+                ? env->plant_cooldown_steps : env->plant_steps;
+        } else if (same_only) {
+            // same-type unripe bushes only: a no-op that spends the planting cooldown, no hold
+            env->plant_noop++;
+            attacker->bite_cooldown = env->plant_cooldown_steps;
+        }
+        if (env->allelo && !zap) {
+            env->plant_attempts++;  // every bite that did not land on a fish: the paper's "total planting"
         }
     }
 
@@ -1953,6 +2342,48 @@ void puf_step(Wef* env) {
             env->collapse_tick = env->tick;
         }
     }
+    if (env->allelo) {
+        // Ripening (Bernoulli, memoryless): each unripe bush of type k with ripen_wait == 0
+        // ripens w.p. F(n_k / K) = ripen_lin x + ripen_cubic x^ripen_pow, one draw per bush.
+        float p_type[2];
+        for (int k = 0; k < 2; k++) {
+            float x = (float)env->n_type[k] / (float)env->num_food;
+            p_type[k] = env->ripen_lin * x + env->ripen_cubic * powf(x, env->ripen_pow);
+        }
+        bool any_ripened = false;
+        for (int f = 0; f < env->num_food; f++) {
+            FishFood* b = &env->food[f];
+            if (!b->active || b->ripe) {
+                continue;
+            }
+            if (b->ripen_wait > 0) {
+                b->ripen_wait--;
+                continue;
+            }
+            if (random_uniform(env, 0.0f, 1.0f) < p_type[b->type]) {
+                b->ripe = true;
+                b->moment_set = false;
+                wef_bush_scale(env, b);
+                env->n_ripe++;
+                env->ripened++;
+                any_ripened = true;
+                wef_obj_event(env, 2 + b->type, f, 5, b->pos);
+            }
+        }
+        if (any_ripened) {
+            for (int i = 0; i < env->num_agents; i++) {
+                env->fish[i].has_previous_food_distance = false;  // no shaping windfall from a new ripe bush
+            }
+        }
+        // Per-step accumulators for the composition metrics (section 5.1).
+        int n_max = env->n_type[0] > env->n_type[1] ? env->n_type[0] : env->n_type[1];
+        env->mono_frac_sum += (float)n_max / (float)env->num_food;
+        env->frac_a_sum += (float)env->n_type[0] / (float)env->num_food;
+        env->ripe_frac_sum += (float)env->n_ripe / (float)env->num_food;
+        if (env->convention_tick == 0 && (float)n_max >= env->conv_theta * (float)env->num_food) {
+            env->convention_tick = env->tick;
+        }
+    }
 
     for (int i = 0; i < env->num_agents; i++) {
         env->eater_steps += wef_recent(env, env->fish[i].eat_mark, WEF_RECENT_STEPS);
@@ -1992,6 +2423,14 @@ void puf_step(Wef* env) {
             }
         }
     }
+    if (env->allelo && env->plant_reward != 0.0f) {
+        float eff = wef_plant_reward_eff(env);
+        for (int i = 0; i < env->num_agents; i++) {
+            if (env->plant_pending[i] > 0) {
+                env->agents[i].rewards[0] += (float)env->plant_pending[i] * eff;
+            }
+        }
+    }
     for (int i = 0; i < env->num_agents; i++) {
         env->episode_return += env->agents[i].rewards[0];
     }
@@ -1999,7 +2438,7 @@ void puf_step(Wef* env) {
     compute_observations(env);
 
     if (env->tick >= env->cur_episode_length
-            || (!env->cleanup && !env->regrows && env->food_eaten == env->num_food)) {
+            || (!env->cleanup && !env->regrows && !env->allelo && env->food_eaten == env->num_food)) {
         env->episode++;
         if (env->trace_file != NULL) {
             fflush(env->trace_file);
@@ -2012,7 +2451,8 @@ void puf_step(Wef* env) {
         env->log.episode_return += env->episode_return;
         env->log.score += env->raw_return_sum;
         float waste_frac = env->waste_max > 0 ? env->waste_frac_sum / ticks : 0.0f;
-        env->log.perf += env->cleanup ? 1.0f - waste_frac
+        env->log.perf += env->allelo ? env->mono_frac_sum / ticks  // AH: the paper's m-bar
+            : env->cleanup ? 1.0f - waste_frac
             : env->regrows ? (float)env->food_active / (float)env->num_food  // Harvest/Commons: stock left
             : (float)env->food_eaten / (float)env->num_food;
         env->log.food_eaten_mean +=(float)env->food_eaten / (float)env->num_agents;
@@ -2063,6 +2503,50 @@ void puf_step(Wef* env) {
         }
         env->log.policy_0_score += pol_n[0] > 0 ? pol_sum[0] / (float)pol_n[0] : 0.0f;
         env->log.policy_1_score += pol_n[1] > 0 ? pol_sum[1] / (float)pol_n[1] : 0.0f;
+        if (env->allelo) {
+            float k = (float)env->num_food;
+            float frac_a_final = (float)env->n_type[0] / k;
+            float frac_a_mean = env->frac_a_sum / ticks;
+            float taste_sum[2] = {0.0f, 0.0f};
+            int taste_n[2] = {0, 0};
+            for (int i = 0; i < env->num_agents; i++) {
+                int t = env->fish[i].taste == 0 ? 0 : 1;
+                taste_sum[t] += env->return_by[i];
+                taste_n[t]++;
+            }
+            float g_a = (float)taste_n[0] / (float)env->num_agents;
+            int major_taste = taste_n[0] > taste_n[1] ? 0 : taste_n[1] > taste_n[0] ? 1 : -1;
+            env->log.mono_frac += env->mono_frac_sum / ticks;
+            env->log.mono_final += frac_a_final > 1.0f - frac_a_final ? frac_a_final : 1.0f - frac_a_final;
+            env->log.frac_a_final += frac_a_final;
+            env->log.frac_a_mean += frac_a_mean;
+            env->log.majority_frac_final += major_taste < 0 ? 0.5f
+                : major_taste == 0 ? frac_a_final : 1.0f - frac_a_final;
+            env->log.conv_c += fabsf(frac_a_mean - g_a);
+            env->log.time_to_convention += env->convention_tick > 0
+                ? (float)env->convention_tick / ticks : 1.0f;
+            env->log.ripened += (float)env->ripened;
+            env->log.ripe_frac += env->ripe_frac_sum / ticks;
+            env->log.plantings += (float)env->plantings;
+            env->log.plantings_a += (float)env->plantings_g[0];
+            env->log.plantings_b += (float)env->plantings_g[1];
+            env->log.plant_attempts += (float)env->plant_attempts;
+            env->log.plant_own_frac += env->plantings > 0 ? (float)env->plant_own / (float)env->plantings : 0.0f;
+            env->log.plant_own_frac_a += env->plantings_g[0] > 0
+                ? (float)env->plant_own_g[0] / (float)env->plantings_g[0] : 0.0f;
+            env->log.plant_own_frac_b += env->plantings_g[1] > 0
+                ? (float)env->plant_own_g[1] / (float)env->plantings_g[1] : 0.0f;
+            env->log.plant_major_frac += env->plantings > 0 ? (float)env->plant_major / (float)env->plantings : 0.0f;
+            env->log.plant_proactive += (float)env->plant_proactive;
+            env->log.plant_noop += (float)env->plant_noop;
+            env->log.plant_gini += wef_gini(env->plantings_by, env->num_agents);
+            env->log.eaten_match_frac += env->food_eaten > 0 ? (float)env->eats_match / (float)env->food_eaten : 0.0f;
+            env->log.zaps_cross += (float)env->zaps_cross;
+            env->log.zaps_same += (float)env->zaps_same;
+            env->log.taste_a_return += taste_n[0] > 0 ? taste_sum[0] / (float)taste_n[0] : 0.0f;
+            env->log.taste_b_return += taste_n[1] > 0 ? taste_sum[1] / (float)taste_n[1] : 0.0f;
+            env->log.taste_a_n += (float)taste_n[0];
+        }
         env->log.n += 1.0f;
         puf_reset(env);
         for (int i = 0; i < env->num_agents; i++) {
@@ -2567,6 +3051,15 @@ static const char* WEF_ENV_KEYS[] = {
     "policy1_agents", "no_clean_agents", "roles", "bot_shift_steps", "bot_oracle", "bot_theta",
     "render_field", "render_field_alpha", "sustain_frac", "num_patches", "regrow_in_patches",
     "bot_camp",
+    // Allelopathic Harvest (docs/wef-allelopathic-harvest-v0-design.md 4.1)
+    "allelo", "ripen_lin", "ripen_cubic", "ripen_pow", "ripen_min_steps", "start_frac_a",
+    "start_ripe_frac", "food_contrast_a", "food_contrast_b", "food_radius_unripe_cm",
+    "food_radius_ripe_cm", "unripe_intrinsic", "ripe_intrinsic", "taste_match", "taste_other",
+    "taste_other_a", "taste_other_b", "taste_split", "taste_n_a", "size_a_min", "size_a_max",
+    "size_b_min", "size_b_max", "size_speed_exp", "plant_mode", "plant_split", "plant_bin_order",
+    "plant_priority", "plant_radius_cm", "plant_steps", "plant_cooldown_steps", "plant_reward",
+    "plant_reward_anneal_steps", "zap_cooldown_steps", "zap_steps", "conv_theta",
+    "bot_plant_theta", "bot_plant_max", "bot_plant_frac",
 };
 
 static void wef_check_keys(Dict* kwargs) {
@@ -2651,6 +3144,46 @@ void puf_init(Env* env, Dict* kwargs) {
     env->num_patches = wef_cfg(kwargs, "num_patches", 0);
     env->regrow_in_patches = wef_cfg(kwargs, "regrow_in_patches", 0);
     env->bot_camp = wef_cfg(kwargs, "bot_camp", 0);
+    // Allelopathic Harvest (section 4.1). Defaults reproduce upstream.
+    env->allelo = wef_cfg(kwargs, "allelo", 0);
+    env->ripen_lin = wef_cfg(kwargs, "ripen_lin", 0);
+    env->ripen_cubic = wef_cfg(kwargs, "ripen_cubic", 0);
+    env->ripen_pow = wef_cfg(kwargs, "ripen_pow", 3.0);
+    env->ripen_min_steps = wef_cfg(kwargs, "ripen_min_steps", 0);
+    env->start_frac_a = wef_cfg(kwargs, "start_frac_a", 0.5);
+    env->start_ripe_frac = wef_cfg(kwargs, "start_ripe_frac", 0);
+    env->food_contrast_a = wef_cfg(kwargs, "food_contrast_a", CONDUCTOR_CONTRAST);
+    env->food_contrast_b = wef_cfg(kwargs, "food_contrast_b", 0.5);
+    env->food_radius_unripe_cm = wef_cfg(kwargs, "food_radius_unripe_cm", FOOD_RADIUS_CM);
+    env->food_radius_ripe_cm = wef_cfg(kwargs, "food_radius_ripe_cm", FOOD_RADIUS_CM);
+    env->unripe_intrinsic = wef_cfg(kwargs, "unripe_intrinsic", 1.0);
+    env->ripe_intrinsic = wef_cfg(kwargs, "ripe_intrinsic", 1.0);
+    env->taste_match = wef_cfg(kwargs, "taste_match", EAT_REWARD);
+    env->taste_other = wef_cfg(kwargs, "taste_other", EAT_REWARD);
+    env->taste_other_a = wef_cfg(kwargs, "taste_other_a", -1);
+    env->taste_other_b = wef_cfg(kwargs, "taste_other_b", -1);
+    env->taste_split = wef_cfg(kwargs, "taste_split", 0.5);
+    env->taste_n_a = wef_cfg(kwargs, "taste_n_a", -1);
+    env->size_a_min = wef_cfg(kwargs, "size_a_min", 0.5);
+    env->size_a_max = wef_cfg(kwargs, "size_a_max", 0.5);
+    env->size_b_min = wef_cfg(kwargs, "size_b_min", 0.5);
+    env->size_b_max = wef_cfg(kwargs, "size_b_max", 0.5);
+    env->size_speed_exp = wef_cfg(kwargs, "size_speed_exp", SIZE_SPEED_EXPONENT);
+    env->plant_mode = wef_cfg(kwargs, "plant_mode", 1);
+    env->plant_split = wef_cfg(kwargs, "plant_split", 0.6745);
+    env->plant_bin_order = wef_cfg(kwargs, "plant_bin_order", 0);
+    env->plant_priority = wef_cfg(kwargs, "plant_priority", 0);
+    env->plant_radius_cm = wef_cfg(kwargs, "plant_radius_cm", BITING_RADIUS_CM);
+    env->plant_steps = wef_cfg(kwargs, "plant_steps", 0);
+    env->plant_cooldown_steps = wef_cfg(kwargs, "plant_cooldown_steps", BITE_COOLDOWN_STEPS);
+    env->plant_reward = wef_cfg(kwargs, "plant_reward", 0);
+    env->plant_reward_anneal_steps = wef_cfg(kwargs, "plant_reward_anneal_steps", 0);
+    env->zap_cooldown_steps = wef_cfg(kwargs, "zap_cooldown_steps", BITE_COOLDOWN_STEPS);
+    env->zap_steps = wef_cfg(kwargs, "zap_steps", 0);
+    env->conv_theta = wef_cfg(kwargs, "conv_theta", 0.9);
+    env->bot_plant_theta = wef_cfg(kwargs, "bot_plant_theta", 1.0);
+    env->bot_plant_max = wef_cfg(kwargs, "bot_plant_max", 0);
+    env->bot_plant_frac = wef_cfg(kwargs, "bot_plant_frac", 1.0);
     {
         // roles = r0,r1,r2,r3 (comma list; a scalar applies to slot 0 only)
         DictItem* item = dict_find(kwargs, "roles");
@@ -2667,8 +3200,49 @@ void puf_init(Env* env, Dict* kwargs) {
     }
     assert(env->bot_shift_steps >= MAX_AGENTS);
     for (int i = 0; i < MAX_AGENTS; i++) {
-        assert(env->roles[i] >= 0 && env->roles[i] <= 7
-            && "roles: 0 policy, 1 cleaner, 2 eater, 3 shift, 4 random, 5 sustainable eater, 6 dense-first eater, 7 stock-threshold eater");
+        assert(env->roles[i] >= 0 && env->roles[i] <= 12
+            && "roles: 0 policy, 1 cleaner, 2 eater, 3 shift, 4 random, 5 sustainable eater, 6 dense-first eater, 7 stock-threshold eater, 8 planter-own, 9 planter-majority, 10 free-rider, 11 zapper-planter, 12 opportunistic planter");
+        assert((env->allelo || env->roles[i] <= 7) && "roles 8-12 need allelo = 1");
+    }
+    if (env->allelo) {
+        assert(env->cleanup == 0 && env->regrow_mode == 0 && env->regrow_p_max == 0.0f
+            && env->waste_max == 0 && env->food_start == -1
+            && "allelo: no cleanup / regrowth / waste / food_start (every slot is a permanent bush)");
+        assert(env->obs_extra != 1 && env->obs_extra != 2 && "allelo: obs_extra 1/2 are Cleanup cues");
+        assert(env->ripen_lin >= 0.0f && env->ripen_cubic >= 0.0f && env->ripen_lin + env->ripen_cubic <= 1.0f);
+        assert(env->ripen_min_steps >= 0);
+        assert(env->start_frac_a >= 0.0f && env->start_frac_a <= 1.0f);
+        assert(env->start_ripe_frac >= 0.0f && env->start_ripe_frac <= 1.0f);
+        assert(env->taste_n_a >= -2 && env->taste_n_a <= env->num_agents
+            && "taste_n_a: -2 per-episode split, -1 free draw, 0..num_agents A-tasting fish");
+        if (env->taste_n_a != -1) {
+            assert(env->size_a_min >= 0.0f && env->size_a_min <= env->size_a_max && env->size_a_max <= 1.0f);
+            assert(env->size_b_min >= 0.0f && env->size_b_min <= env->size_b_max && env->size_b_max <= 1.0f);
+            bool both_used = env->taste_n_a == -2
+                || (env->taste_n_a > 0 && env->taste_n_a < env->num_agents);
+            if (both_used) {
+                float width_a = env->size_a_max - env->size_a_min;
+                float width_b = env->size_b_max - env->size_b_min;
+                float width = width_a > width_b ? width_a : width_b;
+                assert(env->size_a_min - env->size_b_max >= width + 0.10f - 1e-6f
+                    && "allelo: band A must sit above band B by >= max(width) + 0.10 (group label, section 2.4)");
+            }
+        }
+        assert(env->plant_steps >= 0 && env->plant_cooldown_steps >= 0 && env->zap_cooldown_steps >= 0
+            && env->zap_steps >= 0);
+        assert(env->plant_split > 0.0f);
+        assert(env->plant_mode >= 0 && env->plant_mode <= 2);
+        assert(env->plant_priority >= 0 && env->plant_priority <= 2);
+        assert(env->plant_bin_order == 0 || env->plant_bin_order == 1);
+        assert(env->plant_radius_cm > 0.0f);
+        assert(env->taste_other <= env->taste_match && env->taste_other >= 0.0f);
+        assert((env->taste_other_a < 0.0f || env->taste_other_a <= env->taste_match)
+            && (env->taste_other_b < 0.0f || env->taste_other_b <= env->taste_match));
+        assert(env->food_radius_unripe_cm > 0.0f && env->food_radius_ripe_cm > 0.0f);
+        assert(env->ripe_intrinsic >= 0.0f && env->unripe_intrinsic >= 0.0f);
+        assert(env->conv_theta > 0.0f && env->conv_theta <= 1.0f);
+        assert(env->bot_plant_theta >= 0.0f && env->bot_plant_max >= 0
+            && env->bot_plant_frac >= 0.0f && env->bot_plant_frac <= 1.0f);
     }
     assert((int)wef_cfg(kwargs, "num_bots", 0) == 0 && "num_bots is not supported by wef");
     assert(env->waste_max >= 0 && env->waste_max <= MAX_WASTE);
@@ -2715,7 +3289,8 @@ void puf_init(Env* env, Dict* kwargs) {
     if (trace_dir != NULL && trace_dir[0] != '\0') {
         char path[4096];
         bool v2 = env->cleanup || env->regrows;
-        snprintf(path, sizeof(path), v2 ? "%s/env_%05d.v2.bin" : "%s/env_%05d.bin",
+        snprintf(path, sizeof(path),
+            env->allelo ? "%s/env_%05d.v3.bin" : v2 ? "%s/env_%05d.v2.bin" : "%s/env_%05d.bin",
             trace_dir, env->env_id);
         env->trace_file = fopen(path, "wb");
         assert(env->trace_file != NULL && "WEF_TRACE_DIR must be an existing, writable dir");
@@ -2762,6 +3337,82 @@ void puf_init(Env* env, Dict* kwargs) {
     }
 }
 
+// Allelopathic Harvest keys (section 5.1). Emitted in both builds; only their position differs.
+static void wef_log_allelo(Log* log, Dict* out) {
+    dict_set(out, "mono_frac", log->mono_frac);
+    dict_set(out, "frac_a_final", log->frac_a_final);
+    dict_set(out, "frac_a_mean", log->frac_a_mean);
+    dict_set(out, "majority_frac_final", log->majority_frac_final);
+    dict_set(out, "conv_c", log->conv_c);
+    dict_set(out, "time_to_convention", log->time_to_convention);
+    dict_set(out, "ripe_frac", log->ripe_frac);
+    dict_set(out, "plantings", log->plantings);
+    dict_set(out, "plantings_a", log->plantings_a);
+    dict_set(out, "plantings_b", log->plantings_b);
+    dict_set(out, "plant_own_frac", log->plant_own_frac);
+    dict_set(out, "plant_own_frac_a", log->plant_own_frac_a);
+    dict_set(out, "plant_own_frac_b", log->plant_own_frac_b);
+    dict_set(out, "plant_major_frac", log->plant_major_frac);
+    dict_set(out, "plant_proactive", log->plant_proactive);
+    dict_set(out, "plant_gini", log->plant_gini);
+    dict_set(out, "taste_a_n", log->taste_a_n);
+    dict_set(out, "zaps_cross", log->zaps_cross);
+    dict_set(out, "zaps_same", log->zaps_same);
+}
+
+// The rest of the AH keys (off the 30-key live dashboard in the AH build, in the [metrics] series).
+static void wef_log_allelo_tail(Log* log, Dict* out) {
+    dict_set(out, "mono_final", log->mono_final);
+    dict_set(out, "ripened", log->ripened);
+    dict_set(out, "plant_noop", log->plant_noop);
+    dict_set(out, "plant_attempts", log->plant_attempts);
+    dict_set(out, "eaten_match_frac", log->eaten_match_frac);
+    dict_set(out, "taste_a_return", log->taste_a_return);
+    dict_set(out, "taste_b_return", log->taste_b_return);
+}
+
+#ifdef WEF_AH_DASH
+// Allelopathic Harvest dashboard order (section 5.1): the trainer shows the first 30 env/*
+// keys. Set by the AH build line (NVCC_EXTRA="-DMAX_AGENTS=8 -DWEF_AH_DASH"); the default
+// build keeps today's order below so the Cleanup / Commons keys stay on their dashboards.
+void puf_log(Log* log, Dict* out) {
+    dict_set(out, "perf", log->perf);
+    dict_set(out, "score", log->score);
+    dict_set(out, "episode_return", log->episode_return);
+    dict_set(out, "episode_length", log->episode_length);
+    dict_set(out, "food_eaten_mean", log->food_eaten_mean);
+    wef_log_allelo(log, out);
+    dict_set(out, "bites", log->bites);
+    dict_set(out, "freezes", log->freezes);
+    dict_set(out, "frozen_frac", log->frozen_frac);
+    dict_set(out, "equality", log->equality);
+    dict_set(out, "collective_food", log->collective_food);
+    dict_set(out, "eod_rate", log->eod_rate);
+    wef_log_allelo_tail(log, out);
+    dict_set(out, "collisions_fish", log->collisions_fish);
+    dict_set(out, "food_per_fish_area", log->food_per_fish_area);
+    dict_set(out, "waste_frac", log->waste_frac);
+    dict_set(out, "frac_open", log->frac_open);
+    dict_set(out, "cleans", log->cleans);
+    dict_set(out, "regrown", log->regrown);
+    dict_set(out, "clean_gini", log->clean_gini);
+    dict_set(out, "clean_max_share", log->clean_max_share);
+    dict_set(out, "strip_frac", log->strip_frac);
+    dict_set(out, "bites_in_strip", log->bites_in_strip);
+    dict_set(out, "bites_on_eaters", log->bites_on_eaters);
+    dict_set(out, "bites_on_defectors", log->bites_on_defectors);
+    dict_set(out, "bites_at_risk", log->bites_at_risk);
+    dict_set(out, "bites_top", log->bites_top);
+    dict_set(out, "eater_frac", log->eater_frac);
+    dict_set(out, "defector_frac", log->defector_frac);
+    dict_set(out, "collapsed", log->collapsed);
+    dict_set(out, "survival_frac", log->survival_frac);
+    dict_set(out, "policy_0_score", log->policy_0_score);
+    dict_set(out, "policy_1_score", log->policy_1_score);
+    dict_set(out, "draw_rate", log->draw_rate);
+    dict_set(out, "n", log->n);
+}
+#else
 void puf_log(Log* log, Dict* out) {
     dict_set(out, "perf", log->perf);
     dict_set(out, "score", log->score);
@@ -2796,4 +3447,8 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "policy_1_score", log->policy_1_score);
     dict_set(out, "draw_rate", log->draw_rate);
     dict_set(out, "n", log->n);
+    // AH keys appended after today's order (default build: dashboard order unchanged).
+    wef_log_allelo(log, out);
+    wef_log_allelo_tail(log, out);
 }
+#endif
