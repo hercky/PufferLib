@@ -83,6 +83,57 @@ static void kw_harvest(Dict* kw) {
     dict_set(kw, "size_max", 0.5);
 }
 
+// Allelopathic Harvest, AH-strict 4+4 (docs/wef-allelopathic-harvest-v0-design.md 0.1b, 4.1):
+// 8 fish, 40 x 40 cm, 64 uniform bushes, linear F, hold 32, 1024 steps, zaps off (learnability
+// rungs; bitten_freeze_steps=25 on the command line is the zap arm). Needs the 8-fish build.
+static void kw_allelo(Dict* kw) {
+    dict_set(kw, "num_agents", 8);
+    dict_set(kw, "min_arena_width", 40);
+    dict_set(kw, "max_arena_width", 40);
+    dict_set(kw, "min_arena_height", 40);
+    dict_set(kw, "max_arena_height", 40);
+    dict_set(kw, "food_distribution", FOOD_UNIFORM);
+    dict_set(kw, "num_food", 64);
+    dict_set(kw, "episode_length", 1024);
+    dict_set(kw, "allelo", 1);
+    dict_set(kw, "ripen_lin", 8.9e-3);
+    dict_set(kw, "ripen_cubic", 0);
+    dict_set(kw, "plant_steps", 32);
+    dict_set(kw, "plant_mode", 1);
+    dict_set(kw, "plant_split", 0.6745);
+    dict_set(kw, "plant_bin_order", 0);
+    dict_set(kw, "plant_priority", 0);
+    dict_set(kw, "plant_radius_cm", 3.0);
+    dict_set(kw, "taste_n_a", 4);
+    dict_set(kw, "taste_match", 1.0);
+    dict_set(kw, "taste_other", 0.5);
+    dict_set(kw, "size_a_min", 0.58);
+    dict_set(kw, "size_a_max", 0.62);
+    dict_set(kw, "size_b_min", 0.38);
+    dict_set(kw, "size_b_max", 0.42);
+    dict_set(kw, "food_contrast_a", -0.5);
+    dict_set(kw, "food_contrast_b", 0.5);
+    dict_set(kw, "food_radius_unripe_cm", 0.12);
+    dict_set(kw, "food_radius_ripe_cm", 0.30);
+    dict_set(kw, "unripe_intrinsic", 0);
+    dict_set(kw, "ripe_intrinsic", 3);
+    dict_set(kw, "obs_extra", 5);
+    dict_set(kw, "bitten_freeze_steps", 0);
+    dict_set(kw, "zap_cooldown_steps", 25);
+    dict_set(kw, "bitten_reward", 0);
+    dict_set(kw, "bite_reward", 0);
+    dict_set(kw, "proximity_shaping", 0);
+}
+
+// shape=conv: the AH-conv keys on top of kw_allelo (paper cubic F, hold 8, 2048 steps).
+static void kw_allelo_conv(Dict* kw) {
+    dict_set(kw, "ripen_lin", 1.7e-3);
+    dict_set(kw, "ripen_cubic", 7.2e-3);
+    dict_set(kw, "ripen_pow", 3);
+    dict_set(kw, "plant_steps", 8);
+    dict_set(kw, "episode_length", 2048);
+}
+
 static unsigned int g_seed = 7;  // calibration: seed=N on the command line
 
 static Harness make(Dict* kw, int num_fish) {
@@ -530,19 +581,30 @@ static void test_baseline(void) {
 }
 
 // Calibration mode (E1): all fish scripted, so the whole thing runs on the CPU.
-//   wef_test roles=3,3,2,2 [episodes=100] [oracle=0] [key=value ...]
+//   wef_test roles=3,3,2,2 [episodes=100] [oracle=0] [preset=harvest|allelo] [shape=conv] [num_agents=N] [key=value ...]
 // Prints per-slot pellets / cleans / strip time per episode and episode-level
 // waste fraction and open fraction, in the scripts/cleanup.args preset.
 static int run_calibration(int argc, char** argv) {
     Dict kw = {0};
     kw_base(&kw, 4);
     bool harvest = false;
+    bool allelo = false;
+    bool conv = false;
     for (int a = 1; a < argc; a++) {
         if (strcmp(argv[a], "preset=harvest") == 0) {
             harvest = true;
+        } else if (strcmp(argv[a], "preset=allelo") == 0) {
+            allelo = true;
+        } else if (strcmp(argv[a], "shape=conv") == 0) {
+            conv = true;
         }
     }
-    if (harvest) {
+    if (allelo) {
+        kw_allelo(&kw);
+        if (conv) {
+            kw_allelo_conv(&kw);
+        }
+    } else if (harvest) {
         kw_harvest(&kw);
     } else {
         kw_cleanup(&kw);
@@ -550,7 +612,8 @@ static int run_calibration(int argc, char** argv) {
     int episodes = 100;
     const char* roles = "0,0,0,0";
     for (int a = 1; a < argc; a++) {
-        if (strcmp(argv[a], "preset=harvest") == 0) {
+        if (strcmp(argv[a], "preset=harvest") == 0 || strcmp(argv[a], "preset=allelo") == 0
+                || strcmp(argv[a], "shape=conv") == 0) {
             continue;
         }
         char key[64];
@@ -584,16 +647,64 @@ static int run_calibration(int argc, char** argv) {
     double pellets[MAX_AGENTS] = {0};
     double cleans[MAX_AGENTS] = {0};
     double strip[MAX_AGENTS] = {0};
+    double ret[MAX_AGENTS] = {0};      // raw (taste-weighted) return per slot
+    double plant_a[MAX_AGENTS] = {0};  // conversions to A / B per slot
+    double plant_b[MAX_AGENTS] = {0};
+    double noop[MAX_AGENTS] = {0};
+    double zaps_given[MAX_AGENTS] = {0};
+    int taste_of[MAX_AGENTS] = {0};
     double waste_frac = 0.0;
     double open_frac = 0.0;
     double collective = 0.0;
     double stock_left = 0.0;
     double collapsed = 0.0;
     double survival = 0.0;
+    double mono_final = 0.0;
+    double mono_mean = 0.0;
+    double t_conv = 0.0;
+    double plantings = 0.0;
+    double proactive = 0.0;
+    double zaps_cross = 0.0;
+    double zaps_same = 0.0;
+    double zaps_taken[MAX_AGENTS] = {0};
+    double n_ripe_mean = 0.0;
+    double plant_noop_total = 0.0;
+    double plant_attempts = 0.0;
+    double zaps_given_step[MAX_AGENTS] = {0};  // per-episode accumulators (reset each episode)
+    double zaps_taken_step[MAX_AGENTS] = {0};
+    double plant_a_step[MAX_AGENTS] = {0};
+    double plant_b_step[MAX_AGENTS] = {0};
+    double noop_step[MAX_AGENTS] = {0};
+    int prev_noop = 0;
     const char* dbg = getenv("WEF_TEST_DEBUG");
     for (int e = 0; e < episodes; e++) {
+        for (int i = 0; i < env->num_agents; i++) {
+            zaps_given_step[i] = 0;
+            zaps_taken_step[i] = 0;
+            plant_a_step[i] = 0;
+            plant_b_step[i] = 0;
+            noop_step[i] = 0;
+        }
+        prev_noop = 0;
         while (env->episode == e) {
             puf_step(env);
+            if (env->tick > 0) {
+                // per-slot event tallies from this step's trace fields (the env keeps totals only)
+                for (int i = 0; i < env->num_agents; i++) {
+                    FishAgent* f = &env->fish[i];
+                    zaps_given_step[i] += f->bite_victim >= 0;
+                    zaps_taken_step[i] += f->was_bitten;
+                    plant_a_step[i] += f->trace_plant_type == 1;
+                    plant_b_step[i] += f->trace_plant_type == 2;
+                    // a same-type no-op is a bite with no victim and no conversion that moved plant_noop
+                    if (env->plant_noop > prev_noop && f->bite_action && f->bite_victim < 0
+                            && f->trace_plant_type == 0) {
+                        noop_step[i] += 1;
+                    }
+                }
+                prev_noop = env->plant_noop;
+                n_ripe_mean += (double)env->n_ripe / env->cur_episode_length / episodes;
+            }
             if (dbg && e == 0 && env->tick <= 80) {
                 FishAgent* f = &env->fish[0];
                 printf("t=%3d pos=(%.1f,%.1f) ori=%.2f move=%.2f turn=%.2f bite=%d eod=%d waste=%d\n",
@@ -613,6 +724,25 @@ static int run_calibration(int argc, char** argv) {
                 survival += env->collapsed ? (double)env->collapse_tick / env->cur_episode_length : 1.0;
                 waste_frac += env->waste_frac_sum / env->cur_episode_length;
                 open_frac += (double)env->open_steps / env->cur_episode_length;
+                for (int i = 0; i < env->num_agents; i++) {
+                    ret[i] += env->return_by[i];
+                    taste_of[i] = env->fish[i].taste;
+                    plant_a[i] += plant_a_step[i];
+                    plant_b[i] += plant_b_step[i];
+                    noop[i] += noop_step[i];
+                    zaps_given[i] += zaps_given_step[i];
+                    zaps_taken[i] += zaps_taken_step[i];
+                }
+                int n_max = env->n_type[0] > env->n_type[1] ? env->n_type[0] : env->n_type[1];
+                mono_final += (double)n_max / env->num_food;
+                mono_mean += env->mono_frac_sum / env->cur_episode_length;
+                t_conv += env->convention_tick > 0 ? (double)env->convention_tick / env->cur_episode_length : 1.0;
+                plantings += env->plantings;
+                proactive += env->plant_proactive;
+                zaps_cross += env->zaps_cross;
+                zaps_same += env->zaps_same;
+                plant_noop_total += env->plant_noop;
+                plant_attempts += env->plant_attempts;
             }
         }
     }
@@ -620,19 +750,33 @@ static int run_calibration(int argc, char** argv) {
     printf("  collective pellets/episode %.1f   waste_frac %.3f   open_frac %.3f   stock_left %.1f   collapsed %.2f   survival %.3f\n",
         collective / episodes, waste_frac / episodes, open_frac / episodes, stock_left / episodes,
         collapsed / episodes, survival / episodes);
-    printf("  slot role pellets cleans strip%%  cleans/strip-step\n");
-    for (int i = 0; i < env->num_agents; i++) {
-        double strip_steps = strip[i] / episodes * env->episode_length;
-        printf("  %4d %4d %7.1f %6.1f %5.1f%%  %.3f\n", i, env->roles[i], pellets[i] / episodes,
-            cleans[i] / episodes, 100.0 * strip[i] / episodes,
-            strip_steps > 0 ? cleans[i] / episodes / strip_steps : 0.0);
+    if (env->allelo) {
+        printf("  mono_final %.3f   mono_mean %.3f   t_conv %.3f   plantings %.1f   plant_proactive %.1f   plant_noop %.1f   plant_attempts %.1f   zaps_cross %.1f   zaps_same %.1f   n_ripe_mean %.2f\n",
+            mono_final / episodes, mono_mean / episodes, t_conv / episodes, plantings / episodes,
+            proactive / episodes, plant_noop_total / episodes, plant_attempts / episodes,
+            zaps_cross / episodes, zaps_same / episodes, n_ripe_mean);
+        printf("  slot role taste pellets  return plant_a plant_b plant_noop zaps_given zaps_taken\n");
+        for (int i = 0; i < env->num_agents; i++) {
+            printf("  %4d %4d %5c %7.1f %7.2f %7.1f %7.1f %10.1f %10.1f %10.1f\n", i, env->roles[i],
+                taste_of[i] == 0 ? 'A' : 'B', pellets[i] / episodes, ret[i] / episodes,
+                plant_a[i] / episodes, plant_b[i] / episodes, noop[i] / episodes,
+                zaps_given[i] / episodes, zaps_taken[i] / episodes);
+        }
+    } else {
+        printf("  slot role pellets cleans strip%%  cleans/strip-step\n");
+        for (int i = 0; i < env->num_agents; i++) {
+            double strip_steps = strip[i] / episodes * env->episode_length;
+            printf("  %4d %4d %7.1f %6.1f %5.1f%%  %.3f\n", i, env->roles[i], pellets[i] / episodes,
+                cleans[i] / episodes, 100.0 * strip[i] / episodes,
+                strip_steps > 0 ? cleans[i] / episodes / strip_steps : 0.0);
+        }
     }
     puf_close(env);
     dict_clear(&kw);
     return 0;
 }
 
-// Bench mode (CPU, single thread): wef_test bench [steps=N] [preset=harvest] [seed=N] [key=value ...]
+// Bench mode (CPU, single thread): wef_test bench [steps=N] [preset=harvest|allelo] [shape=conv] [seed=N] [num_agents=N] [key=value ...]
 // Steps one env with deterministic pseudo-random actions in the training default config
 // (4 fish, 30-400 cm arenas, 64 pellets, 512-step episodes) and prints microseconds per
 // env-step and per agent-step, the share spent in compute_observations, and an FNV-1a hash of
@@ -675,6 +819,14 @@ static int run_bench(int argc, char** argv) {
             kw_harvest(&kw);
             continue;
         }
+        if (strcmp(argv[a], "preset=allelo") == 0) {
+            kw_allelo(&kw);  // 8 fish: needs the -DMAX_AGENTS=8 build (num_agents=4 projects to 4)
+            continue;
+        }
+        if (strcmp(argv[a], "shape=conv") == 0) {
+            kw_allelo_conv(&kw);
+            continue;
+        }
         char key[64];
         char val[64];
         if (strpbrk(argv[a], " \t") != NULL || sscanf(argv[a], "%63[^=]=%63s", key, val) != 2) {
@@ -703,7 +855,7 @@ static int run_bench(int argc, char** argv) {
         puf_step(env);
         hash = fnv1a(hash, h.obs, (size_t)n * OBS_SIZE * sizeof(obs_t));
         hash = fnv1a(hash, h.rew, (size_t)n * sizeof(float));
-        food_sum += env->food_active;
+        food_sum += env->allelo ? env->n_ripe : env->food_active;
     }
     double t_step = now_s() - t0;
     // compute_observations alone (extra calls; they only advance the sensor-noise RNG)
@@ -721,7 +873,7 @@ static int run_bench(int argc, char** argv) {
     }
     double us_step = 1e6 * t_step / (double)steps;
     double us_obs = 1e6 * t_obs / (double)obs_steps;
-    printf("bench steps=%ld fish=%d mean_food_active=%.1f\n", steps, n, food_sum / (double)steps);
+    printf("bench steps=%ld fish=%d mean_%s=%.1f\n", steps, n, env->allelo ? "n_ripe" : "food_active", food_sum / (double)steps);
     printf("  %.2f us/env-step  %.2f us/agent-step  %.0f agent-steps/s (1 thread)\n",
         us_step, us_step / n, 1e6 * n / us_step);
     printf("  compute_observations %.2f us/env-step (%.0f%% of step)\n", us_obs, 100.0 * us_obs / us_step);

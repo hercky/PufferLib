@@ -105,7 +105,9 @@ typedef float obs_t;
 #define WEF_COLOR_FISH          ((Color){180, 150, 230, 255})
 #define WEF_COLOR_FISH_PULSE    ((Color){180, 150, 230, 140})
 #define WEF_COLOR_SENSOR        ((Color){184, 164, 224, 200})
-#define WEF_COLOR_FOOD          ((Color){0x7A, 0xEF, 0x9A, 200})  // lighter green
+#define WEF_COLOR_FOOD          ((Color){0x7A, 0xEF, 0x9A, 200})  // lighter green (AH: type A)
+#define WEF_COLOR_FOOD_B        ((Color){0xF0, 0x7A, 0xD0, 200})  // AH: type B bushes (magenta)
+#define WEF_COLOR_HOLD          ((Color){250, 200, 60, 255})     // AH: planter on hold (body fill)
 #define WEF_COLOR_WASTE         ((Color){235, 150, 60, 220})     // inert debris (cleanup mode)
 #define WEF_COLOR_EOD_POS       ((Color){220, 60, 50, 255})
 #define WEF_COLOR_EOD_NEG       ((Color){60, 120, 255, 255})
@@ -1013,7 +1015,14 @@ void compute_observations(Wef* env) {
             }
             induced_c[n_ind_c++] = induced[k];
             if (k < n_intrinsic) {
-                intrinsic_c[n_int_c++] = intrinsic[k];
+                // AH: an unripe bush with unripe_intrinsic 0 has an exactly-zero intrinsic
+                // moment and contributes exactly 0 to every ampullary sum, so it is not staged
+                // (fish always carry a nonzero moment; the default path stages everything).
+                bool skip = env->allelo && is_food
+                    && intrinsic[k].m.x == 0.0f && intrinsic[k].m.y == 0.0f;
+                if (!skip) {
+                    intrinsic_c[n_int_c++] = intrinsic[k];
+                }
             }
             n_agent_c += is_agent;
             n_food_c += is_food;
@@ -1596,12 +1605,47 @@ float wef_harvest_regrow_p(const Wef* env, int k) {
 // Scripted roles (eval-only calibration, docs/wef-cleanup-v0-design.md 7): steer
 // straight at the nearest target using env-internal positions ("oracle"), bite
 // when it is inside the action cone. Writes the 4 raw action values.
+// AH bots: raw bite value that decodes to the planter's own type (own = true) or the other
+// type under the env's taste-relative bins (2 x plant_split = upper, 0.5 x plant_split = lower,
+// swapped by plant_bin_order).
+static inline float wef_bot_bin(const Wef* env, bool own) {
+    bool upper = own != (env->plant_bin_order != 0);
+    return upper ? 2.0f * env->plant_split : 0.5f * env->plant_split;
+}
+
+// AH bots: an active unripe bush of type != plant_type inside the plant cone (the env's target
+// rule), -1 if none.
+static int wef_plant_target_in_cone(const Wef* env, const FishAgent* fish, int plant_type) {
+    int best = -1;
+    float nearest = INFINITY;
+    for (int f = 0; f < env->num_food; f++) {
+        const FishFood* b = &env->food[f];
+        if (!b->active || b->ripe || b->type == plant_type) {
+            continue;
+        }
+        if (!in_forward_cone(fish, b->pos, env->plant_radius_cm, EATING_ANGLE)) {
+            continue;
+        }
+        float dx = b->pos.x - fish->pos.x;
+        float dy = b->pos.y - fish->pos.y;
+        float d2 = dx * dx + dy * dy;
+        if (d2 < nearest) {
+            best = f;
+            nearest = d2;
+        }
+    }
+    return best;
+}
+
 void wef_bot_action(Wef* env, int i, float* raw) {
     FishAgent* fish = &env->fish[i];
     int role = env->roles[i];
     if (role == 3) {
         int phase = (env->tick + i * (env->bot_shift_steps / MAX_AGENTS)) / env->bot_shift_steps;
         role = (phase % 2 == 0) ? 1 : 2;
+    }
+    if (env->allelo && role == 2) {
+        role = 10;  // an eater that targeted unripe bushes would be trapped: the free-rider role
     }
     // Stall escape: collisions revert position but not heading, and the 3 cm avoidance
     // turn below fights the pursuit turn, so two bots next to one pellet can pin each
@@ -1610,6 +1654,9 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     float moved = fabsf(fish->pos.x - fish->bot_last.x) + fabsf(fish->pos.y - fish->bot_last.y);
     fish->bot_last = fish->pos;
     fish->bot_stall = (moved < 0.01f && !fish->ate) ? fish->bot_stall + 1 : 0;
+    if (env->allelo && (fish->freeze > 0 || fish->eat_cooldown > EAT_COOLDOWN_STEPS)) {
+        fish->bot_stall = 0;  // a planting hold or a freeze is not a stall
+    }
     if (fish->bot_stall > 40 && fish->bot_escape == 0) {
         fish->bot_escape = 25;
         fish->bot_escape_turn = random_uniform(env, -1.0f, 1.0f);
@@ -1649,7 +1696,97 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     Vec2 target = {0};
     float nearest = INFINITY;
     bool found = false;
-    if (role == 1) {
+    // Allelopathic Harvest roles (section 7.1). Bots read taste / type / ripe from env state.
+    //   8 planter-own: eat a ripe bush within the 5 cm sense range if there is one; otherwise go
+    //     to the nearest unripe bush of type != own taste (bot_oracle: anywhere) and bite it with
+    //     the own-type bin; otherwise eat ripe bushes; bot_plant_theta / bot_plant_max /
+    //     bot_plant_frac gate the planting.
+    //   9 planter-majority: as 8 with the planted type = argmax n_type (tie -> own; bot_oracle 0
+    //     counts only the bushes within 5 cm).
+    //  10 free-rider: nearest ripe bush eater, never bites.
+    //  11 zapper-planter: hunt the nearest non-frozen fish of the other taste and bite it; else 8.
+    //  12 opportunistic planter: forage like 10; bite with the own bin only when an off-type
+    //     unripe bush is already in the plant cone (no travel).
+    int ah_plant_type = -1;      // type this bot wants to plant, -1 = not planting
+    bool ah_plant_target = false; // the target is a bush to plant (plant cone radius, bite in cone)
+    bool ah_hunt = false;         // the target is a rival fish (bite cone radius)
+    bool ah_bite_now = false;     // role 12: bite this step without a travel target
+    if (env->allelo && role >= 8) {
+        int taste = fish->taste;
+        if (role == 11) {
+            for (int j = 0; j < env->num_agents; j++) {
+                if (j == i || env->fish[j].freeze > 0 || env->fish[j].taste == taste) {
+                    continue;
+                }
+                float dx = env->fish[j].pos.x - fish->pos.x;
+                float dy = env->fish[j].pos.y - fish->pos.y;
+                float d2 = dx * dx + dy * dy;
+                if (d2 < nearest) {
+                    nearest = d2;
+                    target = env->fish[j].pos;
+                    found = true;
+                    ah_hunt = true;
+                }
+            }
+        }
+        if (!found && (role == 8 || role == 9 || role == 11 || role == 12)) {
+            int want = taste;
+            if (role == 9) {
+                int na = env->n_type[0];
+                int nb = env->n_type[1];
+                if (!env->bot_oracle) {
+                    na = 0;
+                    nb = 0;
+                    for (int f = 0; f < env->num_food; f++) {
+                        float dx = env->food[f].pos.x - fish->pos.x;
+                        float dy = env->food[f].pos.y - fish->pos.y;
+                        if (env->food[f].active && dx * dx + dy * dy <= MORM_FOOD_RANGE_CM * MORM_FOOD_RANGE_CM) {
+                            na += env->food[f].type == 0;
+                            nb += env->food[f].type == 1;
+                        }
+                    }
+                }
+                want = na > nb ? 0 : nb > na ? 1 : taste;
+            }
+            bool allowed = (float)env->n_type[want] < env->bot_plant_theta * (float)env->num_food
+                && (env->bot_plant_max == 0 || env->plantings_by[i] < env->bot_plant_max);
+            if (allowed && role == 12) {
+                ah_bite_now = wef_plant_target_in_cone(env, fish, want) >= 0;
+                ah_plant_type = ah_bite_now ? want : -1;
+            } else if (allowed) {
+                bool ripe_near = false;
+                for (int f = 0; f < env->num_food && !ripe_near; f++) {
+                    float dx = env->food[f].pos.x - fish->pos.x;
+                    float dy = env->food[f].pos.y - fish->pos.y;
+                    ripe_near = env->food[f].active && env->food[f].ripe
+                        && dx * dx + dy * dy <= MORM_FOOD_RANGE_CM * MORM_FOOD_RANGE_CM;
+                }
+                bool go = !ripe_near
+                    && (env->bot_plant_frac >= 1.0f || random_uniform(env, 0.0f, 1.0f) < env->bot_plant_frac);
+                if (go) {
+                    for (int f = 0; f < env->num_food; f++) {
+                        const FishFood* b = &env->food[f];
+                        if (!b->active || b->ripe || b->type == want) {
+                            continue;
+                        }
+                        float dx = b->pos.x - fish->pos.x;
+                        float dy = b->pos.y - fish->pos.y;
+                        float d2 = dx * dx + dy * dy;
+                        if (d2 < nearest && d2 <= sense2) {
+                            nearest = d2;
+                            target = b->pos;
+                            found = true;
+                            ah_plant_target = true;
+                            ah_plant_type = want;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (found) {
+        // AH: a planting or hunting target was chosen above
+    } else if (role == 1) {
         for (int w = 0; w < env->waste_max; w++) {
             if (!env->waste[w].active) {
                 continue;
@@ -1667,6 +1804,9 @@ void wef_bot_action(Wef* env, int i, float* raw) {
         for (int f = 0; f < env->num_food; f++) {
             if (!env->food[f].active) {
                 continue;
+            }
+            if (env->allelo && !env->food[f].ripe) {
+                continue;  // only ripe bushes are edible
             }
             float dx = env->food[f].pos.x - fish->pos.x;
             float dy = env->food[f].pos.y - fish->pos.y;
@@ -1748,7 +1888,9 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     float turn = clamp(err / fish->max_angular_velocity, -0.99f, 0.99f);
     raw[1] = atanhf(turn);
     raw[2] = 1.0f;
-    float radius = role == 1 ? env->clean_radius_cm : EATING_RADIUS_CM;
+    float radius = role == 1 ? env->clean_radius_cm
+        : ah_plant_target ? env->plant_radius_cm
+        : ah_hunt ? BITING_RADIUS_CM : EATING_RADIUS_CM;
     bool in_cone = found && in_forward_cone(fish, target, radius, EATING_ANGLE);
     // Bite/eat are decided at the pre-move pose but a clean resolves after motion:
     // stop when the item is inside the action radius, and turn in place when it is
@@ -1761,6 +1903,14 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     }
     // Eaters never bite (biting suppresses eating that step); cleaners bite on waste.
     raw[3] = (role == 1 && in_cone) ? 1.0f : -1.0f;
+    if (ah_plant_type >= 0 && ((ah_plant_target && in_cone) || ah_bite_now)) {
+        // planting bite: the bin that decodes to the wanted type; stand still so the bush is
+        // still in the cone when the bite resolves after motion
+        raw[3] = wef_bot_bin(env, ah_plant_type == fish->taste);
+        raw[0] = -8.0f;
+    } else if (ah_hunt && in_cone) {
+        raw[3] = wef_bot_bin(env, true);  // zap (a stray bush in the cone would get the own type)
+    }
     if (restrain) {
         // Eating is automatic on contact, so abstaining = holding still, not patrolling.
         raw[0] = -8.0f;
@@ -2869,6 +3019,17 @@ void puf_render(Wef* env) {
         }
         Vector2 position = world_to_screen(env, env->food[i].pos);
         float radius = fmaxf(2.5f, FOOD_RADIUS_CM * scale);
+        if (env->allelo) {
+            // AH: type by colour (A = today's pellet green, B magenta), ripeness by radius
+            // (ripe = a full pellet, unripe = a small faint dot).
+            Color c = env->food[i].type == 0 ? WEF_COLOR_FOOD : WEF_COLOR_FOOD_B;
+            if (env->food[i].ripe) {
+                DrawCircleV(position, fmaxf(radius, 1.6f * fmaxf(2.5f, env->food_radius_ripe_cm * scale)), c);
+            } else {
+                DrawCircleV(position, fmaxf(2.0f, 0.5f * radius), ColorAlpha(c, 0.55f));
+            }
+            continue;
+        }
         DrawCircleV(position, radius, WEF_COLOR_FOOD);
     }
     if (env->cleanup) {
@@ -2907,6 +3068,15 @@ void puf_render(Wef* env) {
         float radius = BODY_RADIUS_CM * scale;
         if (agent->freeze > 0) {
             DrawCircleV(center, radius, ColorAlpha(WEF_COLOR_MIDGRAY, 0.8f));  // frozen (sanction)
+        } else if (env->allelo && agent->eat_cooldown > EAT_COOLDOWN_STEPS) {
+            // planting hold: fill shrinks as the hold runs out
+            float frac = (float)agent->eat_cooldown / (float)(env->plant_steps > 0 ? env->plant_steps : 1);
+            DrawCircleV(center, radius * fmaxf(0.3f, fminf(1.0f, frac)), ColorAlpha(WEF_COLOR_HOLD, 0.8f));
+        }
+        if (env->allelo) {
+            // taste: a small ring in the type colour just inside the body ring
+            Color tc = agent->taste == 0 ? WEF_COLOR_FOOD : WEF_COLOR_FOOD_B;
+            DrawRing(center, radius - 4.0f, radius - 2.0f, 0.0f, 360.0f, 32, ColorAlpha(tc, 0.9f));
         }
 
         if (agent->emits_eod) {
@@ -2973,7 +3143,12 @@ void puf_render(Wef* env) {
             env->tick, active_eods, env->num_agents, env->client->bites_total);
         DrawText(top, env->client->window_width - 20 - MeasureText(top, 18), 18, 18, WEF_COLOR_MIDGRAY);
     }
-    if (env->cleanup) {
+    if (env->allelo) {
+        const char* status = TextFormat("bushes A %d  B %d   ripe %d   eaten %d   plantings %d   zaps %d",
+            env->n_type[0], env->n_type[1], env->n_ripe, env->food_eaten, env->plantings, env->bites);
+        DrawText(status, env->client->window_width - 70 - MeasureText(status, 18),
+            env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
+    } else if (env->cleanup) {
         // Longer status line: draw it right-aligned so it clears the field-radius text.
         const char* status = TextFormat("food %d active (%d eaten)   waste %d/%d   cleans %d",
             env->food_active, env->food_eaten, env->waste_active, env->waste_max, env->cleans);
@@ -2989,7 +3164,7 @@ void puf_render(Wef* env) {
             20, env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
     }
     DrawText(TextFormat("field radius %.0f cm", env->electric_field_radius_cm),
-        env->cleanup || env->regrows ? 20 : 180,
+        env->cleanup || env->regrows || env->allelo ? 20 : 180,
         env->client->window_height - 32, 18, WEF_COLOR_MIDGRAY);
 
     if (env->client->show_field) {
