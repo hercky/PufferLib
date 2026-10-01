@@ -45,11 +45,17 @@ typedef float obs_t;
 #define NUM_MORMYROMASTS 36
 #define NUM_AMPULLARY 24
 #define NUM_KNOLLEN 12
+// Fish per arena. The 8-fish Allelopathic Harvest build passes -DMAX_AGENTS=8 (a separate
+// binary: the knollenorgan block and the metadata slots scale with MAX_AGENTS - 1).
+#ifndef MAX_AGENTS
 #define MAX_AGENTS 4
+#endif
 
 #define MAX_FOOD 64
-#define OBS_SIZE 110
 #define ACTION_SIZE 4
+// morm + amp + (knollen + metadata) per other fish + last action + 7 scalars:
+// 110 at MAX_AGENTS 4 (upstream), 162 at 8.
+#define OBS_SIZE (NUM_MORMYROMASTS + NUM_AMPULLARY + (NUM_KNOLLEN + 1) * (MAX_AGENTS - 1) + ACTION_SIZE + 7)
 #define EATING_RADIUS_CM 2.0f
 #define BITING_RADIUS_CM 3.0f
 #define EATING_ANGLE (PI_F / 4.0f)

@@ -206,8 +206,8 @@ static void test_sensing(void) {
     env->waste_active = 1;
 
     // obs_extra = 2: normalized x
-    float extra = env->agents[0].observations[103];
-    CHECK(fabsf(extra - (2.0f * 5.0f / 60.0f - 1.0f)) < 1e-6f, "obs[103] = 2x/W - 1 (%.4f)", extra);
+    float extra = env->agents[0].observations[OBS_SIZE - 7];
+    CHECK(fabsf(extra - (2.0f * 5.0f / 60.0f - 1.0f)) < 1e-6f, "obs[extra] = 2x/W - 1 (%.4f)", extra);
     dict_clear(&kw);
 }
 
@@ -381,8 +381,8 @@ static void test_commons(void) {
         puf_step(env);
     }
     CHECK(env->food_active == 16, "no regrowth at the critical stock (S %d)", env->food_active);
-    CHECK(fabsf(env->agents[0].observations[103] - 0.25f) < 1e-6f, "obs[103] = S / K (%.3f)",
-        env->agents[0].observations[103]);
+    CHECK(fabsf(env->agents[0].observations[OBS_SIZE - 7] - 0.25f) < 1e-6f, "obs[extra] = S / K (%.3f)",
+        env->agents[0].observations[OBS_SIZE - 7]);
     // Above it the stock grows toward K, with new pellets anywhere in the arena.
     env->food[16].active = true;
     env->food_active = 17;
@@ -525,7 +525,7 @@ static void test_baseline(void) {
         puf_step(env);
     }
     CHECK(env->episode >= 1, "baseline episode terminates (episode %d)", env->episode);
-    CHECK(env->agents[0].observations[103] == 0.0f, "obs[103] is the constant 0 in baseline mode");
+    CHECK(env->agents[0].observations[OBS_SIZE - 7] == 0.0f, "obs[extra] is the constant 0 in baseline mode");
     dict_clear(&kw);
 }
 
@@ -578,7 +578,8 @@ static int run_calibration(int argc, char** argv) {
         }
     }
     puf_ini_set(&kw, "roles", roles);   // parses the comma list into values[]/len
-    Harness h = make(&kw, 4);
+    int num_fish = (int)dict_get(&kw, "num_agents");   // num_agents=N on the command line
+    Harness h = make(&kw, num_fish);
     Env* env = h.env;
     double pellets[MAX_AGENTS] = {0};
     double cleans[MAX_AGENTS] = {0};
@@ -620,7 +621,7 @@ static int run_calibration(int argc, char** argv) {
         collective / episodes, waste_frac / episodes, open_frac / episodes, stock_left / episodes,
         collapsed / episodes, survival / episodes);
     printf("  slot role pellets cleans strip%%  cleans/strip-step\n");
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < env->num_agents; i++) {
         double strip_steps = strip[i] / episodes * env->episode_length;
         printf("  %4d %4d %7.1f %6.1f %5.1f%%  %.3f\n", i, env->roles[i], pellets[i] / episodes,
             cleans[i] / episodes, 100.0 * strip[i] / episodes,
@@ -688,7 +689,7 @@ static int run_bench(int argc, char** argv) {
             dict_set(&kw, key, atof(val));
         }
     }
-    Harness h = make(&kw, 4);
+    Harness h = make(&kw, (int)dict_get(&kw, "num_agents"));   // num_agents=N on the command line
     Env* env = h.env;
     int n = env->num_agents;
     uint64_t hash = 1469598103934665603ULL;
