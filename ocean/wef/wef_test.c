@@ -1134,6 +1134,55 @@ static void test_ah_planting(void) {
         "bitten_reward 0; zap cooldown 25 (24 after decrement) regardless of the freeze setting");
     destroy(&h2);
     dict_clear(&kw2);
+
+    // (j) the freeze stacks on a planting HOLD only (Q14): a victim serving the plain 3-step eat
+    // cooldown is frozen for bitten_freeze_steps exactly; (k) U9 with zap_steps > plant_steps:
+    // the attacker's recovery hold reads <= 1 in slot OBS_SIZE - 1 (normaliser covers zap_steps).
+    Dict kw3 = {0};
+    kw_ah(&kw3, 2, 1);
+    dict_set(&kw3, "bitten_freeze_steps", 25);
+    dict_set(&kw3, "zap_steps", 40);           // > plant_steps 32
+    Harness h3 = make(&kw3, 2);
+    Env* e3 = h3.env;
+    obs_t* p0 = e3->agents[0].observations;
+    obs_t* p1 = e3->agents[1].observations;
+    clear_objects(e3);
+    ah_bush(e3, 0, 11.5f, 20.0f, 1, true);    // ripe B 1.5 cm ahead of the A fish: eaten at t
+    ah_recount(e3);
+    place_fish(e3, 0, 10.0f, 20.0f, 0.0f);
+    place_fish(e3, 1, 7.5f, 20.0f, 0.0f);     // B fish 2.5 cm behind, facing it
+    ah_still(&h3, 0);
+    ah_still(&h3, 1);
+    puf_step(e3);
+    CHECK(e3->food_by[0] == 1 && e3->fish[0].eat_cooldown == 2 && e3->fish[0].trace_ate_type == 2,
+        "eat at t: the ordinary eat cooldown 3 (2 after decrement) is running, trace hold %d (not a hold)",
+        e3->fish[0].eat_cooldown > EAT_COOLDOWN_STEPS ? e3->fish[0].eat_cooldown : 0);
+    set_action(&h3, 1, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    puf_step(e3);
+    CHECK(e3->fish[1].bite_victim == 0 && e3->fish[0].was_bitten && e3->freezes == 1,
+        "zap at t + 1 on a fish serving the plain eat cooldown");
+    CHECK(e3->fish[0].freeze == 24, "freeze = bitten_freeze_steps 25 exactly (24 after decrement), no stacking on a plain eat cooldown: got %d",
+        e3->fish[0].freeze);
+    CHECK(e3->fish[1].eat_cooldown == 39 && p1[OBS_EAT_CD] == 39.0f / 40.0f && p1[OBS_EAT_CD] <= 1.0f,
+        "U9: zap_steps 40 > plant_steps 32: attacker eat_cooldown 39, slot %d = 39/40 (<= 1): got %d, %.3f",
+        OBS_EAT_CD, e3->fish[1].eat_cooldown, p1[OBS_EAT_CD]);
+    CHECK(p0[OBS_EAT_CD] == 1.0f && p1[OBS_BITE_CD] == 24.0f / 32.0f,
+        "victim slot %d = 1 while frozen; attacker bite cooldown 24/32", OBS_EAT_CD);
+    // the attacker's zap recovery is a hold (eat_cooldown > 3): a zap on IT would stack
+    ah_still(&h3, 1);
+    place_fish(e3, 0, 30.0f, 36.0f, 0.0f);
+    e3->fish[0].freeze = 0;
+    place_fish(e3, 1, 20.0f, 20.0f, 0.0f);    // (place_fish clears the cooldowns and the freeze)
+    place_fish(e3, 0, 17.5f, 20.0f, 0.0f);    // the thawed A fish behind the B fish
+    e3->fish[1].eat_cooldown = 20;            // mid-recovery (zap_steps 40) or mid-hold: > 3
+    set_action(&h3, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    int cd1 = e3->fish[1].eat_cooldown;
+    puf_step(e3);
+    CHECK(e3->fish[0].bite_victim == 1 && cd1 == 20 && e3->fish[1].freeze == 25 + cd1 - 1,
+        "a zap on a fish with eat_cooldown %d (> 3: a hold) stacks: freeze %d = 25 + %d - 1",
+        cd1, e3->fish[1].freeze, cd1);
+    destroy(&h3);
+    dict_clear(&kw3);
 }
 
 // Episode Log (section 5.1): one conversion at tick 1, one zap at tick 2, 64-step episode.
@@ -1677,7 +1726,6 @@ static int run_calibration(int argc, char** argv) {
     double plant_a_step[MAX_AGENTS] = {0};
     double plant_b_step[MAX_AGENTS] = {0};
     double noop_step[MAX_AGENTS] = {0};
-    int prev_noop = 0;
     const char* dbg = getenv("WEF_TEST_DEBUG");
     for (int e = 0; e < episodes; e++) {
         for (int i = 0; i < env->num_agents; i++) {
@@ -1687,7 +1735,6 @@ static int run_calibration(int argc, char** argv) {
             plant_b_step[i] = 0;
             noop_step[i] = 0;
         }
-        prev_noop = 0;
         while (env->episode == e) {
             puf_step(env);
             if (env->tick > 0) {
@@ -1698,13 +1745,8 @@ static int run_calibration(int argc, char** argv) {
                     zaps_taken_step[i] += f->was_bitten;
                     plant_a_step[i] += f->trace_plant_type == 1;
                     plant_b_step[i] += f->trace_plant_type == 2;
-                    // a same-type no-op is a bite with no victim and no conversion that moved plant_noop
-                    if (env->plant_noop > prev_noop && f->bite_action && f->bite_victim < 0
-                            && f->trace_plant_type == 0) {
-                        noop_step[i] += 1;
-                    }
+                    noop_step[i] += f->trace_plant_noop;  // per-fish same-type-only no-op flag (exact)
                 }
-                prev_noop = env->plant_noop;
                 n_ripe_mean += (double)env->n_ripe / env->cur_episode_length / episodes;
             }
             if (dbg && e == 0 && env->tick <= 80) {

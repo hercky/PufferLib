@@ -182,6 +182,7 @@ typedef struct FishAgent {
     int trace_plant_type;  // trace only: 0 none / 1 A / 2 B converted this step
     int trace_planted_slot;// trace only: slot converted this step, -1 none
     int trace_ate_type;    // trace only: 0 none / 1 A / 2 B eaten this step
+    bool trace_plant_noop; // trace only: this step's bite was a same-type-only no-op (plant_noop)
 } FishAgent;
 
 // Shared sensor layouts (body radius fixed → identical for every fish)
@@ -1180,10 +1181,12 @@ void compute_observations(Wef* env) {
         obs[obs_idx++] = clamp(
             agent->disp_ego.y / agent->max_linear_velocity, -1.0f, 1.0f);
         {
-            // AH: a planting hold (eat_cooldown up to plant_steps) reads 1 -> 0
+            // AH: a planting hold (eat_cooldown up to plant_steps) or a zap recovery (zap_steps)
+            // reads 1 -> 0: every eat_cooldown the AH branches can set, so the slot stays <= 1
             int eat_max = EAT_COOLDOWN_STEPS;
-            if (env->allelo && env->plant_steps > eat_max) {
-                eat_max = env->plant_steps;
+            if (env->allelo) {
+                eat_max = eat_max > env->plant_steps ? eat_max : env->plant_steps;
+                eat_max = eat_max > env->zap_steps ? eat_max : env->zap_steps;
             }
             obs[obs_idx++] = agent->freeze > 0 ? 1.0f
                 : (float)agent->eat_cooldown / (float)eat_max;
@@ -1675,6 +1678,15 @@ void wef_bot_action(Wef* env, int i, float* raw) {
         raw[1] = random_uniform(env, -2.0f, 2.0f);
         raw[2] = 1.0f;
         raw[3] = random_uniform(env, -1.0f, 1.0f);
+        if (env->allelo) {
+            // T7 (design 7.2) assumes raw[3] ~ N(0, 1), the untrained policy's bite head: with
+            // plant_split 0.6745 the bins then land 25 % upper / 25 % lower / 50 % no bite. A
+            // U(-1, 1) draw would give 32.6 / 33.7 / 50. Box-Muller from two more draws; the
+            // default path (allelo 0, eval only anyway) keeps its single draw.
+            float u1 = random_uniform(env, 1e-7f, 1.0f);
+            float u2 = random_uniform(env, 0.0f, 2.0f * PI_F);
+            raw[3] = sqrtf(-2.0f * logf(u1)) * cosf(u2);
+        }
         return;
     }
     // Target: nearest item of the role's kind. bot_oracle = 0 limits the search to the
@@ -1713,7 +1725,12 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     bool ah_bite_now = false;     // role 12: bite this step without a travel target
     if (env->allelo && role >= 8) {
         int taste = fish->taste;
-        if (role == 11) {
+        // Role 11 hunts only while it can bite (bite_cooldown 0: during the zap cooldown it
+        // behaves as role 8, so it plants and eats between zaps instead of trailing a rival it
+        // cannot zap) and only rivals within the hunt range (bot_oracle 0: the 10 cm range at
+        // which a conspecific's induced image is sensed; 1: anywhere).
+        if (role == 11 && fish->bite_cooldown <= 0) {
+            float hunt2 = env->bot_oracle ? INFINITY : MORM_AGENT_RANGE_CM * MORM_AGENT_RANGE_CM;
             for (int j = 0; j < env->num_agents; j++) {
                 if (j == i || env->fish[j].freeze > 0 || env->fish[j].taste == taste) {
                     continue;
@@ -1721,7 +1738,7 @@ void wef_bot_action(Wef* env, int i, float* raw) {
                 float dx = env->fish[j].pos.x - fish->pos.x;
                 float dy = env->fish[j].pos.y - fish->pos.y;
                 float d2 = dx * dx + dy * dy;
-                if (d2 < nearest) {
+                if (d2 < nearest && d2 <= hunt2) {
                     nearest = d2;
                     target = env->fish[j].pos;
                     found = true;
@@ -1748,6 +1765,9 @@ void wef_bot_action(Wef* env, int i, float* raw) {
                 }
                 want = na > nb ? 0 : nb > na ? 1 : taste;
             }
+            // bot_plant_theta gates on the type the bot is about to plant (`want`): for roles 8 /
+            // 11 / 12 that is its taste (7.1's n_type[taste]); for the convention follower 9 it
+            // is the majority type, so the threshold is on the convention it joins.
             bool allowed = (float)env->n_type[want] < env->bot_plant_theta * (float)env->num_food
                 && (env->bot_plant_max == 0 || env->plantings_by[i] < env->bot_plant_max);
             if (allowed && role == 12) {
@@ -2026,6 +2046,7 @@ void puf_step(Wef* env) {
         env->fish[i].trace_plant_type = 0;
         env->fish[i].trace_planted_slot = -1;
         env->fish[i].trace_ate_type = 0;
+        env->fish[i].trace_plant_noop = false;
         env->clean_pending[i] = 0;
         env->plant_pending[i] = 0;
         env->agents[i].rewards[0] = 0.0f;
@@ -2307,9 +2328,13 @@ void puf_step(Wef* env) {
             env->agents[i].rewards[0] += env->bite_reward;
             if (env->bitten_freeze_steps > 0) {
                 // AH: the freeze stacks on any planting hold the victim is serving (section
-                // 2.5), so a zap early in a hold still costs the planter the full sanction.
-                env->fish[victim].freeze = env->bitten_freeze_steps
-                    + (env->allelo ? env->fish[victim].eat_cooldown : 0);
+                // 2.5, Q14), so a zap early in a hold still costs the planter the full sanction.
+                // A hold is an eat_cooldown above the ordinary EAT_COOLDOWN_STEPS (the trace's
+                // `hold` field and the renderer use the same test); a victim serving the plain
+                // 3-step eat cooldown is frozen for bitten_freeze_steps exactly.
+                int hold = env->allelo && env->fish[victim].eat_cooldown > EAT_COOLDOWN_STEPS
+                    ? env->fish[victim].eat_cooldown : 0;
+                env->fish[victim].freeze = env->bitten_freeze_steps + hold;
                 env->freezes++;
             }
             if (env->cleanup && attacker->pos.x < env->strip_cm) {
@@ -2360,10 +2385,15 @@ void puf_step(Wef* env) {
         } else if (same_only) {
             // same-type unripe bushes only: a no-op that spends the planting cooldown, no hold
             env->plant_noop++;
+            attacker->trace_plant_noop = true;
             attacker->bite_cooldown = env->plant_cooldown_steps;
         }
         if (env->allelo && !zap) {
-            env->plant_attempts++;  // every bite that did not land on a fish: the paper's "total planting"
+            // every AH bite that did not zap a fish (the paper's "total planting"): under
+            // plant_priority 1 / 2 a conversion made with a fish in the cone counts too, so
+            // plantings + plant_noop <= plant_attempts for every priority (design 2.3 wrote
+            // `victim < 0`, identical under the preset's plant_priority 0).
+            env->plant_attempts++;
         }
     }
 
@@ -2500,7 +2530,6 @@ void puf_step(Wef* env) {
             float x = (float)env->n_type[k] / (float)env->num_food;
             p_type[k] = env->ripen_lin * x + env->ripen_cubic * powf(x, env->ripen_pow);
         }
-        bool any_ripened = false;
         for (int f = 0; f < env->num_food; f++) {
             FishFood* b = &env->food[f];
             if (!b->active || b->ripe) {
@@ -2516,13 +2545,24 @@ void puf_step(Wef* env) {
                 wef_bush_scale(env, b);
                 env->n_ripe++;
                 env->ripened++;
-                any_ripened = true;
                 wef_obj_event(env, 2 + b->type, f, 5, b->pos);
-            }
-        }
-        if (any_ripened) {
-            for (int i = 0; i < env->num_agents; i++) {
-                env->fish[i].has_previous_food_distance = false;  // no shaping windfall from a new ripe bush
+                // Proximity shaping: a fish whose nearest ripe bush is now this one would be paid
+                // a windfall (previous distance - new distance) for standing still, so forget its
+                // tracked distance. Only the fish it is nearer for: at the AH-strict flux (~0.3
+                // ripenings per step) resetting everyone would switch shaping off almost entirely.
+                if (env->proximity_shaping != 0.0f) {
+                    for (int i = 0; i < env->num_agents; i++) {
+                        FishAgent* a = &env->fish[i];
+                        if (!a->has_previous_food_distance) {
+                            continue;
+                        }
+                        float dx = a->pos.x - b->pos.x;
+                        float dy = a->pos.y - b->pos.y;
+                        if (sqrtf(dx * dx + dy * dy) < a->previous_food_distance) {
+                            a->has_previous_food_distance = false;
+                        }
+                    }
+                }
             }
         }
         // Per-step accumulators for the composition metrics (section 5.1).
@@ -3411,8 +3451,9 @@ void puf_init(Env* env, Dict* kwargs) {
         assert(env->plant_bin_order == 0 || env->plant_bin_order == 1);
         assert(env->plant_radius_cm > 0.0f);
         assert(env->taste_other <= env->taste_match && env->taste_other >= 0.0f);
-        assert((env->taste_other_a < 0.0f || env->taste_other_a <= env->taste_match)
-            && (env->taste_other_b < 0.0f || env->taste_other_b <= env->taste_match));
+        assert((env->taste_other_a == -1.0f || (env->taste_other_a >= 0.0f && env->taste_other_a <= env->taste_match))
+            && (env->taste_other_b == -1.0f || (env->taste_other_b >= 0.0f && env->taste_other_b <= env->taste_match))
+            && "allelo: taste_other_a / taste_other_b are -1 (inherit taste_other) or in [0, taste_match]");
         assert(env->food_radius_unripe_cm > 0.0f && env->food_radius_ripe_cm > 0.0f);
         assert(env->ripe_intrinsic >= 0.0f && env->unripe_intrinsic >= 0.0f);
         assert(env->conv_theta > 0.0f && env->conv_theta <= 1.0f);
