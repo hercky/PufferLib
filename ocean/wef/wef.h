@@ -1691,7 +1691,7 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     // Role 7 (Commons cooperator): a nearest-pellet eater that stops eating while the
     // global stock is at or below bot_theta * K (the cue obs_extra = 3 gives a policy).
     bool restrain = role == 7
-        && (float)env->food_active <= env->bot_theta * (float)env->num_food;
+        && (float)(env->allelo ? env->n_ripe : env->food_active) <= env->bot_theta * (float)env->num_food;
     float sense2 = sense * sense;
     Vec2 target = {0};
     float nearest = INFINITY;
