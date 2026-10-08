@@ -1918,10 +1918,11 @@ static void test_inst_marks(void) {
 // U17: zapping a marked fish is cheap (base cooldown) and, with a bounty, paid; an unmarked one costs zap_cooldown_steps.
 static void test_inst_zap_cost(void) {
     printf("-- INST U17: zap cost on marked vs unmarked victims\n");
-    for (int bounty = 0; bounty <= 1; bounty++) {
+    for (int bounty = 0; bounty <= 2; bounty++) {   // pass 2: bounty + mark_freeze_steps 100
         Dict kw = {0};
         kw_inst_test(&kw, AH_FISH, 0);
         dict_set(&kw, "mark_zap_reward", bounty ? 0.25 : 0.0);
+        dict_set(&kw, "mark_freeze_steps", bounty == 2 ? 100 : -1);
         Harness h = make(&kw, AH_FISH);
         Env* env = h.env;
         clear_objects(env);
@@ -1946,7 +1947,10 @@ static void test_inst_zap_cost(void) {
             "zaps_on_marked 1 (trace flag on the right attacker), bounty paid %.2f", env->bounty_sum);
         CHECK(fabsf(h.rew[0] - (bounty ? 0.25f : 0.0f)) < 1e-6f && h.rew[1] == 0.0f,
             "attacker reward %.2f (bite_reward 0 in the AH preset + bounty), the other attacker 0", h.rew[0]);
-        CHECK(env->fish[b].freeze == 24 && env->fish[c].freeze == 24, "both victims frozen 25 (24 after the decrement)");
+        int want_b = bounty == 2 ? 99 : 24;
+        CHECK(env->fish[b].freeze == want_b && env->fish[c].freeze == 24,
+            "marked victim frozen %d (%s), unmarked 24 (bitten_freeze_steps 25 - 1)", env->fish[b].freeze,
+            bounty == 2 ? "mark_freeze_steps 100 - 1" : "bitten_freeze_steps 25 - 1");
         destroy(&h);
         dict_clear(&kw);
     }

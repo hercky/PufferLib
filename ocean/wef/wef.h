@@ -706,6 +706,7 @@ struct Env {
     int inst_mark_steps;        // violation mark duration (0 = no marks)
     float mark_zap_reward;      // bounty to the attacker for zapping a marked fish
     int mark_zap_cooldown;      // attacker bite cooldown after zapping a marked fish (-1 = BITE_COOLDOWN_STEPS)
+    int mark_freeze_steps;      // freeze of a MARKED victim (-1 = bitten_freeze_steps): the sanction the institution legitimates
     int inst_pos_random;        // 0 beacon at the arena centre, 1 drawn uniformly per episode
     float inst_read_cm;         // a fish inside this radius reads the rule
     float inst_obj_radius_cm;   // the beacon's electrical signature: a waste-like conductor
@@ -2636,7 +2637,12 @@ void puf_step(Wef* env) {
             float size_difference = attacker->size - env->fish[victim].size;
             env->agents[victim].rewards[0] += env->bitten_reward * (1.0f + size_difference);
             env->agents[i].rewards[0] += env->bite_reward;
-            if (env->bitten_freeze_steps > 0) {
+            bool marked_victim = env->inst_mode > 0 && env->fish[victim].mark > 0;
+            // institutions: a marked victim's freeze is mark_freeze_steps when set (the sanction the
+            // rule legitimates); unmarked victims keep bitten_freeze_steps
+            int freeze_steps = marked_victim && env->mark_freeze_steps >= 0
+                ? env->mark_freeze_steps : env->bitten_freeze_steps;
+            if (freeze_steps > 0) {
                 // AH: the freeze stacks on any planting hold the victim is serving (section
                 // 2.5, Q14), so a zap early in a hold still costs the planter the full sanction.
                 // A hold is an eat_cooldown above the ordinary EAT_COOLDOWN_STEPS (the trace's
@@ -2644,13 +2650,12 @@ void puf_step(Wef* env) {
                 // 3-step eat cooldown is frozen for bitten_freeze_steps exactly.
                 int hold = env->allelo && env->fish[victim].eat_cooldown > EAT_COOLDOWN_STEPS
                     ? env->fish[victim].eat_cooldown : 0;
-                env->fish[victim].freeze = env->bitten_freeze_steps + hold;
+                env->fish[victim].freeze = freeze_steps + hold;
                 env->freezes++;
             }
             if (env->cleanup && attacker->pos.x < env->strip_cm) {
                 env->bites_in_strip++;
             }
-            bool marked_victim = env->inst_mode > 0 && env->fish[victim].mark > 0;
             if (marked_victim) {
                 // sanctioning a labelled rule-breaker: cheaper (mark_zap_cooldown) and, with a
                 // bounty configured, paid (docs/institutions-plan.md 3.2 item 4; v0 bounty 0)
@@ -3747,7 +3752,7 @@ static const char* WEF_ENV_KEYS[] = {
     // Institutions (docs/institutions-plan.md section 4)
     "inst_mode", "inst_obs", "inst_fixed_type", "inst_theta", "inst_hyst", "inst_flip_steps",
     "inst_mark_steps", "mark_zap_reward", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
-    "inst_obj_radius_cm", "inst_contrast", "inst_latch",
+    "inst_obj_radius_cm", "inst_contrast", "inst_latch", "mark_freeze_steps",
 };
 
 static void wef_check_keys(Dict* kwargs) {
@@ -3882,6 +3887,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->inst_mark_steps = wef_cfg(kwargs, "inst_mark_steps", 0);
     env->mark_zap_reward = wef_cfg(kwargs, "mark_zap_reward", 0);
     env->mark_zap_cooldown = wef_cfg(kwargs, "mark_zap_cooldown", -1);
+    env->mark_freeze_steps = wef_cfg(kwargs, "mark_freeze_steps", -1);
     env->inst_pos_random = wef_cfg(kwargs, "inst_pos_random", 0);
     env->inst_read_cm = wef_cfg(kwargs, "inst_read_cm", 5.0);
     env->inst_obj_radius_cm = wef_cfg(kwargs, "inst_obj_radius_cm", 0.5);
@@ -3918,8 +3924,8 @@ void puf_init(Env* env, Dict* kwargs) {
     assert(env->inst_fixed_type >= -1 && env->inst_fixed_type <= 1);
     assert(env->inst_theta > 0.0f && env->inst_theta < 1.0f && env->inst_hyst >= 0.0f && env->inst_theta + env->inst_hyst <= 1.0f);
     assert((env->inst_mode != 3 || env->inst_flip_steps > 0) && "inst_mode 3 needs inst_flip_steps > 0");
-    assert(env->inst_mark_steps >= 0 && env->mark_zap_cooldown >= -1 && env->inst_read_cm > 0.0f
-        && env->inst_obj_radius_cm > 0.0f);
+    assert(env->inst_mark_steps >= 0 && env->mark_zap_cooldown >= -1 && env->mark_freeze_steps >= -1
+        && env->inst_read_cm > 0.0f && env->inst_obj_radius_cm > 0.0f);
     assert((env->inst_pos_random == 0 || env->inst_pos_random == 1) && (env->inst_latch == 0 || env->inst_latch == 1));
     if (env->allelo) {
         assert(env->cleanup == 0 && env->regrow_mode == 0 && env->regrow_p_max == 0.0f
