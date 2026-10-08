@@ -119,7 +119,7 @@ typedef float obs_t;
 #define WEF_COLOR_HOLD          ((Color){250, 200, 60, 255})     // AH: planter on hold (body fill)
 #define WEF_COLOR_WASTE         ((Color){235, 150, 60, 220})     // inert debris (cleanup mode)
 #define WEF_COLOR_INST          ((Color){255, 225, 120, 255})    // institution beacon (inst_obs)
-#define WEF_COLOR_MARK          ((Color){255, 120, 40, 255})     // violation mark on a fish
+#define WEF_COLOR_MARK          ((Color){255, 255, 255, 255})    // violation mark on a fish (white ring, dark outline)
 #define WEF_COLOR_EOD_POS       ((Color){220, 60, 50, 255})
 #define WEF_COLOR_EOD_NEG       ((Color){60, 120, 255, 255})
 #define WEF_COLOR_BITE          ((Color){255, 70, 70, 255})
@@ -3526,15 +3526,20 @@ void puf_render(Wef* env) {
         // the control arm, which has no rule).
         Vector2 bp = world_to_screen(env, env->inst_pos);
         Color rc = WEF_COLOR_MIDGRAY;
+        const char* label = "BEACON: mute";
         if (env->inst_mode > 0) {
             rc = env->allelo ? (env->inst_type == 0 ? WEF_COLOR_FOOD : WEF_COLOR_FOOD_B)
                 : (env->inst_type ? WEF_COLOR_BITE : WEF_COLOR_FOOD);
+            label = env->allelo ? (env->inst_type == 0 ? "RULE: PLANT GREEN (A)" : "RULE: PLANT MAGENTA (B)")
+                : (env->inst_type ? "SEASON: CLOSED" : "SEASON: OPEN");
         }
         float rr = env->inst_read_cm * scale;
-        DrawRing(bp, rr - 1.0f, rr + 1.0f, 0.0f, 360.0f, 48, ColorAlpha(WEF_COLOR_INST, 0.5f));
-        DrawCircleV(bp, fmaxf(5.0f, env->inst_obj_radius_cm * scale), rc);
-        DrawRing(bp, fmaxf(5.0f, env->inst_obj_radius_cm * scale), fmaxf(5.0f, env->inst_obj_radius_cm * scale) + 2.0f,
-            0.0f, 360.0f, 32, WEF_COLOR_INST);
+        DrawRing(bp, rr - 1.5f, rr + 1.5f, 0.0f, 360.0f, 64, ColorAlpha(WEF_COLOR_INST, 0.6f));
+        // the beacon: a large disc in the rule's colour with a white outline and a label
+        float br = fmaxf(12.0f, env->inst_obj_radius_cm * scale);
+        DrawCircleV(bp, br + 3.0f, WEF_COLOR_TEXT);
+        DrawCircleV(bp, br, rc);
+        DrawText(label, (int)(bp.x + br + 8.0f), (int)(bp.y - 9.0f), 18, WEF_COLOR_TEXT);
     }
     // Bites: red line biter -> victim and a fading red ring on the victim.
     for (int v = 0; v < env->num_agents; v++) {
@@ -3567,9 +3572,11 @@ void puf_render(Wef* env) {
             DrawRing(center, radius - 4.0f, radius - 2.0f, 0.0f, 360.0f, 32, ColorAlpha(tc, 0.9f));
         }
         if (agent->mark > 0) {
-            // violation mark: an orange ring outside the body, fading as the mark runs out
-            float a = 0.35f + 0.65f * (float)agent->mark / (float)(env->inst_mark_steps > 0 ? env->inst_mark_steps : 1);
-            DrawRing(center, radius + 2.5f, radius + 5.5f, 0.0f, 360.0f, 32, ColorAlpha(WEF_COLOR_MARK, a));
+            // violation mark: a thick white ring with a dark outline outside the body (the taste ring
+            // inside the body is green / magenta, so the mark is unmistakable), fading as it runs out
+            float a = 0.45f + 0.55f * (float)agent->mark / (float)(env->inst_mark_steps > 0 ? env->inst_mark_steps : 1);
+            DrawRing(center, radius + 3.0f, radius + 9.0f, 0.0f, 360.0f, 32, ColorAlpha((Color){0, 0, 0, 255}, a));
+            DrawRing(center, radius + 4.5f, radius + 7.5f, 0.0f, 360.0f, 32, ColorAlpha(WEF_COLOR_MARK, a));
         }
         if (env->inst_mode > 0 && agent->informed) {
             // informed fish: a small dot in the rule colour it last read, at the tail
@@ -3656,6 +3663,8 @@ void puf_render(Wef* env) {
         const char* line = TextFormat("%s   informed %d/%d   violations %d   marked %d   zaps on marked %d/%d",
             rule, informed, env->num_agents, env->violations, marked, env->zaps_on_marked, env->bites);
         DrawText(line, 20, 44, 18, WEF_COLOR_INST);
+        DrawText("legend: beacon disc = the rule's colour (label beside it); white ring = marked rule-breaker; tail dot = rule as read; grey fill = frozen; yellow fill = planting hold",
+            20, 66, 14, WEF_COLOR_MIDGRAY);
     }
     if (env->allelo) {
         const char* status = TextFormat("bushes A %d  B %d   ripe %d   eaten %d   plantings %d   zaps %d",
