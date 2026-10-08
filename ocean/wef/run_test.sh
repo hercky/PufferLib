@@ -4,6 +4,11 @@
 # 7.1 (U1-U10, the episode Log and the V3 trace in wef_test.c; U11 and U12 below).
 #   ./ocean/wef/run_test.sh                        # default 4-fish build:  build/wef_test
 #   CFLAGS=-DMAX_AGENTS=8 ./ocean/wef/run_test.sh  # 8-fish build:          build/wef_test8
+#   CFLAGS="-DMAX_AGENTS=8 -DWEF_INST" ./ocean/wef/run_test.sh   # institution build: build/wef_test8i
+#   CFLAGS=-DWEF_INST ./ocean/wef/run_test.sh                    # 4-fish institution build: build/wef_test4i
+# An institution build also runs U13: at inst_obs 0 its bench projection onto the base slots and its
+# rewards hash must equal the same-MAX_AGENTS plain build's (project=MAX_AGENTS), i.e. the extra slots
+# are the only difference.
 # Either run ends with U11 (the default bench hash, scripts/bench_env.sh variant o2) and U12
 # (projection identity: the 8-fish build at num_agents=4 reproduces the 4-fish build's rewards
 # hash and 110-slot obs projection over 20K bench steps), so both binaries are built.
@@ -14,8 +19,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 CFLAGS="${CFLAGS:-}"
-SUFFIX=$(printf '%s' "$CFLAGS" | sed -n 's/.*-DMAX_AGENTS=\([0-9][0-9]*\).*/\1/p')
-BASE_CFLAGS=$(printf '%s' "$CFLAGS" | sed 's/-DMAX_AGENTS=[0-9][0-9]*//')
+NFISH=$(printf '%s' "$CFLAGS" | sed -n 's/.*-DMAX_AGENTS=\([0-9][0-9]*\).*/\1/p')
+INST=0
+case "$CFLAGS" in *-DWEF_INST*) INST=1 ;; esac
+SUFFIX=$NFISH
+if [ "$INST" = 1 ]; then SUFFIX="${NFISH:-4}i"; fi
+BASE_CFLAGS=$(printf '%s' "$CFLAGS" | sed 's/-DMAX_AGENTS=[0-9][0-9]*//; s/-DWEF_INST//')
 OUT=build/wef_test$SUFFIX
 mkdir -p build
 CC="${CC:-gcc}"
@@ -78,8 +87,27 @@ else
 fi
 hash8=$(printf '%s\n' "$out8" | sed -n 's/^  hash \([0-9a-f]*\)$/\1/p')
 echo "     (8-fish build, num_agents=4, full 162-slot hash $hash8; 4-fish harness hash $(printf '%s\n' "$out4" | sed -n 's/^  hash \([0-9a-f]*\)$/\1/p'))"
+if [ "$INST" = 1 ]; then
+    # U13: the institution build at inst_obs 0 is the plain build plus zero-filled slots.
+    n=${NFISH:-4}
+    plain=build/wef_test; [ "$n" = 4 ] || plain=build/wef_test$n
+    outp=$("$plain" bench steps=5000 preset=allelo num_agents="$n" project="$n" 2>&1) || true
+    outi=$("$OUT" bench steps=5000 preset=allelo num_agents="$n" project="$n" 2>&1) || true
+    if [ "$n" = 4 ]; then  # the 4-fish builds cannot run the 8-fish AH preset: use the default bench
+        outp=$("$plain" bench steps=5000 project=4 2>&1) || true
+        outi=$("$OUT" bench steps=5000 project=4 2>&1) || true
+    fi
+    lp=$(printf '%s\n' "$outp" | sed -n 's/^  proj_hash \([0-9a-f]*\) .* rew_hash \([0-9a-f]*\)$/\1 \2/p')
+    li=$(printf '%s\n' "$outi" | sed -n 's/^  proj_hash \([0-9a-f]*\) .* rew_hash \([0-9a-f]*\)$/\1 \2/p')
+    if [ -n "$lp" ] && [ "$lp" = "$li" ]; then
+        echo "ok   U13 institution build at inst_obs 0: base-slot projection / rewards hash equal the plain $n-fish build's ($lp, 5000 steps)"
+    else
+        echo "FAIL U13 institution build vs plain $n-fish build: '$li' vs '$lp'"
+        fail=1
+    fi
+fi
 if [ "$fail" = 0 ]; then
-    echo "run_test.sh PASSED (unit suite, U11, U12)"
+    echo "run_test.sh PASSED (unit suite, U11, U12${INST:+, U13})"
 else
     echo "run_test.sh FAILED"
     exit 1

@@ -55,7 +55,16 @@ typedef float obs_t;
 #define ACTION_SIZE 4
 // morm + amp + (knollen + metadata) per other fish + last action + 7 scalars:
 // 110 at MAX_AGENTS 4 (upstream), 162 at 8.
-#define OBS_SIZE (NUM_MORMYROMASTS + NUM_AMPULLARY + (NUM_KNOLLEN + 1) * (MAX_AGENTS - 1) + ACTION_SIZE + 7)
+#define OBS_BASE_SIZE (NUM_MORMYROMASTS + NUM_AMPULLARY + (NUM_KNOLLEN + 1) * (MAX_AGENTS - 1) + ACTION_SIZE + 7)
+// Institution build (-DWEF_INST, docs/institutions-plan.md section 4): the row grows by one rule
+// slot, one own-mark slot and one mark slot per other fish (114 at 4 fish, 170 at 8). The default
+// and the 8-fish AH builds add nothing, so their rows and checkpoints are untouched.
+#ifdef WEF_INST
+#define INST_OBS_EXTRA (2 + (MAX_AGENTS - 1))
+#else
+#define INST_OBS_EXTRA 0
+#endif
+#define OBS_SIZE (OBS_BASE_SIZE + INST_OBS_EXTRA)
 #define EATING_RADIUS_CM 2.0f
 #define BITING_RADIUS_CM 3.0f
 #define EATING_ANGLE (PI_F / 4.0f)
@@ -109,6 +118,8 @@ typedef float obs_t;
 #define WEF_COLOR_FOOD_B        ((Color){0xF0, 0x7A, 0xD0, 200})  // AH: type B bushes (magenta)
 #define WEF_COLOR_HOLD          ((Color){250, 200, 60, 255})     // AH: planter on hold (body fill)
 #define WEF_COLOR_WASTE         ((Color){235, 150, 60, 220})     // inert debris (cleanup mode)
+#define WEF_COLOR_INST          ((Color){255, 225, 120, 255})    // institution beacon (inst_obs)
+#define WEF_COLOR_MARK          ((Color){255, 120, 40, 255})     // violation mark on a fish
 #define WEF_COLOR_EOD_POS       ((Color){220, 60, 50, 255})
 #define WEF_COLOR_EOD_NEG       ((Color){60, 120, 255, 255})
 #define WEF_COLOR_BITE          ((Color){255, 70, 70, 255})
@@ -183,6 +194,20 @@ typedef struct FishAgent {
     int trace_planted_slot;// trace only: slot converted this step, -1 none
     int trace_ate_type;    // trace only: 0 none / 1 A / 2 B eaten this step
     bool trace_plant_noop; // trace only: this step's bite was a same-type-only no-op (plant_noop)
+    // --- Institutions (inst_mode / inst_obs, docs/institutions-plan.md 3.2-4). Zero / unread when
+    // both are 0.
+    int mark;              // steps left of the violation mark (the public label)
+    float inst_val;        // the rule as last read at the beacon: +1 / -1, 0 = never read (latched)
+    bool informed;         // has read the beacon this episode
+    int first_visit_tick;  // first tick inside inst_read_cm, 0 = never
+    int visits;            // fish-steps inside inst_read_cm
+    int inst_private;      // inst_mode 2 (AH): this fish's private prescribed type 0 / 1
+    float inst_private_theta;  // inst_mode 2 (Commons): this fish's private closing threshold
+    int violations;        // rule-breaking acts this episode
+    int comply_acts;       // rule-governed acts that followed the rule
+    int rule_acts;         // rule-governed acts (AH: conversions; Commons: eats)
+    bool trace_violated;   // trace only: this step's act broke the rule
+    bool trace_zap_marked; // trace only: this step's zap landed on a marked fish
 } FishAgent;
 
 // Shared sensor layouts (body radius fixed → identical for every fish)
@@ -266,7 +291,7 @@ float conductor_scale_c(float radius_cm, float contrast) {
 }
 
 // Caps: 2 EOD poles/agent; agent+food+waste dipoles.
-enum { WEF_MAX_MONO = 2 * MAX_AGENTS, WEF_MAX_DIP = MAX_AGENTS + MAX_FOOD + MAX_WASTE };
+enum { WEF_MAX_MONO = 2 * MAX_AGENTS, WEF_MAX_DIP = MAX_AGENTS + MAX_FOOD + MAX_WASTE + 1 };  // + 1 beacon
 
 // Electric sources for measure_field: position in meters, moments/charges SI.
 typedef struct { Vec2 p; float q; } Mono;
@@ -340,6 +365,26 @@ struct Log {
     float taste_a_return;    // mean raw return of A-tasting fish (0 if none)
     float taste_b_return;
     float taste_a_n;         // number of A-tasting fish
+    // Institutions (docs/institutions-plan.md 4-5); zero unless inst_mode > 0 or inst_obs.
+    float inst_type_a;       // AH: fraction of episodes whose prescribed type at reset was A
+    float comply_frac;       // rule-following acts / rule-governed acts (1 when there were none)
+    float comply_informed;   // the same over fish that had read the beacon
+    float violations;        // rule-breaking acts per episode
+    float marked_frac;       // fish-steps marked / fish-steps
+    float marked_exposure;   // (i, j) pairs within MORM_AGENT_RANGE_CM with j marked / all such pairs (the mark-blind null)
+    float zaps_on_marked;    // fish bites whose victim was marked
+    float zaps_on_marked_share;  // zaps_on_marked / bites (0 without bites)
+    float inst_agree_final;  // AH: bushes of the prescribed type / K at the end
+    float inst_agree_mean;   // AH: time-mean of the same
+    float plantings_p;       // AH: conversions by fish whose taste is the prescribed type
+    float plantings_np;      // AH: conversions by the other group (= violations under plant_mode 2)
+    float closed_frac;       // Commons: steps with the public season closed / T
+    float eats_closed;       // Commons: eats that broke the rule
+    float mark_zap_bounty;   // bounty paid for zapping marked fish
+    float beacon_first_visit;// mean over fish of the first-read tick / T (1 if never)
+    float informed_frac;     // fish that read the beacon at least once / N
+    float informed_mean;     // time-mean fraction of informed fish
+    float beacon_visits;     // fish-steps inside inst_read_cm / N
     float n;
 };
 
@@ -385,6 +430,26 @@ typedef struct WefTraceRowV3 {
     int32_t n_a, n_ripe;
     int32_t hold;          // eat_cooldown while above EAT_COOLDOWN_STEPS (a planting hold), else 0
 } WefTraceRowV3;
+
+// Institution trace row (file name env_<id>.v4.bin, written when inst_mode > 0 or inst_obs):
+// WefTraceRowV3 + the rule as this fish has read it, its mark, this step's violation / marked zap,
+// whether it has read the beacon, and the public rule state (AH: 0 A / 1 B; Commons: 1 closed).
+typedef struct WefTraceRowV4 {
+    int32_t env_id, episode, tick, agent;
+    float x, y, orientation, size;
+    float move, turn;
+    int32_t eod, bite, bite_victim, was_bitten, ate, collided;
+    float reward, nearest_food, arena_x, arena_y;
+    int32_t food_left;
+    int32_t cleaned, waste_left, food_active, frozen, zone;
+    int32_t taste, plant_type, planted_slot, ate_type, n_a, n_ripe, hold;
+    int32_t inst_signal;   // -1 / 0 (never read) / +1
+    int32_t mark;          // steps left of this fish's mark
+    int32_t violated;      // this step's act broke the rule
+    int32_t zap_marked;    // this step's zap landed on a marked fish
+    int32_t informed;      // has read the beacon this episode
+    int32_t inst_type;     // public rule state
+} WefTraceRowV4;
 
 // Object-event log for offline replay (env_<id>.obj.bin, written with the trace):
 // one row per pellet/waste state change. kind 0 pellet, 1 waste; event 0 present at
@@ -629,8 +694,80 @@ struct Env {
     float frac_a_sum;
     float ripe_frac_sum;
     int convention_tick;        // first tick at or above conv_theta, 0 = never
+    // --- Institutions (docs/institutions-plan.md section 4). Inert when inst_mode == 0 and
+    // inst_obs == 0; inst_obs needs the -DWEF_INST build (the obs row grows).
+    int inst_mode;              // 0 none; 1 public beacon; 2 private signals; 3 spurious public signal
+    int inst_obs;               // 1: the beacon object sits in the arena and the institution slots are filled
+    int inst_fixed_type;        // AH: -1 draw the prescribed type per episode, 0 / 1 pin it
+    float inst_theta;           // Commons: the public season closes while S <= theta K ...
+    float inst_hyst;            // ... and reopens above (theta + hyst) K
+    int inst_flip_steps;        // mode 3: AH flips the prescription every N steps; Commons toggles w.p. 1 / N per step
+    int inst_mark_steps;        // violation mark duration (0 = no marks)
+    float mark_zap_reward;      // bounty to the attacker for zapping a marked fish
+    int mark_zap_cooldown;      // attacker bite cooldown after zapping a marked fish (-1 = BITE_COOLDOWN_STEPS)
+    int inst_pos_random;        // 0 beacon at the arena centre, 1 drawn uniformly per episode
+    float inst_read_cm;         // a fish inside this radius reads the rule
+    float inst_obj_radius_cm;   // the beacon's electrical signature: a waste-like conductor
+    float inst_contrast;
+    int inst_latch;             // 1: the obs slot keeps the last value read; 0: in range only
+    // institution episode state
+    int inst_type;              // public rule: AH prescribed type 0 A / 1 B; Commons 1 closed / 0 open
+    int inst_type_reset;        // AH: the prescribed type drawn at reset (inst_type_a)
+    Vec2 inst_pos;
+    Vec2 inst_moment;           // beacon induced dipole this step
+    int violations;
+    int zaps_on_marked;
+    int marked_steps;
+    int pair_steps;             // ordered fish pairs within MORM_AGENT_RANGE_CM, summed over steps
+    int pair_marked_steps;      // ... whose second fish was marked
+    int informed_steps;
+    float inst_agree_sum;
+    int closed_steps;
+    int eats_closed;
+    float bounty_sum;
+    int plantings_p;
+    int plantings_np;
 };
 typedef Env Wef;
+
+// Institutions: the rule a fish is subject to (docs/institutions-plan.md 3.2 / 3.3). AH: the
+// prescribed type (public in modes 1 / 3, this fish's private draw in mode 2). Commons: whether
+// the season is closed for this fish (public flag, or the stock against its private threshold).
+static inline int wef_inst_rule_type(const Wef* env, int i) {
+    return env->inst_mode == 2 ? env->fish[i].inst_private : env->inst_type;
+}
+
+static inline int wef_inst_closed(const Wef* env, int i) {
+    if (env->inst_mode == 2) {
+        return (float)env->food_active <= env->fish[i].inst_private_theta * (float)env->num_food;
+    }
+    return env->inst_type;
+}
+
+// The value a fish reads at the beacon: +1 / -1 (AH: type A / B; Commons: closed / open).
+static inline float wef_inst_signal(const Wef* env, int i) {
+    if (env->allelo) {
+        return wef_inst_rule_type(env, i) == 0 ? 1.0f : -1.0f;
+    }
+    return wef_inst_closed(env, i) ? 1.0f : -1.0f;
+}
+
+static inline bool wef_at_beacon(const Wef* env, const FishAgent* fish) {
+    float dx = fish->pos.x - env->inst_pos.x;
+    float dy = fish->pos.y - env->inst_pos.y;
+    return dx * dx + dy * dy <= env->inst_read_cm * env->inst_read_cm;
+}
+
+// A violation: mark the fish (public label) and count it.
+static inline void wef_inst_violation(Wef* env, int i) {
+    FishAgent* fish = &env->fish[i];
+    env->violations++;
+    fish->violations++;
+    fish->trace_violated = true;
+    if (env->inst_mark_steps > 0) {
+        fish->mark = env->inst_mark_steps;
+    }
+}
 
 // glibc's rand_r (TYPE_0 LCG, unchanged since glibc 2.x; ocean/wef/wef_test.c checks it
 // against the library call): inlined so the ~400 sensor-noise draws per env-step skip the
@@ -940,6 +1077,17 @@ void compute_observations(Wef* env) {
             env->waste[i].induced_moment = (Vec2){f.x * waste_scale, f.y * waste_scale};
         }
     }
+    // Institution beacon (inst_obs): a static conductor sensed like a waste item (induced only,
+    // waste class ranges), present in every arm of the institution build, control included.
+    if (env->inst_obs) {
+        float inst_scale = conductor_scale_c(env->inst_obj_radius_cm, env->inst_contrast);
+        float mono_range = env->waste_sense_range_cm + BODY_RADIUS_CM + 2.0f * EOD_POLE_OFFSET_CM;
+        Vec2 f = {0.0f, 0.0f};
+        if (wef_any_fish_within(env, env->inst_pos, mono_range + EOD_POLE_OFFSET_CM + 0.1f)) {
+            f = wef_mono_field(env->inst_pos, eod, n_eod, mono_range);
+        }
+        env->inst_moment = (Vec2){f.x * inst_scale, f.y * inst_scale};
+    }
     // Induced + intrinsic dipoles as AoS for measure_field: [agents..., food..., waste...]
     Dipole induced[WEF_MAX_DIP];
     Dipole intrinsic[WEF_MAX_DIP];
@@ -976,6 +1124,11 @@ void compute_observations(Wef* env) {
             };
             n_waste_staged++;
         }
+    }
+    if (env->inst_obs) {
+        // the beacon joins the waste class (same ranges and cull radius; no intrinsic moment)
+        induced[n_induced++] = (Dipole){to_m(env->inst_pos), env->inst_moment};
+        n_waste_staged++;
     }
     // Per-fish culling radii: every sensor sits on the BODY_RADIUS_CM ring around the fish
     // centre, so a source farther than (range + ring + margin) from the centre is out of
@@ -1079,6 +1232,7 @@ void compute_observations(Wef* env) {
         // Knollenorgans: conspecific EOD only.
         int metadata_start = NUM_MORMYROMASTS + NUM_AMPULLARY + NUM_KNOLLEN * (MAX_AGENTS - 1);
         int cons_slot = 0;
+        bool det[MAX_AGENTS] = {false};  // institution slots: which others this fish detected
         for (int other = 0; other < MAX_AGENTS; other++) {
             if (other == i) {
                 continue;
@@ -1131,6 +1285,7 @@ void compute_observations(Wef* env) {
                 }
             }
             float metadata = -1.0f;
+            det[other] = valid && detected;
             if (valid && detected) {
                 metadata = agent->size - env->fish[other].size;
                 metadata += random_uniform(env, -0.05f, 0.05f);
@@ -1191,6 +1346,29 @@ void compute_observations(Wef* env) {
             obs[obs_idx++] = agent->freeze > 0 ? 1.0f
                 : (float)agent->eat_cooldown / (float)eat_max;
         }
+#ifdef WEF_INST
+        // Institution slots (docs/institutions-plan.md 4): the rule as this fish last read it at the
+        // beacon (0 = never), its own mark, then one mark slot per other fish in metadata-slot
+        // order, filled only for fish the knollenorgan block detected this step (a mark is a label
+        // on the fish: seen when the fish is). All 0 when inst_obs == 0 (and in the control arm).
+        {
+            float mark_norm = env->inst_mark_steps > 0 ? 1.0f / (float)env->inst_mark_steps : 0.0f;
+            obs[obs_idx++] = env->inst_obs ? agent->inst_val : 0.0f;
+            obs[obs_idx++] = env->inst_obs ? (float)agent->mark * mark_norm : 0.0f;
+            for (int other = 0; other < MAX_AGENTS; other++) {
+                if (other == i) {
+                    continue;
+                }
+                float m = 0.0f;
+                if (env->inst_obs && det[other]) {
+                    m = (float)env->fish[other].mark * mark_norm;
+                }
+                obs[obs_idx++] = m;
+            }
+        }
+#else
+        (void)det;
+#endif
     }
 }
 
@@ -1313,6 +1491,18 @@ void puf_reset(Wef* env) {
     env->frac_a_sum = 0.0f;
     env->ripe_frac_sum = 0.0f;
     env->convention_tick = 0;
+    env->violations = 0;
+    env->zaps_on_marked = 0;
+    env->marked_steps = 0;
+    env->pair_steps = 0;
+    env->pair_marked_steps = 0;
+    env->informed_steps = 0;
+    env->inst_agree_sum = 0.0f;
+    env->closed_steps = 0;
+    env->eats_closed = 0;
+    env->bounty_sum = 0.0f;
+    env->plantings_p = 0;
+    env->plantings_np = 0;
     // Only the first episode of an env can be shortened (desync_first_episode).
     env->cur_episode_length = env->episode == 0 ? env->first_episode_len : env->episode_length;
 
@@ -1380,6 +1570,14 @@ void puf_reset(Wef* env) {
         agent.emits_eod = true;
         agent.bite_victim = -1;
         agent.can_clean = i < env->num_agents - env->no_clean_agents;
+        if (env->inst_mode == 2) {
+            // private signals: the same per-fish statistics as the public rule, drawn
+            // independently per fish (no common knowledge). AH: a type; Commons: a threshold
+            // centred on inst_theta.
+            float u = random_uniform(env, 0.0f, 1.0f);
+            agent.inst_private = u < 0.5f ? 0 : 1;
+            agent.inst_private_theta = clamp(env->inst_theta + 0.5f * (u - 0.5f), 0.05f, 0.95f);
+        }
         env->fish[i] = agent;
     }
 
@@ -1487,6 +1685,24 @@ void puf_reset(Wef* env) {
         }
         env->food_active = env->num_food;
     }
+    if (env->inst_obs || env->inst_mode > 0) {
+        // Institution: beacon position and this episode's public rule (docs/institutions-plan.md 3.2).
+        env->inst_pos = (Vec2){env->arena_size_x * 0.5f, env->arena_size_y * 0.5f};
+        if (env->inst_pos_random) {
+            env->inst_pos = (Vec2){
+                random_uniform(env, 3.0f, env->arena_size_x - 3.0f),
+                random_uniform(env, 3.0f, env->arena_size_y - 3.0f),
+            };
+        }
+        env->inst_moment = (Vec2){0.0f, 0.0f};
+        if (env->allelo) {
+            env->inst_type = env->inst_fixed_type >= 0 ? env->inst_fixed_type
+                : env->inst_mode > 0 ? (random_uniform(env, 0.0f, 1.0f) < 0.5f ? 0 : 1) : 0;
+        } else {
+            env->inst_type = (float)env->food_active <= env->inst_theta * (float)env->num_food ? 1 : 0;
+        }
+        env->inst_type_reset = env->inst_type;
+    }
     // Ampullary baseline: unit intrinsic dipole at arena center
     Vec2 center = {env->arena_size_x * 0.5f, env->arena_size_y * 0.5f};
     Dipole baseline_dip[1] = {{to_m(center), (Vec2){INTRINSIC_MOMENT_C_M, 0.0f}}};
@@ -1538,10 +1754,10 @@ int wef_zone(const Wef* env, Vec2 p) {
 }
 
 void wef_trace_step(Wef* env) {
-    WefTraceRowV3 rows[MAX_AGENTS];
+    WefTraceRowV4 rows[MAX_AGENTS];
     for (int i = 0; i < env->num_agents; i++) {
         FishAgent* agent = &env->fish[i];
-        rows[i] = (WefTraceRowV3){
+        rows[i] = (WefTraceRowV4){
             .env_id = env->env_id, .episode = env->episode,
             .tick = env->tick, .agent = i,
             .x = agent->pos.x, .y = agent->pos.y,
@@ -1563,10 +1779,19 @@ void wef_trace_step(Wef* env) {
             .planted_slot = agent->trace_planted_slot, .ate_type = agent->trace_ate_type,
             .n_a = env->n_type[0], .n_ripe = env->n_ripe,
             .hold = agent->eat_cooldown > EAT_COOLDOWN_STEPS ? agent->eat_cooldown : 0,
+            .inst_signal = agent->inst_val > 0.0f ? 1 : agent->inst_val < 0.0f ? -1 : 0,
+            .mark = agent->mark, .violated = agent->trace_violated,
+            .zap_marked = agent->trace_zap_marked, .informed = agent->informed,
+            .inst_type = env->inst_type,
         };
     }
-    if (env->allelo) {
-        fwrite(rows, sizeof(WefTraceRowV3), env->num_agents, env->trace_file);
+    if (env->inst_mode > 0 || env->inst_obs) {
+        fwrite(rows, sizeof(WefTraceRowV4), env->num_agents, env->trace_file);
+    } else if (env->allelo) {
+        // V3: the V4 row starts with the V3 fields, so write that prefix.
+        for (int i = 0; i < env->num_agents; i++) {
+            fwrite(&rows[i], sizeof(WefTraceRowV3), 1, env->trace_file);
+        }
     } else if (env->cleanup || env->regrows) {
         // V2: the V3 row starts with the V2 fields, so write that prefix.
         for (int i = 0; i < env->num_agents; i++) {
@@ -1650,6 +1875,25 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     if (env->allelo && role == 2) {
         role = 10;  // an eater that targeted unripe bushes would be trapped: the free-rider role
     }
+    // Institution roles (docs/institutions-plan.md 4; calibration only): 13 complier, 14 enforcer.
+    // Both know where the beacon is and swim to it until they have read the rule. Informed, the AH
+    // complier is a planter-own (role 8) when its taste is the prescribed type and a free-rider
+    // (role 10) otherwise; the Commons complier is role 7 whose restraint is the season as last
+    // read, and it waits AT the beacon while closed (so it keeps reading) and returns to it when
+    // it has nothing to eat. The enforcer hunts the nearest marked fish within the hunt range
+    // whenever it can bite, and behaves as a complier otherwise.
+    bool inst_role = env->inst_mode > 0 && (role == 13 || role == 14);
+    bool enforcer = inst_role && role == 14;
+    bool go_beacon = false;
+    if (inst_role) {
+        if (!fish->informed) {
+            go_beacon = true;
+        } else if (env->allelo) {
+            role = fish->taste == wef_inst_rule_type(env, i) ? 8 : 10;
+        } else {
+            role = 7;
+        }
+    }
     // Stall escape: collisions revert position but not heading, and the 3 cm avoidance
     // turn below fights the pursuit turn, so two bots next to one pellet can pin each
     // other for the rest of the episode. After 40 motionless decisions, swim off on a
@@ -1703,7 +1947,12 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     // Role 7 (Commons cooperator): a nearest-pellet eater that stops eating while the
     // global stock is at or below bot_theta * K (the cue obs_extra = 3 gives a policy).
     bool restrain = role == 7
-        && (float)(env->allelo ? env->n_ripe : env->food_active) <= env->bot_theta * (float)env->num_food;
+        && (inst_role ? fish->inst_val > 0.0f
+            : (float)(env->allelo ? env->n_ripe : env->food_active) <= env->bot_theta * (float)env->num_food);
+    bool at_beacon = inst_role && wef_at_beacon(env, fish);
+    if (inst_role && restrain && !at_beacon) {
+        go_beacon = true;  // wait out the closed season at the beacon
+    }
     float sense2 = sense * sense;
     Vec2 target = {0};
     float nearest = INFINITY;
@@ -1723,7 +1972,28 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     bool ah_plant_target = false; // the target is a bush to plant (plant cone radius, bite in cone)
     bool ah_hunt = false;         // the target is a rival fish (bite cone radius)
     bool ah_bite_now = false;     // role 12: bite this step without a travel target
-    if (env->allelo && role >= 8) {
+    if (go_beacon) {
+        target = env->inst_pos;
+        found = true;
+    } else if (enforcer && fish->bite_cooldown <= 0) {
+        // enforcer: the nearest marked, non-frozen fish within the hunt range
+        float hunt2 = env->bot_oracle ? INFINITY : MORM_AGENT_RANGE_CM * MORM_AGENT_RANGE_CM;
+        for (int j = 0; j < env->num_agents; j++) {
+            if (j == i || env->fish[j].freeze > 0 || env->fish[j].mark <= 0) {
+                continue;
+            }
+            float dx = env->fish[j].pos.x - fish->pos.x;
+            float dy = env->fish[j].pos.y - fish->pos.y;
+            float d2 = dx * dx + dy * dy;
+            if (d2 < nearest && d2 <= hunt2) {
+                nearest = d2;
+                target = env->fish[j].pos;
+                found = true;
+                ah_hunt = true;
+            }
+        }
+    }
+    if (!found && env->allelo && role >= 8) {
         int taste = fish->taste;
         // Role 11 hunts only while it can bite (bite_cooldown 0: during the zap cooldown it
         // behaves as role 8, so it plants and eats between zaps instead of trailing a rival it
@@ -1854,6 +2124,11 @@ void wef_bot_action(Wef* env, int i, float* raw) {
             }
         }
     }
+    if (!found && inst_role) {
+        // nothing to eat / plant / zap: back to the beacon (re-read the rule)
+        target = env->inst_pos;
+        found = true;
+    }
     if (!found && role != 1 && env->bot_camp > 0.0f && fish->bot_has_eat) {
         // Camp: circle the last eating spot (a learned fish remembers where food was; patches
         // regrow in place). The orbit radius bot_camp plus the 5 cm sense range covers a patch.
@@ -1931,7 +2206,7 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     } else if (ah_hunt && in_cone) {
         raw[3] = wef_bot_bin(env, true);  // zap (a stray bush in the cone would get the own type)
     }
-    if (restrain) {
+    if (restrain && (!inst_role || at_beacon)) {
         // Eating is automatic on contact, so abstaining = holding still, not patrolling.
         raw[0] = -8.0f;
         raw[1] = 0.0f;
@@ -2047,6 +2322,8 @@ void puf_step(Wef* env) {
         env->fish[i].trace_planted_slot = -1;
         env->fish[i].trace_ate_type = 0;
         env->fish[i].trace_plant_noop = false;
+        env->fish[i].trace_violated = false;
+        env->fish[i].trace_zap_marked = false;
         env->clean_pending[i] = 0;
         env->plant_pending[i] = 0;
         env->agents[i].rewards[0] = 0.0f;
@@ -2129,6 +2406,17 @@ void puf_step(Wef* env) {
                     if ((float)env->food_active <= env->sustain_frac * (float)env->num_food) {
                         agent->low_eat_mark = env->tick;
                     }
+                    if (env->inst_mode > 0) {
+                        // the rule "do not eat while the season is closed", judged before this
+                        // eat changes the stock
+                        agent->rule_acts++;
+                        if (wef_inst_closed(env, i)) {
+                            env->eats_closed++;
+                            wef_inst_violation(env, i);
+                        } else {
+                            agent->comply_acts++;
+                        }
+                    }
                     env->food_active--;
                     wef_obj_event(env, 0, f, 1, env->food[f].pos);
                 }
@@ -2193,6 +2481,24 @@ void puf_step(Wef* env) {
         }
         if (env->cleanup && agent->pos.x < env->strip_cm) {
             env->strip_steps_by[i]++;
+        }
+        if (env->inst_obs || env->inst_mode > 0) {
+            // Reading the institution: inside inst_read_cm of the beacon. Visits are counted in
+            // every arm (the control's chance-visit rate is the discovery null); the rule itself
+            // is written to the slot only when there is one (inst_mode > 0).
+            if (!env->inst_latch) {
+                agent->inst_val = 0.0f;
+            }
+            if (wef_at_beacon(env, agent)) {
+                agent->visits++;
+                if (!agent->informed) {
+                    agent->informed = true;
+                    agent->first_visit_tick = env->tick;
+                }
+                if (env->inst_mode > 0) {
+                    agent->inst_val = wef_inst_signal(env, i);
+                }
+            }
         }
 
         // Proximity shaping
@@ -2340,8 +2646,21 @@ void puf_step(Wef* env) {
             if (env->cleanup && attacker->pos.x < env->strip_cm) {
                 env->bites_in_strip++;
             }
+            bool marked_victim = env->inst_mode > 0 && env->fish[victim].mark > 0;
+            if (marked_victim) {
+                // sanctioning a labelled rule-breaker: cheaper (mark_zap_cooldown) and, with a
+                // bounty configured, paid (docs/institutions-plan.md 3.2 item 4; v0 bounty 0)
+                env->zaps_on_marked++;
+                attacker->trace_zap_marked = true;
+                env->agents[i].rewards[0] += env->mark_zap_reward;
+                env->bounty_sum += env->mark_zap_reward;
+            }
+            if (env->allelo || env->inst_mode > 0) {
+                attacker->bite_cooldown = marked_victim
+                    ? (env->mark_zap_cooldown >= 0 ? env->mark_zap_cooldown : BITE_COOLDOWN_STEPS)
+                    : env->zap_cooldown_steps;
+            }
             if (env->allelo) {
-                attacker->bite_cooldown = env->zap_cooldown_steps;
                 if (env->zap_steps > attacker->eat_cooldown) {
                     attacker->eat_cooldown = env->zap_steps;  // head-butt recovery (pricing lever)
                 }
@@ -2372,6 +2691,22 @@ void puf_step(Wef* env) {
             env->plant_proactive += !(bush == attacker->last_eaten_slot
                 && env->tick - attacker->last_eat_tick <= 3);
             env->plant_pending[i]++;
+            if (env->inst_mode > 0) {
+                // the rule "plant the prescribed type" (plant_mode 2: the prescribed group
+                // complies whenever it plants, the other group violates whenever it plants)
+                int rule = wef_inst_rule_type(env, i);
+                attacker->rule_acts++;
+                if (attacker->taste == rule) {
+                    env->plantings_p++;
+                } else {
+                    env->plantings_np++;
+                }
+                if (plant_type == rule) {
+                    attacker->comply_acts++;
+                } else {
+                    wef_inst_violation(env, i);
+                }
+            }
             attacker->last_plant_type = plant_type;
             attacker->plant_mark = env->tick;
             attacker->trace_plant_type = 1 + plant_type;
@@ -2575,6 +2910,48 @@ void puf_step(Wef* env) {
         }
     }
 
+    if (env->inst_mode > 0 || env->inst_obs) {
+        if (env->inst_mode > 0 && !env->allelo) {
+            // Commons: the public season from the stock (hysteresis), or, in mode 3, a random
+            // on / off schedule with mean block length inst_flip_steps (the spurious rule)
+            if (env->inst_mode == 3) {
+                if (random_uniform(env, 0.0f, 1.0f) < 1.0f / (float)env->inst_flip_steps) {
+                    env->inst_type = 1 - env->inst_type;
+                }
+            } else {
+                float stock = (float)env->food_active;
+                float k = (float)env->num_food;
+                if (env->inst_type == 0 && stock <= env->inst_theta * k) {
+                    env->inst_type = 1;
+                } else if (env->inst_type == 1 && stock > (env->inst_theta + env->inst_hyst) * k) {
+                    env->inst_type = 0;
+                }
+            }
+            env->closed_steps += env->inst_type;
+        } else if (env->inst_mode == 3 && env->allelo && env->inst_flip_steps > 0
+                && env->tick % env->inst_flip_steps == 0) {
+            env->inst_type = 1 - env->inst_type;  // AH spurious rule: the prescription flips
+        }
+        if (env->allelo) {
+            env->inst_agree_sum += (float)env->n_type[env->inst_type] / (float)env->num_food;
+        }
+        // marks, exposure (the mark-blind null for zap targeting) and informed fish
+        for (int i = 0; i < env->num_agents; i++) {
+            env->marked_steps += env->fish[i].mark > 0;
+            env->informed_steps += env->fish[i].informed;
+            for (int j = 0; j < env->num_agents; j++) {
+                if (j == i) {
+                    continue;
+                }
+                float dx = env->fish[j].pos.x - env->fish[i].pos.x;
+                float dy = env->fish[j].pos.y - env->fish[i].pos.y;
+                if (dx * dx + dy * dy <= MORM_AGENT_RANGE_CM * MORM_AGENT_RANGE_CM) {
+                    env->pair_steps++;
+                    env->pair_marked_steps += env->fish[j].mark > 0;
+                }
+            }
+        }
+    }
     for (int i = 0; i < env->num_agents; i++) {
         env->eater_steps += wef_recent(env, env->fish[i].eat_mark, WEF_RECENT_STEPS);
         env->defector_steps += wef_is_defector(env, &env->fish[i]);
@@ -2584,6 +2961,7 @@ void puf_step(Wef* env) {
         env->fish[i].eat_cooldown -= env->fish[i].eat_cooldown > 0;
         env->fish[i].bite_cooldown -= env->fish[i].bite_cooldown > 0;
         env->fish[i].freeze -= env->fish[i].freeze > 0;
+        env->fish[i].mark -= env->fish[i].mark > 0;
         // Raw (pre-mixing, pre-shaping) per-fish return: what the metrics report.
         env->return_by[i] += env->agents[i].rewards[0];
         env->raw_return_sum += env->agents[i].rewards[0];
@@ -2736,6 +3114,51 @@ void puf_step(Wef* env) {
             env->log.taste_a_return += taste_n[0] > 0 ? taste_sum[0] / (float)taste_n[0] : 0.0f;
             env->log.taste_b_return += taste_n[1] > 0 ? taste_sum[1] / (float)taste_n[1] : 0.0f;
             env->log.taste_a_n += (float)taste_n[0];
+        }
+        if (env->inst_mode > 0 || env->inst_obs) {
+            float fish_steps = ticks * (float)env->num_agents;
+            int comply = 0;
+            int acts = 0;
+            int comply_inf = 0;
+            int acts_inf = 0;
+            int informed_n = 0;
+            int visits = 0;
+            float first_visit = 0.0f;
+            for (int i = 0; i < env->num_agents; i++) {
+                FishAgent* f = &env->fish[i];
+                comply += f->comply_acts;
+                acts += f->rule_acts;
+                visits += f->visits;
+                if (f->informed) {
+                    informed_n++;
+                    comply_inf += f->comply_acts;
+                    acts_inf += f->rule_acts;
+                    first_visit += (float)f->first_visit_tick / ticks;
+                } else {
+                    first_visit += 1.0f;
+                }
+            }
+            float k = (float)env->num_food;
+            env->log.inst_type_a += env->allelo && env->inst_type_reset == 0 ? 1.0f : 0.0f;
+            env->log.comply_frac += acts > 0 ? (float)comply / (float)acts : 1.0f;
+            env->log.comply_informed += acts_inf > 0 ? (float)comply_inf / (float)acts_inf : 1.0f;
+            env->log.violations += (float)env->violations;
+            env->log.marked_frac += (float)env->marked_steps / fish_steps;
+            env->log.marked_exposure += env->pair_steps > 0
+                ? (float)env->pair_marked_steps / (float)env->pair_steps : 0.0f;
+            env->log.zaps_on_marked += (float)env->zaps_on_marked;
+            env->log.zaps_on_marked_share += env->bites > 0 ? (float)env->zaps_on_marked / (float)env->bites : 0.0f;
+            env->log.inst_agree_final += env->allelo ? (float)env->n_type[env->inst_type] / k : 0.0f;
+            env->log.inst_agree_mean += env->allelo ? env->inst_agree_sum / ticks : 0.0f;
+            env->log.plantings_p += (float)env->plantings_p;
+            env->log.plantings_np += (float)env->plantings_np;
+            env->log.closed_frac += env->allelo ? 0.0f : (float)env->closed_steps / ticks;
+            env->log.eats_closed += (float)env->eats_closed;
+            env->log.mark_zap_bounty += env->bounty_sum;
+            env->log.beacon_first_visit += first_visit / (float)env->num_agents;
+            env->log.informed_frac += (float)informed_n / (float)env->num_agents;
+            env->log.informed_mean += (float)env->informed_steps / fish_steps;
+            env->log.beacon_visits += (float)visits / (float)env->num_agents;
         }
         env->log.n += 1.0f;
         puf_reset(env);
@@ -3088,6 +3511,22 @@ void puf_render(Wef* env) {
             DrawCircleV(position, fmaxf(3.0f, env->waste_radius_cm * scale), WEF_COLOR_WASTE);
         }
     }
+    if (env->inst_obs) {
+        // Institution beacon: the read radius as a faint ring, the object as a dot in the rule's
+        // colour (AH: the prescribed type; Commons: red while closed, green while open; grey in
+        // the control arm, which has no rule).
+        Vector2 bp = world_to_screen(env, env->inst_pos);
+        Color rc = WEF_COLOR_MIDGRAY;
+        if (env->inst_mode > 0) {
+            rc = env->allelo ? (env->inst_type == 0 ? WEF_COLOR_FOOD : WEF_COLOR_FOOD_B)
+                : (env->inst_type ? WEF_COLOR_BITE : WEF_COLOR_FOOD);
+        }
+        float rr = env->inst_read_cm * scale;
+        DrawRing(bp, rr - 1.0f, rr + 1.0f, 0.0f, 360.0f, 48, ColorAlpha(WEF_COLOR_INST, 0.5f));
+        DrawCircleV(bp, fmaxf(5.0f, env->inst_obj_radius_cm * scale), rc);
+        DrawRing(bp, fmaxf(5.0f, env->inst_obj_radius_cm * scale), fmaxf(5.0f, env->inst_obj_radius_cm * scale) + 2.0f,
+            0.0f, 360.0f, 32, WEF_COLOR_INST);
+    }
     // Bites: red line biter -> victim and a fading red ring on the victim.
     for (int v = 0; v < env->num_agents; v++) {
         int f = env->client->bite_flash[v];
@@ -3117,6 +3556,19 @@ void puf_render(Wef* env) {
             // taste: a small ring in the type colour just inside the body ring
             Color tc = agent->taste == 0 ? WEF_COLOR_FOOD : WEF_COLOR_FOOD_B;
             DrawRing(center, radius - 4.0f, radius - 2.0f, 0.0f, 360.0f, 32, ColorAlpha(tc, 0.9f));
+        }
+        if (agent->mark > 0) {
+            // violation mark: an orange ring outside the body, fading as the mark runs out
+            float a = 0.35f + 0.65f * (float)agent->mark / (float)(env->inst_mark_steps > 0 ? env->inst_mark_steps : 1);
+            DrawRing(center, radius + 2.5f, radius + 5.5f, 0.0f, 360.0f, 32, ColorAlpha(WEF_COLOR_MARK, a));
+        }
+        if (env->inst_mode > 0 && agent->informed) {
+            // informed fish: a small dot in the rule colour it last read, at the tail
+            Color ic = agent->inst_val > 0.0f ? (env->allelo ? WEF_COLOR_FOOD : WEF_COLOR_BITE)
+                : agent->inst_val < 0.0f ? (env->allelo ? WEF_COLOR_FOOD_B : WEF_COLOR_FOOD) : WEF_COLOR_MIDGRAY;
+            Vector2 tail = {center.x - cosf(agent->orientation) * radius * 1.4f,
+                center.y + sinf(agent->orientation) * radius * 1.4f};
+            DrawCircleV(tail, 3.0f, ic);
         }
 
         if (agent->emits_eod) {
@@ -3182,6 +3634,19 @@ void puf_render(Wef* env) {
         const char* top = TextFormat("step %d   active EODs %d/%d   bites %d",
             env->tick, active_eods, env->num_agents, env->client->bites_total);
         DrawText(top, env->client->window_width - 20 - MeasureText(top, 18), 18, 18, WEF_COLOR_MIDGRAY);
+    }
+    if (env->inst_mode > 0) {
+        int marked = 0;
+        int informed = 0;
+        for (int i = 0; i < env->num_agents; i++) {
+            marked += env->fish[i].mark > 0;
+            informed += env->fish[i].informed;
+        }
+        const char* rule = env->allelo ? (env->inst_type == 0 ? "rule: plant A" : "rule: plant B")
+            : (env->inst_type ? "season: CLOSED" : "season: open");
+        const char* line = TextFormat("%s   informed %d/%d   violations %d   marked %d   zaps on marked %d/%d",
+            rule, informed, env->num_agents, env->violations, marked, env->zaps_on_marked, env->bites);
+        DrawText(line, 20, 44, 18, WEF_COLOR_INST);
     }
     if (env->allelo) {
         const char* status = TextFormat("bushes A %d  B %d   ripe %d   eaten %d   plantings %d   zaps %d",
@@ -3275,6 +3740,10 @@ static const char* WEF_ENV_KEYS[] = {
     "plant_priority", "plant_radius_cm", "plant_steps", "plant_cooldown_steps", "plant_reward",
     "plant_reward_anneal_steps", "zap_cooldown_steps", "zap_steps", "conv_theta",
     "bot_plant_theta", "bot_plant_max", "bot_plant_frac",
+    // Institutions (docs/institutions-plan.md section 4)
+    "inst_mode", "inst_obs", "inst_fixed_type", "inst_theta", "inst_hyst", "inst_flip_steps",
+    "inst_mark_steps", "mark_zap_reward", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
+    "inst_obj_radius_cm", "inst_contrast", "inst_latch",
 };
 
 static void wef_check_keys(Dict* kwargs) {
@@ -3399,6 +3868,21 @@ void puf_init(Env* env, Dict* kwargs) {
     env->bot_plant_theta = wef_cfg(kwargs, "bot_plant_theta", 1.0);
     env->bot_plant_max = wef_cfg(kwargs, "bot_plant_max", 0);
     env->bot_plant_frac = wef_cfg(kwargs, "bot_plant_frac", 1.0);
+    // Institutions (section 4). Defaults = no institution, no beacon, no extra slots filled.
+    env->inst_mode = wef_cfg(kwargs, "inst_mode", 0);
+    env->inst_obs = wef_cfg(kwargs, "inst_obs", 0);
+    env->inst_fixed_type = wef_cfg(kwargs, "inst_fixed_type", -1);
+    env->inst_theta = wef_cfg(kwargs, "inst_theta", 0.5);
+    env->inst_hyst = wef_cfg(kwargs, "inst_hyst", 0.1);
+    env->inst_flip_steps = wef_cfg(kwargs, "inst_flip_steps", 0);
+    env->inst_mark_steps = wef_cfg(kwargs, "inst_mark_steps", 0);
+    env->mark_zap_reward = wef_cfg(kwargs, "mark_zap_reward", 0);
+    env->mark_zap_cooldown = wef_cfg(kwargs, "mark_zap_cooldown", -1);
+    env->inst_pos_random = wef_cfg(kwargs, "inst_pos_random", 0);
+    env->inst_read_cm = wef_cfg(kwargs, "inst_read_cm", 5.0);
+    env->inst_obj_radius_cm = wef_cfg(kwargs, "inst_obj_radius_cm", 0.5);
+    env->inst_contrast = wef_cfg(kwargs, "inst_contrast", 1.0);
+    env->inst_latch = wef_cfg(kwargs, "inst_latch", 1);
     {
         // roles = r0,r1,r2,r3 (comma list; a scalar applies to slot 0 only)
         DictItem* item = dict_find(kwargs, "roles");
@@ -3415,10 +3899,24 @@ void puf_init(Env* env, Dict* kwargs) {
     }
     assert(env->bot_shift_steps >= MAX_AGENTS);
     for (int i = 0; i < MAX_AGENTS; i++) {
-        assert(env->roles[i] >= 0 && env->roles[i] <= 12
-            && "roles: 0 policy, 1 cleaner, 2 eater, 3 shift, 4 random, 5 sustainable eater, 6 dense-first eater, 7 stock-threshold eater, 8 planter-own, 9 planter-majority, 10 free-rider, 11 zapper-planter, 12 opportunistic planter");
-        assert((env->allelo || env->roles[i] <= 7) && "roles 8-12 need allelo = 1");
+        assert(env->roles[i] >= 0 && env->roles[i] <= 14
+            && "roles: 0 policy, 1 cleaner, 2 eater, 3 shift, 4 random, 5 sustainable eater, 6 dense-first eater, 7 stock-threshold eater, 8 planter-own, 9 planter-majority, 10 free-rider, 11 zapper-planter, 12 opportunistic planter, 13 complier, 14 enforcer");
+        assert((env->allelo || env->roles[i] <= 7 || env->roles[i] >= 13) && "roles 8-12 need allelo = 1");
+        assert((env->inst_mode > 0 || env->roles[i] < 13) && "roles 13-14 need inst_mode > 0");
     }
+    assert(env->inst_mode >= 0 && env->inst_mode <= 3 && "inst_mode: 0 none, 1 public beacon, 2 private signals, 3 spurious rule");
+    assert((env->inst_mode == 0 || env->inst_obs) && "inst_mode > 0 needs inst_obs = 1 (the beacon and the slots)");
+#ifndef WEF_INST
+    assert(env->inst_obs == 0 && "inst_obs needs the institution build (NVCC_EXTRA / CFLAGS -DWEF_INST)");
+#endif
+    assert((env->inst_mode == 0 || env->allelo || env->regrow_p_max > 0.0f || env->regrow_mode == 3)
+        && "an institution needs Allelopathic Harvest (rule = the prescribed type) or a regrowth mode (rule = the closed season)");
+    assert(env->inst_fixed_type >= -1 && env->inst_fixed_type <= 1);
+    assert(env->inst_theta > 0.0f && env->inst_theta < 1.0f && env->inst_hyst >= 0.0f && env->inst_theta + env->inst_hyst <= 1.0f);
+    assert((env->inst_mode != 3 || env->inst_flip_steps > 0) && "inst_mode 3 needs inst_flip_steps > 0");
+    assert(env->inst_mark_steps >= 0 && env->mark_zap_cooldown >= -1 && env->inst_read_cm > 0.0f
+        && env->inst_obj_radius_cm > 0.0f);
+    assert((env->inst_pos_random == 0 || env->inst_pos_random == 1) && (env->inst_latch == 0 || env->inst_latch == 1));
     if (env->allelo) {
         assert(env->cleanup == 0 && env->regrow_mode == 0 && env->regrow_p_max == 0.0f
             && env->waste_max == 0 && env->food_start == -1
@@ -3505,8 +4003,9 @@ void puf_init(Env* env, Dict* kwargs) {
     if (trace_dir != NULL && trace_dir[0] != '\0') {
         char path[4096];
         bool v2 = env->cleanup || env->regrows;
+        bool v4 = env->inst_mode > 0 || env->inst_obs;
         snprintf(path, sizeof(path),
-            env->allelo ? "%s/env_%05d.v3.bin" : v2 ? "%s/env_%05d.v2.bin" : "%s/env_%05d.bin",
+            v4 ? "%s/env_%05d.v4.bin" : env->allelo ? "%s/env_%05d.v3.bin" : v2 ? "%s/env_%05d.v2.bin" : "%s/env_%05d.bin",
             trace_dir, env->env_id);
         env->trace_file = fopen(path, "wb");
         assert(env->trace_file != NULL && "WEF_TRACE_DIR must be an existing, writable dir");
@@ -3576,6 +4075,33 @@ static void wef_log_allelo(Log* log, Dict* out) {
     dict_set(out, "zaps_same", log->zaps_same);
 }
 
+// Institution keys (docs/institutions-plan.md 4-5). The first group is what the dashboard shows
+// in the -DWEF_INST AH build; the tail lands in the [metrics] series only.
+static void wef_log_inst(Log* log, Dict* out) {
+    dict_set(out, "comply_frac", log->comply_frac);
+    dict_set(out, "inst_agree_final", log->inst_agree_final);
+    dict_set(out, "informed_frac", log->informed_frac);
+    dict_set(out, "zaps_on_marked_share", log->zaps_on_marked_share);
+    dict_set(out, "violations", log->violations);
+}
+
+static void wef_log_inst_tail(Log* log, Dict* out) {
+    dict_set(out, "inst_type_a", log->inst_type_a);
+    dict_set(out, "comply_informed", log->comply_informed);
+    dict_set(out, "marked_frac", log->marked_frac);
+    dict_set(out, "marked_exposure", log->marked_exposure);
+    dict_set(out, "zaps_on_marked", log->zaps_on_marked);
+    dict_set(out, "inst_agree_mean", log->inst_agree_mean);
+    dict_set(out, "plantings_p", log->plantings_p);
+    dict_set(out, "plantings_np", log->plantings_np);
+    dict_set(out, "closed_frac", log->closed_frac);
+    dict_set(out, "eats_closed", log->eats_closed);
+    dict_set(out, "mark_zap_bounty", log->mark_zap_bounty);
+    dict_set(out, "beacon_first_visit", log->beacon_first_visit);
+    dict_set(out, "informed_mean", log->informed_mean);
+    dict_set(out, "beacon_visits", log->beacon_visits);
+}
+
 // The rest of the AH keys (off the 30-key live dashboard in the AH build, in the [metrics] series).
 static void wef_log_allelo_tail(Log* log, Dict* out) {
     dict_set(out, "mono_final", log->mono_final);
@@ -3597,6 +4123,37 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "episode_return", log->episode_return);
     dict_set(out, "episode_length", log->episode_length);
     dict_set(out, "food_eaten_mean", log->food_eaten_mean);
+#ifdef WEF_INST
+    // institution build: the 5 institution keys take the dashboard places of plant_own_frac_a / _b,
+    // plant_gini, taste_a_n and eod_rate (all still in the [metrics] series below)
+    dict_set(out, "mono_frac", log->mono_frac);
+    dict_set(out, "frac_a_final", log->frac_a_final);
+    dict_set(out, "frac_a_mean", log->frac_a_mean);
+    dict_set(out, "majority_frac_final", log->majority_frac_final);
+    dict_set(out, "conv_c", log->conv_c);
+    dict_set(out, "time_to_convention", log->time_to_convention);
+    dict_set(out, "ripe_frac", log->ripe_frac);
+    dict_set(out, "plantings", log->plantings);
+    dict_set(out, "plantings_a", log->plantings_a);
+    dict_set(out, "plantings_b", log->plantings_b);
+    dict_set(out, "plant_own_frac", log->plant_own_frac);
+    dict_set(out, "plant_major_frac", log->plant_major_frac);
+    dict_set(out, "plant_proactive", log->plant_proactive);
+    dict_set(out, "zaps_cross", log->zaps_cross);
+    dict_set(out, "zaps_same", log->zaps_same);
+    wef_log_inst(log, out);
+    dict_set(out, "bites", log->bites);
+    dict_set(out, "freezes", log->freezes);
+    dict_set(out, "frozen_frac", log->frozen_frac);
+    dict_set(out, "equality", log->equality);
+    dict_set(out, "collective_food", log->collective_food);
+    dict_set(out, "eod_rate", log->eod_rate);
+    dict_set(out, "plant_own_frac_a", log->plant_own_frac_a);
+    dict_set(out, "plant_own_frac_b", log->plant_own_frac_b);
+    dict_set(out, "plant_gini", log->plant_gini);
+    dict_set(out, "taste_a_n", log->taste_a_n);
+    wef_log_inst_tail(log, out);
+#else
     wef_log_allelo(log, out);
     dict_set(out, "bites", log->bites);
     dict_set(out, "freezes", log->freezes);
@@ -3604,6 +4161,9 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "equality", log->equality);
     dict_set(out, "collective_food", log->collective_food);
     dict_set(out, "eod_rate", log->eod_rate);
+    wef_log_inst(log, out);
+    wef_log_inst_tail(log, out);
+#endif
     wef_log_allelo_tail(log, out);
     dict_set(out, "collisions_fish", log->collisions_fish);
     dict_set(out, "food_per_fish_area", log->food_per_fish_area);
@@ -3640,6 +4200,9 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "bites", log->bites);
     dict_set(out, "food_per_fish_area", log->food_per_fish_area);
     dict_set(out, "collective_food", log->collective_food);
+#ifdef WEF_INST
+    wef_log_inst(log, out);  // 4-fish institution build (Commons arms): on the dashboard
+#endif
     dict_set(out, "waste_frac", log->waste_frac);
     dict_set(out, "frac_open", log->frac_open);
     dict_set(out, "cleans", log->cleans);
@@ -3666,5 +4229,9 @@ void puf_log(Log* log, Dict* out) {
     // AH keys appended after today's order (default build: dashboard order unchanged).
     wef_log_allelo(log, out);
     wef_log_allelo_tail(log, out);
+#ifndef WEF_INST
+    wef_log_inst(log, out);
+#endif
+    wef_log_inst_tail(log, out);
 }
 #endif

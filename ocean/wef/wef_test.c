@@ -18,6 +18,11 @@
  *      min(8, MAX_AGENTS) fish; the slot numbers in the messages are derived from OBS_SIZE.
  *      U11 (default bench hash) and U12 (projection identity, `bench project=4`) are run
  *      by run_test.sh.
+ *   6. Institutions (docs/institutions-plan.md section 4), checks U13-U22 (slot layout, beacon read
+ *      and latch, rule draws, violations and marks, zap cost, Commons season, beacon sensing, the
+ *      Log, the V4 trace, the complier / enforcer roles). They need the -DWEF_INST build
+ *      (build/wef_test8i via CFLAGS="-DMAX_AGENTS=8 -DWEF_INST") and are skipped elsewhere;
+ *      run_test.sh adds U13' (base-slot projection identity of the institution build).
  */
 #include <stdbool.h>
 #include <stdio.h>
@@ -131,6 +136,55 @@ static void kw_allelo(Dict* kw) {
     dict_set(kw, "proximity_shaping", 0);
 }
 
+// Institution arm on top of an AH or Commons preset (scripts/inst_ah.args / inst_commons.args):
+// the beacon at the centre, read within 5 cm, latched; public rule (inst_mode 1), marks 64 steps,
+// zaps on (freeze 25, cooldown 25 for unmarked victims, 5 for marked), no bounty.
+static void kw_inst(Dict* kw) {
+    dict_set(kw, "inst_obs", 1);
+    dict_set(kw, "inst_mode", 1);
+    dict_set(kw, "inst_mark_steps", 64);
+    dict_set(kw, "inst_read_cm", 5.0);
+    dict_set(kw, "inst_latch", 1);
+    dict_set(kw, "bitten_freeze_steps", 25);
+    dict_set(kw, "zap_cooldown_steps", 25);
+    dict_set(kw, "mark_zap_cooldown", -1);
+    dict_set(kw, "mark_zap_reward", 0);
+}
+
+// preset=inst_ah: AH-strict 4+4 with plant_mode 2 (scripts/ah_strict.args) + kw_inst.
+static void kw_inst_ah(Dict* kw) {
+    kw_allelo(kw);
+    dict_set(kw, "plant_mode", 2);
+    kw_inst(kw);
+}
+
+// preset=inst_commons: the patchy Commons preset (scripts/commons_patchy80.args) + kw_inst.
+static void kw_inst_commons(Dict* kw) {
+    dict_set(kw, "num_agents", 4);
+    dict_set(kw, "min_arena_width", 80);
+    dict_set(kw, "max_arena_width", 80);
+    dict_set(kw, "min_arena_height", 80);
+    dict_set(kw, "max_arena_height", 80);
+    dict_set(kw, "food_distribution", FOOD_PATCHY);
+    dict_set(kw, "num_food", 64);
+    dict_set(kw, "num_patches", 2);
+    dict_set(kw, "patch_radius", 6);
+    dict_set(kw, "patch_radius_std", 0);
+    dict_set(kw, "regrow_mode", 2);
+    dict_set(kw, "regrow_p_max", 0.015);
+    dict_set(kw, "regrow_allee", 0.4);
+    dict_set(kw, "regrow_in_patches", 1);
+    dict_set(kw, "bot_theta", 0.6);
+    dict_set(kw, "bot_oracle", 1);
+    dict_set(kw, "size_min", 0.5);
+    dict_set(kw, "size_max", 0.5);
+    dict_set(kw, "proximity_shaping", 0);
+    dict_set(kw, "obs_extra", 3);
+    dict_set(kw, "sustain_frac", 0.5);
+    dict_set(kw, "episode_length", 1024);
+    kw_inst(kw);
+}
+
 // shape=conv: the AH-conv keys on top of kw_allelo (paper cubic F, hold 8, 2048 steps).
 static void kw_allelo_conv(Dict* kw) {
     dict_set(kw, "ripen_lin", 1.7e-3);
@@ -142,14 +196,18 @@ static void kw_allelo_conv(Dict* kw) {
 
 static unsigned int g_seed = 7;  // calibration: seed=N on the command line
 
-// Observation layout (section 3.1): 110 floats at MAX_AGENTS 4, 162 at 8.
+// Observation layout (section 3.1): 110 floats at MAX_AGENTS 4, 162 at 8 (the base layout; the
+// -DWEF_INST build appends INST_OBS_EXTRA institution slots, see OBS_INST_*).
 #define OBS_META_START (NUM_MORMYROMASTS + NUM_AMPULLARY + NUM_KNOLLEN * (MAX_AGENTS - 1))
 #define OBS_ACT_START (OBS_META_START + MAX_AGENTS - 1)   // last action (4 slots)
-#define OBS_EXTRA (OBS_SIZE - 7)                           // obs_extra
-#define OBS_BITTEN (OBS_SIZE - 6)
-#define OBS_OWN_SIZE (OBS_SIZE - 5)
-#define OBS_BITE_CD (OBS_SIZE - 4)
-#define OBS_EAT_CD (OBS_SIZE - 1)                          // freeze ? 1 : eat_cooldown / max(3, plant_steps)
+#define OBS_EXTRA (OBS_BASE_SIZE - 7)                      // obs_extra
+#define OBS_BITTEN (OBS_BASE_SIZE - 6)
+#define OBS_OWN_SIZE (OBS_BASE_SIZE - 5)
+#define OBS_BITE_CD (OBS_BASE_SIZE - 4)
+#define OBS_EAT_CD (OBS_BASE_SIZE - 1)                     // freeze ? 1 : eat_cooldown / max(3, plant_steps)
+#define OBS_INST_RULE (OBS_BASE_SIZE)                      // institution build: the rule as read (+1 / -1 / 0)
+#define OBS_INST_MARK (OBS_BASE_SIZE + 1)                  // own mark / inst_mark_steps
+#define OBS_INST_OTHERS (OBS_BASE_SIZE + 2)                // marks of the others (metadata-slot order)
 
 // stride: floats between consecutive obs rows (OBS_SIZE, or more to leave guard words).
 static Harness make_ex(Dict* kw, int num_fish, int stride) {
@@ -287,7 +345,7 @@ static void test_sensing(void) {
     env->waste_active = 1;
 
     // obs_extra = 2: normalized x
-    float extra = env->agents[0].observations[OBS_SIZE - 7];
+    float extra = env->agents[0].observations[OBS_BASE_SIZE - 7];
     CHECK(fabsf(extra - (2.0f * 5.0f / 60.0f - 1.0f)) < 1e-6f, "obs[extra] = 2x/W - 1 (%.4f)", extra);
     dict_clear(&kw);
 }
@@ -462,8 +520,8 @@ static void test_commons(void) {
         puf_step(env);
     }
     CHECK(env->food_active == 16, "no regrowth at the critical stock (S %d)", env->food_active);
-    CHECK(fabsf(env->agents[0].observations[OBS_SIZE - 7] - 0.25f) < 1e-6f, "obs[extra] = S / K (%.3f)",
-        env->agents[0].observations[OBS_SIZE - 7]);
+    CHECK(fabsf(env->agents[0].observations[OBS_BASE_SIZE - 7] - 0.25f) < 1e-6f, "obs[extra] = S / K (%.3f)",
+        env->agents[0].observations[OBS_BASE_SIZE - 7]);
     // Above it the stock grows toward K, with new pellets anywhere in the arena.
     env->food[16].active = true;
     env->food_active = 17;
@@ -606,7 +664,7 @@ static void test_baseline(void) {
         puf_step(env);
     }
     CHECK(env->episode >= 1, "baseline episode terminates (episode %d)", env->episode);
-    CHECK(env->agents[0].observations[OBS_SIZE - 7] == 0.0f, "obs[extra] is the constant 0 in baseline mode");
+    CHECK(env->agents[0].observations[OBS_BASE_SIZE - 7] == 0.0f, "obs[extra] is the constant 0 in baseline mode");
     dict_clear(&kw);
 }
 
@@ -712,9 +770,10 @@ static void test_ah_layout(void) {
     const int stride = OBS_SIZE + 8;
     Harness h = make_ex(&kw, AH_FISH, stride);
     Env* env = h.env;
-    CHECK(OBS_SIZE == 71 + 13 * (MAX_AGENTS - 1) && OBS_META_START == 60 + 12 * (MAX_AGENTS - 1),
-        "OBS_SIZE = 71 + 13 (MAX_AGENTS - 1) = %d; metadata starts at %d, last action at %d, extra at %d",
-        OBS_SIZE, OBS_META_START, OBS_ACT_START, OBS_EXTRA);
+    CHECK(OBS_BASE_SIZE == 71 + 13 * (MAX_AGENTS - 1) && OBS_META_START == 60 + 12 * (MAX_AGENTS - 1)
+        && OBS_SIZE == OBS_BASE_SIZE + INST_OBS_EXTRA,
+        "OBS_BASE_SIZE = 71 + 13 (MAX_AGENTS - 1) = %d (+ %d institution slots = %d); metadata starts at %d, last action at %d, extra at %d",
+        OBS_BASE_SIZE, INST_OBS_EXTRA, OBS_SIZE, OBS_META_START, OBS_ACT_START, OBS_EXTRA);
     // every row writes exactly OBS_SIZE floats: sentinel fill, 8 guard words after each row
     for (int k = 0; k < AH_FISH * stride; k++) {
         h.obs[k] = -777.0f;
@@ -1631,6 +1690,546 @@ static void test_ah_trace(void) {
     dict_clear(&kw);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Institutions (docs/institutions-plan.md section 4), U13-U22. Need the -DWEF_INST build; AH
+// scenes use kw_inst_ah with ripening off (kw_ah) and the rule pinned to A, 60 x 40 arena
+// (kw_base) so the beacon sits at (30, 20); taste A in slots < AH_FISH / 2.
+#ifdef WEF_INST
+#define INST_OTHER_SLOT(i, other) (OBS_INST_OTHERS + ((other) < (i) ? (other) : (other) - 1))
+
+static void kw_inst_test(Dict* kw, int num_fish, int fixed_type) {
+    kw_ah(kw, num_fish, num_fish / 2);
+    dict_set(kw, "min_arena_width", 60);   // kw_allelo set 40 x 40; the scenes assume the beacon at (30, 20)
+    dict_set(kw, "max_arena_width", 60);
+    dict_set(kw, "min_arena_height", 40);
+    dict_set(kw, "max_arena_height", 40);
+    dict_set(kw, "plant_mode", 2);
+    kw_inst(kw);
+    dict_set(kw, "inst_fixed_type", fixed_type);
+}
+
+// U13: layout, sentinel fill, slots at inst_obs 0 / 1.
+static void test_inst_layout(void) {
+    printf("-- INST U13: institution slots (OBS_SIZE %d = %d + %d)\n", OBS_SIZE, OBS_BASE_SIZE, INST_OBS_EXTRA);
+    CHECK(INST_OBS_EXTRA == 2 + (MAX_AGENTS - 1) && OBS_SIZE == OBS_BASE_SIZE + INST_OBS_EXTRA,
+        "the institution build appends 2 + (MAX_AGENTS - 1) = %d slots", INST_OBS_EXTRA);
+    Dict kw = {0};
+    kw_inst_test(&kw, AH_FISH, 0);
+    const int stride = OBS_SIZE + 8;
+    Harness h = make_ex(&kw, AH_FISH, stride);
+    Env* env = h.env;
+    for (int k = 0; k < AH_FISH * stride; k++) {
+        h.obs[k] = -777.0f;
+    }
+    compute_observations(env);
+    int unwritten = 0;
+    int overrun = 0;
+    for (int i = 0; i < AH_FISH; i++) {
+        for (int k = 0; k < OBS_SIZE; k++) {
+            unwritten += h.obs[i * stride + k] == -777.0f;
+        }
+        for (int k = OBS_SIZE; k < stride; k++) {
+            overrun += h.obs[i * stride + k] != -777.0f;
+        }
+    }
+    CHECK(unwritten == 0 && overrun == 0, "every row writes exactly %d floats (%d unwritten, %d guard words touched)",
+        OBS_SIZE, unwritten, overrun);
+    bool zero = true;
+    for (int i = 0; i < AH_FISH; i++) {
+        for (int k = OBS_BASE_SIZE; k < OBS_SIZE; k++) {
+            zero = zero && h.obs[i * stride + k] == 0.0f;
+        }
+    }
+    CHECK(zero, "before any fish has read the beacon or been marked, all institution slots read 0");
+    CHECK(env->inst_pos.x == 30.0f && env->inst_pos.y == 20.0f && env->inst_type == 0 && env->inst_type_reset == 0,
+        "beacon at the arena centre (%.1f, %.1f), rule pinned to A (inst_type %d)", env->inst_pos.x, env->inst_pos.y, env->inst_type);
+    destroy(&h);
+    // inst_obs 0 on this build: no beacon in the field, slots stay 0, inst_mode must be 0
+    dict_set(&kw, "inst_obs", 0);
+    dict_set(&kw, "inst_mode", 0);
+    Harness h0 = make_ex(&kw, AH_FISH, stride);
+    clear_objects(h0.env);
+    ah_park(&h0, 0);
+    place_fish(h0.env, 0, 22.0f, 20.0f, 0.0f);  // 8 cm from the (absent) beacon
+    compute_observations(h0.env);
+    bool zero0 = true;
+    for (int k = OBS_BASE_SIZE; k < OBS_SIZE; k++) {
+        zero0 = zero0 && h0.obs[k] == 0.0f;
+    }
+    CHECK(zero0 && morm_peak(h0.env) == 0.0f, "inst_obs 0: institution slots 0 and nothing at the centre to sense (peak %.3f)",
+        morm_peak(h0.env));
+    destroy(&h0);
+    dict_clear(&kw);
+}
+
+// U14: reading the beacon, the latch, discovery counters.
+static void test_inst_read(void) {
+    printf("-- INST U14: beacon read, latch, discovery\n");
+    for (int latch = 1; latch >= 0; latch--) {
+        for (int fixed = 0; fixed <= 1; fixed++) {
+            Dict kw = {0};
+            kw_inst_test(&kw, AH_FISH, fixed);
+            dict_set(&kw, "inst_latch", latch);
+            Harness h = make(&kw, AH_FISH);
+            Env* env = h.env;
+            clear_objects(env);
+            ah_park(&h, 0);
+            place_fish(env, 0, 30.0f + 4.0f, 20.0f, 0.0f);   // 4 cm from the beacon: inside inst_read_cm 5
+            ah_still(&h, 0);
+            puf_step(env);
+            obs_t* o0 = env->agents[0].observations;
+            float want = fixed == 0 ? 1.0f : -1.0f;
+            CHECK(o0[OBS_INST_RULE] == want && env->fish[0].informed && env->fish[0].first_visit_tick == 1
+                && env->fish[0].visits == 1 && !env->fish[1].informed && env->agents[1].observations[OBS_INST_RULE] == 0.0f,
+                "latch %d, rule %c: fish inside 5 cm reads %+.0f at tick 1 (informed, first_visit 1, visits 1); a parked fish reads 0",
+                latch, fixed == 0 ? 'A' : 'B', o0[OBS_INST_RULE]);
+            place_fish(env, 0, 10.0f, 20.0f, 0.0f);          // 20 cm away
+            puf_step(env);
+            CHECK(o0[OBS_INST_RULE] == (latch ? want : 0.0f) && env->fish[0].visits == 1,
+                "latch %d: 20 cm away the slot reads %+.0f (%s)", latch, o0[OBS_INST_RULE],
+                latch ? "kept" : "cleared");
+            place_fish(env, 0, 30.0f, 20.0f + 5.2f, 0.0f);   // 5.2 cm: just outside
+            puf_step(env);
+            CHECK(env->fish[0].visits == 1, "5.2 cm from the beacon is outside inst_read_cm 5 (visits %d)", env->fish[0].visits);
+            destroy(&h);
+            dict_clear(&kw);
+        }
+    }
+}
+
+// U15: the rule is drawn per episode (mode 1), per fish (mode 2), and flips on schedule (mode 3).
+static void test_inst_rule_draws(void) {
+    printf("-- INST U15: rule draws per episode / per fish / spurious flips\n");
+    Dict kw = {0};
+    kw_inst_test(&kw, AH_FISH, -1);
+    Harness h = make(&kw, AH_FISH);
+    Env* env = h.env;
+    int n_a = 0;
+    int same_within = 0;
+    for (int e = 0; e < 200; e++) {
+        puf_reset(env);
+        n_a += env->inst_type == 0;
+        same_within += env->inst_type == env->inst_type_reset;
+    }
+    CHECK(n_a > 70 && n_a < 130 && same_within == 200, "mode 1, inst_fixed_type -1: A prescribed in %d of 200 episodes (p 1/2)", n_a);
+    destroy(&h);
+    dict_set(&kw, "inst_mode", 2);
+    Harness h2 = make(&kw, AH_FISH);
+    env = h2.env;
+    int differ = 0;
+    int reads_ok = 0;
+    for (int e = 0; e < 200; e++) {
+        puf_reset(env);
+        differ += env->fish[0].inst_private != env->fish[1].inst_private;
+        clear_objects(env);
+        ah_park(&h2, 0);
+        place_fish(env, 0, 32.0f, 20.0f, 0.0f);
+        place_fish(env, 1, 28.0f, 20.0f, 3.1416f);
+        ah_still(&h2, 0);
+        ah_still(&h2, 1);
+        puf_step(env);
+        float r0 = env->agents[0].observations[OBS_INST_RULE];
+        float r1 = env->agents[1].observations[OBS_INST_RULE];
+        reads_ok += r0 == (env->fish[0].inst_private == 0 ? 1.0f : -1.0f)
+            && r1 == (env->fish[1].inst_private == 0 ? 1.0f : -1.0f);
+    }
+    CHECK(differ > 70 && differ < 130 && reads_ok == 200,
+        "mode 2: fish 0 and 1 draw different private rules in %d of 200 episodes; each reads its own at the beacon (%d / 200)",
+        differ, reads_ok);
+    destroy(&h2);
+    dict_set(&kw, "inst_mode", 3);
+    dict_set(&kw, "inst_flip_steps", 16);
+    dict_set(&kw, "inst_fixed_type", 0);
+    Harness h3 = make(&kw, AH_FISH);
+    env = h3.env;
+    clear_objects(env);
+    ah_park(&h3, 0);
+    int flips = 0;
+    int prev = env->inst_type;
+    for (int t = 0; t < 64; t++) {
+        puf_step(env);
+        flips += env->inst_type != prev;
+        prev = env->inst_type;
+    }
+    CHECK(flips == 4 && env->inst_type == 0, "mode 3, inst_flip_steps 16: the prescription flipped %d times in 64 steps (A B A B A)", flips);
+    destroy(&h3);
+    dict_clear(&kw);
+}
+
+// U16: violations, marks, the others' mark slots, decay; compliance bookkeeping.
+static void test_inst_marks(void) {
+    printf("-- INST U16: violations and marks (AH, rule A)\n");
+    Dict kw = {0};
+    kw_inst_test(&kw, AH_FISH, 0);
+    Harness h = make(&kw, AH_FISH);
+    Env* env = h.env;
+    clear_objects(env);
+    ah_park(&h, 0);
+    int b = AH_FISH / 2;   // first B-tasting fish
+    // B fish at (10, 20) heading +x with an unripe A bush 2 cm ahead: plant_mode 2 plants B = a violation
+    ah_bush(env, 0, 12.0f, 20.0f, 0, false);
+    // A fish at (10, 30) heading +x with an unripe B bush ahead: plants A = compliant
+    ah_bush(env, 1, 12.0f, 30.0f, 1, false);
+    ah_recount(env);
+    place_fish(env, b, 10.0f, 20.0f, 0.0f);
+    place_fish(env, 0, 10.0f, 30.0f, 0.0f);
+    place_fish(env, 1, 10.0f, 24.0f, 1.5708f);   // 4 cm from the B fish, heading +y: detects it, bites nothing
+    set_action(&h, b, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    ah_still(&h, 1);
+    puf_step(env);
+    FishAgent* fb = &env->fish[b];
+    FishAgent* fa = &env->fish[0];
+    CHECK(env->food[0].type == 1 && env->food[1].type == 0 && env->plantings == 2,
+        "both planted (bush 0 -> B, bush 1 -> A)");
+    CHECK(fb->violations == 1 && fb->rule_acts == 1 && fb->comply_acts == 0 && fb->mark == 63 && fb->trace_violated
+        && env->violations == 1 && env->plantings_np == 1,
+        "the B fish broke the rule: violations 1, mark %d (64 - 1 after the decrement), plantings_np 1", fb->mark);
+    CHECK(fa->violations == 0 && fa->rule_acts == 1 && fa->comply_acts == 1 && fa->mark == 0 && !fa->trace_violated
+        && env->plantings_p == 1,
+        "the A fish followed it: comply_acts 1, no mark, plantings_p 1");
+    obs_t* ob = env->agents[b].observations;
+    obs_t* o1 = env->agents[1].observations;
+    CHECK(ob[OBS_INST_MARK] == 63.0f / 64.0f && o1[INST_OTHER_SLOT(1, b)] == 63.0f / 64.0f
+        && o1[INST_OTHER_SLOT(1, 0)] == 0.0f && env->agents[0].observations[OBS_INST_MARK] == 0.0f,
+        "own-mark slot 63/64 on the violator; fish 1 (4 cm away, detecting it) sees 63/64 in its slot for fish %d and 0 for the A fish", b);
+    CHECK(env->marked_steps == 1 && env->pair_marked_steps >= 1 && env->pair_steps >= 2,
+        "accumulators: marked_steps 1, pairs within 10 cm counted (%d, %d marked)", env->pair_steps, env->pair_marked_steps);
+    ah_still(&h, b);
+    ah_still(&h, 0);
+    for (int t = 0; t < 62; t++) {
+        puf_step(env);
+    }
+    CHECK(fb->mark == 1 && ob[OBS_INST_MARK] == 1.0f / 64.0f, "mark counts down (1 left after 63 steps)");
+    puf_step(env);
+    CHECK(fb->mark == 0 && ob[OBS_INST_MARK] == 0.0f && o1[INST_OTHER_SLOT(1, b)] == 0.0f, "and expires: every mark slot 0 again");
+    // a second violation refreshes the mark
+    ah_bush(env, 2, 12.0f, 20.0f, 0, false);
+    ah_recount(env);
+    fb->bite_cooldown = 0;
+    fb->eat_cooldown = 0;
+    set_action(&h, b, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    puf_step(env);
+    CHECK(fb->mark == 63 && fb->violations == 2 && env->violations == 2, "a second violation re-marks (mark %d, violations 2)", fb->mark);
+    destroy(&h);
+    dict_clear(&kw);
+}
+
+// U17: zapping a marked fish is cheap (base cooldown) and, with a bounty, paid; an unmarked one costs zap_cooldown_steps.
+static void test_inst_zap_cost(void) {
+    printf("-- INST U17: zap cost on marked vs unmarked victims\n");
+    for (int bounty = 0; bounty <= 1; bounty++) {
+        Dict kw = {0};
+        kw_inst_test(&kw, AH_FISH, 0);
+        dict_set(&kw, "mark_zap_reward", bounty ? 0.25 : 0.0);
+        Harness h = make(&kw, AH_FISH);
+        Env* env = h.env;
+        clear_objects(env);
+        ah_park(&h, 0);
+        int b = AH_FISH / 2;                          // first B fish (2 at 4 fish, 4 at 8)
+        int c = b + 1;                                // second B fish
+        env->fish[b].mark = 40;                       // a marked B fish
+        place_fish(env, b, 12.0f, 20.0f, 0.0f);
+        place_fish(env, 0, 9.5f, 20.0f, 0.0f);        // A fish 2.5 cm behind it (in the bite cone, no body contact)
+        place_fish(env, c, 12.0f, 30.0f, 0.0f);       // an unmarked B fish ...
+        place_fish(env, 1, 9.5f, 30.0f, 0.0f);        // ... zapped by this A fish
+        set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+        set_action(&h, 1, -8.0f, 0.0f, 1.0f, AH_UPPER);
+        puf_step(env);
+        CHECK(env->fish[0].bite_victim == b && env->fish[1].bite_victim == c && env->bites == 2,
+            "bounty %d: both zaps landed (victims %d and %d)", bounty, env->fish[0].bite_victim, env->fish[1].bite_victim);
+        CHECK(env->fish[0].bite_cooldown == BITE_COOLDOWN_STEPS - 1 && env->fish[1].bite_cooldown == 24,
+            "marked victim: attacker cooldown %d (base 5 - 1); unmarked: %d (zap_cooldown_steps 25 - 1)",
+            env->fish[0].bite_cooldown, env->fish[1].bite_cooldown);
+        CHECK(env->zaps_on_marked == 1 && env->fish[0].trace_zap_marked && !env->fish[1].trace_zap_marked
+            && fabsf(env->bounty_sum - (bounty ? 0.25f : 0.0f)) < 1e-6f,
+            "zaps_on_marked 1 (trace flag on the right attacker), bounty paid %.2f", env->bounty_sum);
+        CHECK(fabsf(h.rew[0] - (bounty ? 0.25f : 0.0f)) < 1e-6f && h.rew[1] == 0.0f,
+            "attacker reward %.2f (bite_reward 0 in the AH preset + bounty), the other attacker 0", h.rew[0]);
+        CHECK(env->fish[b].freeze == 24 && env->fish[c].freeze == 24, "both victims frozen 25 (24 after the decrement)");
+        destroy(&h);
+        dict_clear(&kw);
+    }
+}
+
+// U18: the Commons season rule (public flag with hysteresis), eating while closed, the private threshold, the random toggle.
+static void test_inst_commons(void) {
+    printf("-- INST U18: Commons season rule\n");
+    Dict kw = {0};
+    kw_base(&kw, 4);
+    dict_set(&kw, "regrow_mode", 3);          // seasonal with no season end inside the test: regrows, no growth
+    dict_set(&kw, "season_steps", 100000);
+    dict_set(&kw, "regrow_allee", 0.1);
+    dict_set(&kw, "size_min", 0.5);
+    dict_set(&kw, "size_max", 0.5);
+    dict_set(&kw, "proximity_shaping", 0);
+    dict_set(&kw, "obs_extra", 3);
+    kw_inst(&kw);
+    Harness h = make(&kw, 4);
+    Env* env = h.env;
+    CHECK(env->inst_type == 0 && env->inst_pos.x == 30.0f && env->inst_pos.y == 20.0f, "reset: 64 of 64 pellets, season open");
+    clear_objects(env);
+    ah_park(&h, 0);
+    // stock 32 (<= 0.5 K): closes at the end of the step
+    for (int f = 0; f < 32; f++) {
+        env->food[f] = (FishFood){.pos = {50.0f + (float)(f % 8), 2.0f + (float)(f / 8)}, .active = true};
+    }
+    env->food_active = 32;
+    puf_step(env);
+    CHECK(env->inst_type == 1 && env->closed_steps == 1, "S = 32 <= theta K: the season closes (closed_steps %d)", env->closed_steps);
+    place_fish(env, 0, 32.0f, 20.0f, 0.0f);   // at the beacon
+    puf_step(env);
+    CHECK(env->agents[0].observations[OBS_INST_RULE] == 1.0f && env->fish[0].informed, "a fish at the beacon reads +1 (closed)");
+    // eating while closed: a pellet 2 cm ahead of fish 1
+    env->food[40] = (FishFood){.pos = {11.5f, 30.0f}, .active = true};
+    env->food_active = 33;
+    place_fish(env, 1, 10.0f, 30.0f, 0.0f);
+    ah_still(&h, 1);
+    puf_step(env);
+    CHECK(env->fish[1].ate && env->eats_closed == 1 && env->violations == 1 && env->fish[1].mark == 63
+        && env->fish[1].rule_acts == 1 && env->fish[1].comply_acts == 0,
+        "eating while closed: eats_closed 1, violation, mark %d", env->fish[1].mark);
+    // stock back above (theta + hyst) K = 38.4 -> reopens; 38 does not
+    for (int f = 32; f < 38; f++) {
+        env->food[f] = (FishFood){.pos = {50.0f + (float)(f % 8), 12.0f + (float)(f / 8)}, .active = true};
+    }
+    env->food_active = 38;
+    puf_step(env);
+    CHECK(env->inst_type == 1, "S = 38 <= (theta + hyst) K = 38.4: still closed (hysteresis)");
+    env->food[38] = (FishFood){.pos = {60.0f, 30.0f}, .active = true};
+    env->food_active = 39;
+    puf_step(env);
+    CHECK(env->inst_type == 0, "S = 39 > 38.4: reopens");
+    env->food[41] = (FishFood){.pos = {11.5f, 10.0f}, .active = true};
+    env->food_active = 40;
+    place_fish(env, 2, 10.0f, 10.0f, 0.0f);
+    ah_still(&h, 2);
+    puf_step(env);
+    CHECK(env->fish[2].ate && env->eats_closed == 1 && env->fish[2].comply_acts == 1 && env->fish[2].mark == 0,
+        "eating while open is compliant (no mark)");
+    destroy(&h);
+    // mode 2: private thresholds around inst_theta, violation judged against the fish's own
+    dict_set(&kw, "inst_mode", 2);
+    Harness h2 = make(&kw, 4);
+    env = h2.env;
+    bool in_band = true;
+    float lo = 1.0f;
+    float hi = 0.0f;
+    for (int e = 0; e < 50; e++) {
+        puf_reset(env);
+        for (int i = 0; i < 4; i++) {
+            float th = env->fish[i].inst_private_theta;
+            in_band = in_band && th >= 0.25f - 1e-6f && th <= 0.75f + 1e-6f;
+            lo = th < lo ? th : lo;
+            hi = th > hi ? th : hi;
+        }
+    }
+    CHECK(in_band && hi - lo > 0.3f, "mode 2: private thresholds in [0.25, 0.75] (seen %.2f .. %.2f)", lo, hi);
+    destroy(&h2);
+    // mode 3: random toggles with mean block 8
+    dict_set(&kw, "inst_mode", 3);
+    dict_set(&kw, "inst_flip_steps", 8);
+    Harness h3 = make(&kw, 4);
+    env = h3.env;
+    clear_objects(env);
+    ah_park(&h3, 0);
+    int toggles = 0;
+    int prev = env->inst_type;
+    for (int t = 0; t < 800; t++) {
+        puf_step(env);
+        toggles += env->inst_type != prev;
+        prev = env->inst_type;
+    }
+    CHECK(toggles > 60 && toggles < 140, "mode 3, inst_flip_steps 8: %d toggles in 800 steps (expect ~100)", toggles);
+    destroy(&h3);
+    dict_clear(&kw);
+}
+
+// U19: the beacon is sensed like a waste item (conductor, within 10 cm), in the control arm too.
+static void test_inst_sensing(void) {
+    printf("-- INST U19: beacon sensing\n");
+    for (int mode = 1; mode >= 0; mode--) {
+        Dict kw = {0};
+        kw_inst_test(&kw, AH_FISH, 0);
+        dict_set(&kw, "inst_mode", mode);
+        Harness h = make(&kw, AH_FISH);
+        Env* env = h.env;
+        clear_objects(env);
+        ah_park(&h, 0);
+        place_fish(env, 0, 22.0f, 20.0f, 0.0f);    // 8 cm from the beacon, heading at it
+        compute_observations(env);
+        float p8 = morm_peak(env);
+        place_fish(env, 0, 18.0f, 20.0f, 0.0f);    // 12 cm
+        compute_observations(env);
+        float p12 = morm_peak(env);
+        place_fish(env, 0, 10.0f, 10.0f, 0.0f);    // away from the beacon: a ripe A bush 4 cm ahead for the sign
+        ah_bush(env, 0, 14.0f, 10.0f, 0, true);
+        ah_recount(env);
+        compute_observations(env);
+        float pa = morm_peak(env);
+        CHECK(fabsf(p8) > 0.0f && p12 == 0.0f, "inst_mode %d: beacon sensed at 8 cm (peak %.3f), not at 12 cm (%.3f)", mode, p8, p12);
+        CHECK(p8 * pa < 0.0f, "the beacon (contrast +1) reads with the waste sign, opposite to a type-A bush (%+.3f vs %+.3f)", p8, pa);
+        destroy(&h);
+        dict_clear(&kw);
+    }
+}
+
+// U20: the Log after one short episode.
+static void test_inst_log(void) {
+    printf("-- INST U20: episode Log\n");
+    Dict kw = {0};
+    kw_inst_test(&kw, 2, 0);          // fish 0 A, fish 1 B; rule A
+    dict_set(&kw, "episode_length", 64);
+    Harness h = make(&kw, 2);
+    Env* env = h.env;
+    clear_objects(env);
+    for (int f = 2; f < env->num_food; f++) {
+        ah_bush(env, f, 40.0f + (float)((f - 2) % 9), 30.0f + (float)((f - 2) / 9), f % 2, false);  // far grid, 31 A / 31 B
+    }
+    ah_bush(env, 0, 12.0f, 20.0f, 0, false);     // unripe A ahead of the B fish: it plants B (violation)
+    ah_bush(env, 1, 12.0f, 10.0f, 1, false);
+    ah_recount(env);
+    place_fish(env, 1, 10.0f, 20.0f, 0.0f);
+    place_fish(env, 0, 7.5f, 20.0f, 0.0f);       // 2.5 cm behind: zaps it at tick 2
+    set_action(&h, 1, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    ah_still(&h, 0);
+    puf_step(env);                               // tick 1: violation, mark 64
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    ah_still(&h, 1);
+    puf_step(env);                               // tick 2: the A fish zaps the marked B fish
+    ah_still(&h, 0);
+    CHECK(env->violations == 1 && env->zaps_on_marked == 1 && env->fish[1].freeze == 55,
+        "scene: 1 violation, 1 zap on the marked fish (freeze %d = 25 + the 31-step hold left, - 1)", env->fish[1].freeze);
+    place_fish(env, 0, 32.0f, 20.0f, 0.0f);      // the A fish reads the beacon from tick 3 on
+    while (env->episode == 0) {
+        puf_step(env);
+    }
+    Log* l = &env->log;
+    CHECK(l->n == 1.0f && l->violations == 1.0f && l->plantings_np == 1.0f && l->plantings_p == 0.0f && l->inst_type_a == 1.0f,
+        "violations 1, plantings_np 1, plantings_p 0, inst_type_a 1");
+    CHECK(l->comply_frac == 0.0f && l->comply_informed == 1.0f,
+        "comply_frac 0 (the only act broke the rule); comply_informed 1 (the informed fish made no act: counts as compliant)");
+    CHECK(l->zaps_on_marked == 1.0f && l->zaps_on_marked_share == 1.0f && l->bites == 1.0f,
+        "zaps_on_marked 1 of 1 bite (share 1)");
+    CHECK(fabsf(l->marked_frac - 64.0f / 128.0f) < 1e-6f, "marked_frac = 64 marked fish-steps / 128 (counted before the decrement; %.4f)", l->marked_frac);
+    CHECK(fabsf(l->inst_agree_final - 31.0f / 64.0f) < 1e-6f && l->inst_agree_mean > 0.47f && l->inst_agree_mean < 0.5f,
+        "inst_agree_final 31/64 (%.4f), inst_agree_mean %.4f", l->inst_agree_final, l->inst_agree_mean);
+    CHECK(l->informed_frac == 0.5f && fabsf(l->beacon_first_visit - 0.5f * (3.0f / 64.0f + 1.0f)) < 1e-5f
+        && fabsf(l->beacon_visits - 62.0f / 2.0f) < 1e-5f && l->informed_mean > 0.47f && l->informed_mean < 0.49f,
+        "informed_frac 1/2, beacon_first_visit (3/64 + 1)/2 (%.4f), beacon_visits 62/2 (%.1f), informed_mean %.4f",
+        l->beacon_first_visit, l->beacon_visits, l->informed_mean);
+    CHECK(l->marked_exposure > 0.0f && l->marked_exposure < 1.0f && l->mark_zap_bounty == 0.0f && l->closed_frac == 0.0f && l->eats_closed == 0.0f,
+        "marked_exposure in (0, 1) (%.3f), bounty 0, Commons keys 0", l->marked_exposure);
+    destroy(&h);
+    dict_clear(&kw);
+}
+
+// U21: the V4 trace row.
+static void test_inst_trace(void) {
+    const char* dir = getenv("WEF_TEST_TRACE_DIR");
+    CHECK(sizeof(WefTraceRowV4) == sizeof(WefTraceRowV3) + 6 * sizeof(int32_t), "WefTraceRowV4 = V3 row + 6 int32 (%zu bytes)", sizeof(WefTraceRowV4));
+    if (dir == NULL || dir[0] == '\0') {
+        printf("-- INST U21: trace skipped (set WEF_TEST_TRACE_DIR)\n");
+        return;
+    }
+    printf("-- INST U21: V4 trace rows\n");
+    setenv("WEF_TRACE_DIR", dir, 1);
+    Dict kw = {0};
+    kw_inst_test(&kw, 2, 0);
+    dict_set(&kw, "episode_length", 8);
+    g_seed = 11;
+    Harness h = make(&kw, 2);
+    unsetenv("WEF_TRACE_DIR");
+    g_seed = 7;
+    Env* env = h.env;
+    clear_objects(env);
+    for (int f = 2; f < env->num_food; f++) {
+        ah_bush(env, f, 40.0f + (float)((f - 2) % 9), 30.0f + (float)((f - 2) / 9), 0, false);
+    }
+    ah_bush(env, 0, 12.0f, 20.0f, 0, false);
+    ah_recount(env);
+    place_fish(env, 1, 10.0f, 20.0f, 0.0f);      // B fish plants B at tick 1 (violation)
+    place_fish(env, 0, 32.0f, 20.0f, 0.0f);      // A fish at the beacon
+    set_action(&h, 1, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    ah_still(&h, 0);
+    puf_step(env);
+    ah_still(&h, 1);
+    while (env->episode == 0) {
+        puf_step(env);
+    }
+    destroy(&h);
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/env_%05d.v4.bin", dir, 11);
+    FILE* fp = fopen(path, "rb");
+    CHECK(fp != NULL, "trace file %s exists (.v4.bin suffix under inst_obs)", path);
+    if (fp != NULL) {
+        WefTraceRowV4 rows[16];
+        size_t nr = fread(rows, sizeof(WefTraceRowV4), 16, fp);
+        int extra = fgetc(fp);
+        fclose(fp);
+        CHECK(nr == 16 && extra == EOF, "8 ticks x 2 fish = 16 V4 rows (%zu read)", nr);
+        if (nr == 16) {
+            CHECK(rows[0].agent == 0 && rows[0].inst_signal == 1 && rows[0].informed == 1 && rows[0].mark == 0 && rows[0].inst_type == 0,
+                "tick 1, A fish: inst_signal +1 (read at the beacon), informed, no mark, public rule A");
+            CHECK(rows[1].agent == 1 && rows[1].violated == 1 && rows[1].mark == 63 && rows[1].inst_signal == 0 && rows[1].informed == 0
+                && rows[1].plant_type == 2 && rows[1].taste == 1,
+                "tick 1, B fish: violated, mark 63, never read (signal 0), plant_type B");
+            CHECK(rows[3].violated == 0 && rows[3].mark == 62 && rows[15].mark == 56, "mark counts down across the rows (62 at tick 2, 56 at tick 8)");
+        }
+    }
+    dict_clear(&kw);
+}
+
+// U22: the scripted complier / enforcer roles reach the beacon, read it, and the enforcer zaps a marked fish.
+static void test_inst_roles(void) {
+    printf("-- INST U22: complier / enforcer roles\n");
+    Dict kw = {0};
+    kw_inst_test(&kw, AH_FISH, 0);
+    dict_set(&kw, "bot_oracle", 1);
+    puf_ini_set(&kw, "roles", AH_FISH >= 8 ? "13,14,13,14,13,14,13,14" : "13,14,13,14");
+    Harness h = make(&kw, AH_FISH);
+    Env* env = h.env;
+    for (int t = 0; t < 400; t++) {
+        puf_step(env);
+    }
+    int informed = 0;
+    for (int i = 0; i < AH_FISH; i++) {
+        informed += env->fish[i].informed;
+    }
+    CHECK(informed == AH_FISH, "all %d scripted fish found and read the beacon within 400 steps (%d informed)", AH_FISH, informed);
+    // the B compliers (taste != rule A) free-ride: no plantings by them; A compliers plant A
+    CHECK(env->plantings_np == 0 && env->violations == 0, "no complier broke the rule (plantings_np %d)", env->plantings_np);
+    // mark a B fish by hand and see an enforcer zap it
+    int b = AH_FISH / 2;
+    env->fish[b].mark = 64;
+    int zaps0 = env->zaps_on_marked;
+    for (int t = 0; t < 300 && env->zaps_on_marked == zaps0; t++) {
+        env->fish[b].mark = 64;   // keep it marked until caught
+        puf_step(env);
+    }
+    CHECK(env->zaps_on_marked > zaps0, "an enforcer zapped the marked fish within 300 steps (zaps_on_marked %d)", env->zaps_on_marked);
+    destroy(&h);
+    dict_clear(&kw);
+}
+
+static void test_inst(void) {
+    test_inst_layout();
+    test_inst_read();
+    test_inst_rule_draws();
+    test_inst_marks();
+    test_inst_zap_cost();
+    test_inst_commons();
+    test_inst_sensing();
+    test_inst_log();
+    test_inst_trace();
+    test_inst_roles();
+}
+#else
+static void test_inst(void) {
+    printf("-- INST U13-U22: skipped (needs the -DWEF_INST build)\n");
+}
+#endif
+
 // Calibration mode (E1): all fish scripted, so the whole thing runs on the CPU.
 //   wef_test roles=3,3,2,2 [episodes=100] [oracle=0] [preset=harvest|allelo] [shape=conv] [num_agents=N] [key=value ...]
 // Prints per-slot pellets / cleans / strip time per episode and episode-level
@@ -1640,17 +2239,27 @@ static int run_calibration(int argc, char** argv) {
     kw_base(&kw, 4);
     bool harvest = false;
     bool allelo = false;
+    bool inst_ah = false;
+    bool inst_commons = false;
     bool conv = false;
     for (int a = 1; a < argc; a++) {
         if (strcmp(argv[a], "preset=harvest") == 0) {
             harvest = true;
         } else if (strcmp(argv[a], "preset=allelo") == 0) {
             allelo = true;
+        } else if (strcmp(argv[a], "preset=inst_ah") == 0) {
+            inst_ah = true;
+        } else if (strcmp(argv[a], "preset=inst_commons") == 0) {
+            inst_commons = true;
         } else if (strcmp(argv[a], "shape=conv") == 0) {
             conv = true;
         }
     }
-    if (allelo) {
+    if (inst_ah) {
+        kw_inst_ah(&kw);
+    } else if (inst_commons) {
+        kw_inst_commons(&kw);
+    } else if (allelo) {
         kw_allelo(&kw);
         if (conv) {
             kw_allelo_conv(&kw);
@@ -1664,6 +2273,7 @@ static int run_calibration(int argc, char** argv) {
     const char* roles = "0,0,0,0";
     for (int a = 1; a < argc; a++) {
         if (strcmp(argv[a], "preset=harvest") == 0 || strcmp(argv[a], "preset=allelo") == 0
+                || strcmp(argv[a], "preset=inst_ah") == 0 || strcmp(argv[a], "preset=inst_commons") == 0
                 || strcmp(argv[a], "shape=conv") == 0) {
             continue;
         }
@@ -1721,6 +2331,18 @@ static int run_calibration(int argc, char** argv) {
     double n_ripe_mean = 0.0;
     double plant_noop_total = 0.0;
     double plant_attempts = 0.0;
+    double viol[MAX_AGENTS] = {0};        // institution: rule-breaking acts / zaps on marked fish per slot
+    double zap_mk[MAX_AGENTS] = {0};
+    double viol_step[MAX_AGENTS] = {0};
+    double zap_mk_step[MAX_AGENTS] = {0};
+    double inst_comply = 0.0;
+    double inst_informed = 0.0;
+    double inst_first_visit = 0.0;
+    double inst_marked = 0.0;
+    double inst_exposure = 0.0;
+    double inst_agree = 0.0;
+    double inst_closed = 0.0;
+    double inst_eats_closed = 0.0;
     double zaps_given_step[MAX_AGENTS] = {0};  // per-episode accumulators (reset each episode)
     double zaps_taken_step[MAX_AGENTS] = {0};
     double plant_a_step[MAX_AGENTS] = {0};
@@ -1731,6 +2353,8 @@ static int run_calibration(int argc, char** argv) {
         for (int i = 0; i < env->num_agents; i++) {
             zaps_given_step[i] = 0;
             zaps_taken_step[i] = 0;
+            viol_step[i] = 0;
+            zap_mk_step[i] = 0;
             plant_a_step[i] = 0;
             plant_b_step[i] = 0;
             noop_step[i] = 0;
@@ -1743,6 +2367,8 @@ static int run_calibration(int argc, char** argv) {
                     FishAgent* f = &env->fish[i];
                     zaps_given_step[i] += f->bite_victim >= 0;
                     zaps_taken_step[i] += f->was_bitten;
+                    viol_step[i] += f->trace_violated;
+                    zap_mk_step[i] += f->trace_zap_marked;
                     plant_a_step[i] += f->trace_plant_type == 1;
                     plant_b_step[i] += f->trace_plant_type == 2;
                     noop_step[i] += f->trace_plant_noop;  // per-fish same-type-only no-op flag (exact)
@@ -1776,6 +2402,27 @@ static int run_calibration(int argc, char** argv) {
                     noop[i] += noop_step[i];
                     zaps_given[i] += zaps_given_step[i];
                     zaps_taken[i] += zaps_taken_step[i];
+                    viol[i] += viol_step[i];
+                    zap_mk[i] += zap_mk_step[i];
+                }
+                if (env->inst_mode > 0 || env->inst_obs) {
+                    int comply = 0;
+                    int acts = 0;
+                    int informed = 0;
+                    for (int i = 0; i < env->num_agents; i++) {
+                        comply += env->fish[i].comply_acts;
+                        acts += env->fish[i].rule_acts;
+                        informed += env->fish[i].informed;
+                        inst_first_visit += (env->fish[i].informed
+                            ? (double)env->fish[i].first_visit_tick / env->cur_episode_length : 1.0) / env->num_agents;
+                    }
+                    inst_comply += acts > 0 ? (double)comply / acts : 1.0;
+                    inst_informed += (double)informed / env->num_agents;
+                    inst_marked += (double)env->marked_steps / ((double)env->cur_episode_length * env->num_agents);
+                    inst_exposure += env->pair_steps > 0 ? (double)env->pair_marked_steps / env->pair_steps : 0.0;
+                    inst_agree += env->allelo ? (double)env->n_type[env->inst_type] / env->num_food : 0.0;
+                    inst_closed += (double)env->closed_steps / env->cur_episode_length;
+                    inst_eats_closed += env->eats_closed;
                 }
                 int n_max = env->n_type[0] > env->n_type[1] ? env->n_type[0] : env->n_type[1];
                 mono_final += (double)n_max / env->num_food;
@@ -1794,25 +2441,38 @@ static int run_calibration(int argc, char** argv) {
     printf("  collective pellets/episode %.1f   waste_frac %.3f   open_frac %.3f   stock_left %.1f   collapsed %.2f   survival %.3f\n",
         collective / episodes, waste_frac / episodes, open_frac / episodes, stock_left / episodes,
         collapsed / episodes, survival / episodes);
+    if (env->inst_mode > 0 || env->inst_obs) {
+        double vsum = 0.0;
+        double zsum = 0.0;
+        for (int i = 0; i < env->num_agents; i++) {
+            vsum += viol[i];
+            zsum += zap_mk[i];
+        }
+        printf("  inst_mode %d   comply %.3f   informed %.3f   first_visit %.3f   violations %.1f   marked_frac %.3f   exposure %.3f   zaps_on_marked %.1f   agree_final %.3f   closed_frac %.3f   eats_closed %.1f\n",
+            env->inst_mode, inst_comply / episodes, inst_informed / episodes, inst_first_visit / episodes,
+            vsum / episodes, inst_marked / episodes, inst_exposure / episodes, zsum / episodes,
+            inst_agree / episodes, inst_closed / episodes, inst_eats_closed / episodes);
+    }
     if (env->allelo) {
         printf("  mono_final %.3f   mono_mean %.3f   t_conv %.3f   plantings %.1f   plant_proactive %.1f   plant_noop %.1f   plant_attempts %.1f   zaps_cross %.1f   zaps_same %.1f   n_ripe_mean %.2f\n",
             mono_final / episodes, mono_mean / episodes, t_conv / episodes, plantings / episodes,
             proactive / episodes, plant_noop_total / episodes, plant_attempts / episodes,
             zaps_cross / episodes, zaps_same / episodes, n_ripe_mean);
-        printf("  slot role taste pellets  return plant_a plant_b plant_noop zaps_given zaps_taken\n");
+        printf("  slot role taste pellets  return plant_a plant_b plant_noop zaps_given zaps_taken viol zap_mk\n");
         for (int i = 0; i < env->num_agents; i++) {
-            printf("  %4d %4d %5c %7.1f %7.2f %7.1f %7.1f %10.1f %10.1f %10.1f\n", i, env->roles[i],
+            printf("  %4d %4d %5c %7.1f %7.2f %7.1f %7.1f %10.1f %10.1f %10.1f %4.1f %6.1f\n", i, env->roles[i],
                 taste_of[i] == 0 ? 'A' : 'B', pellets[i] / episodes, ret[i] / episodes,
                 plant_a[i] / episodes, plant_b[i] / episodes, noop[i] / episodes,
-                zaps_given[i] / episodes, zaps_taken[i] / episodes);
+                zaps_given[i] / episodes, zaps_taken[i] / episodes, viol[i] / episodes, zap_mk[i] / episodes);
         }
     } else {
-        printf("  slot role pellets cleans strip%%  cleans/strip-step\n");
+        printf("  slot role pellets cleans strip%%  cleans/strip-step  return zaps_given zaps_taken viol zap_mk\n");
         for (int i = 0; i < env->num_agents; i++) {
             double strip_steps = strip[i] / episodes * env->episode_length;
-            printf("  %4d %4d %7.1f %6.1f %5.1f%%  %.3f\n", i, env->roles[i], pellets[i] / episodes,
+            printf("  %4d %4d %7.1f %6.1f %5.1f%%  %.3f %7.2f %10.1f %10.1f %4.1f %6.1f\n", i, env->roles[i], pellets[i] / episodes,
                 cleans[i] / episodes, 100.0 * strip[i] / episodes,
-                strip_steps > 0 ? cleans[i] / episodes / strip_steps : 0.0);
+                strip_steps > 0 ? cleans[i] / episodes / strip_steps : 0.0,
+                ret[i] / episodes, zaps_given[i] / episodes, zaps_taken[i] / episodes, viol[i] / episodes, zap_mk[i] / episodes);
         }
     }
     puf_close(env);
@@ -1870,6 +2530,14 @@ static int run_bench(int argc, char** argv) {
         }
         if (strcmp(argv[a], "preset=allelo") == 0) {
             kw_allelo(&kw);  // 8 fish: needs the -DMAX_AGENTS=8 build (num_agents=4 projects to 4)
+            continue;
+        }
+        if (strcmp(argv[a], "preset=inst_ah") == 0) {
+            kw_inst_ah(&kw);  // institution build
+            continue;
+        }
+        if (strcmp(argv[a], "preset=inst_commons") == 0) {
+            kw_inst_commons(&kw);
             continue;
         }
         if (strcmp(argv[a], "shape=conv") == 0) {
@@ -1954,7 +2622,7 @@ static int run_bench(int argc, char** argv) {
     if (project > 0) {
         printf("  proj_hash %016llx (%d-fish layout, %d slots + rewards)  rew_hash %016llx\n",
             (unsigned long long)proj_hash, project, 71 + 13 * (project - 1), (unsigned long long)rew_hash);
-        if (project == MAX_AGENTS && proj_hash != hash) {
+        if (project == MAX_AGENTS && INST_OBS_EXTRA == 0 && proj_hash != hash) {
             printf("  FAIL: the identity projection (K = MAX_AGENTS) must reproduce the full hash\n");
             return 1;
         }
@@ -2001,6 +2669,8 @@ int main(int argc, char** argv) {
     test_ah_confound();
     test_ah_taste();
     test_ah_trace();
+    // Institutions (docs/institutions-plan.md 4), U13-U22; U13' (projection identity) in run_test.sh
+    test_inst();
     printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
     return g_fail ? 1 : 0;
 }
