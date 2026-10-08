@@ -2216,6 +2216,134 @@ static void test_inst_roles(void) {
     dict_clear(&kw);
 }
 
+// U23 (phase 3, D11): inst_mark_until_zap: the mark does not count down and the sanction clears it.
+static void test_inst_mark_until_zap(void) {
+    printf("-- INST U23: persistent marks cleared by the sanction (inst_mark_until_zap)\n");
+    Dict kw = {0};
+    kw_inst_test(&kw, AH_FISH, 0);
+    dict_set(&kw, "inst_mark_until_zap", 1);
+    Harness h = make(&kw, AH_FISH);
+    Env* env = h.env;
+    clear_objects(env);
+    ah_park(&h, 0);
+    int b = AH_FISH / 2;
+    ah_bush(env, 0, 12.0f, 20.0f, 0, false);      // unripe A bush ahead of the B fish: it plants B (violation)
+    ah_recount(env);
+    place_fish(env, b, 10.0f, 20.0f, 0.0f);
+    set_action(&h, b, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    puf_step(env);
+    FishAgent* fb = &env->fish[b];
+    CHECK(fb->violations == 1 && fb->mark == 64, "violation marks 64 and nothing is decremented (mark %d)", fb->mark);
+    ah_still(&h, b);
+    for (int t = 0; t < 200; t++) {
+        puf_step(env);
+    }
+    CHECK(fb->mark == 64 && env->agents[b].observations[OBS_INST_MARK] == 1.0f,
+        "200 steps later still marked (mark %d, own slot %.2f)", fb->mark, env->agents[b].observations[OBS_INST_MARK]);
+    CHECK(env->marked_steps == 201, "marked_steps counts every step (%d)", env->marked_steps);
+    // an A fish 2.5 cm behind it zaps it: sanction received, mark cleared, zaps_on_marked 1
+    fb->eat_cooldown = 0;
+    fb->freeze = 0;
+    place_fish(env, 0, 7.5f, 20.0f, 0.0f);
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    puf_step(env);
+    CHECK(env->fish[0].bite_victim == b && env->zaps_on_marked == 1 && fb->zapped_marked == 1,
+        "the zap landed on the marked fish (zaps_on_marked %d, zapped_marked %d)", env->zaps_on_marked, fb->zapped_marked);
+    CHECK(fb->mark == 0 && env->agents[b].observations[OBS_INST_MARK] == 0.0f, "and cleared the mark (mark %d)", fb->mark);
+    CHECK(env->fish[0].mark == 0 && env->zaps_wrongful == 0, "the sanction itself is no violation (attacker unmarked)");
+    destroy(&h);
+    dict_clear(&kw);
+}
+
+// U24 (phase 3, D12): inst_mark_wrongful: a bite on an unmarked fish marks the biter; on a marked fish it does not.
+static void test_inst_wrongful(void) {
+    printf("-- INST U24: wrongful bites are violations (inst_mark_wrongful)\n");
+    for (int on = 0; on <= 1; on++) {
+        Dict kw = {0};
+        kw_inst_test(&kw, AH_FISH, 0);
+        dict_set(&kw, "inst_mark_wrongful", on);
+        Harness h = make(&kw, AH_FISH);
+        Env* env = h.env;
+        clear_objects(env);
+        ah_park(&h, 0);
+        int b = AH_FISH / 2;
+        int c = b + 1;
+        env->fish[b].mark = 40;                       // a marked B fish ...
+        place_fish(env, b, 12.0f, 20.0f, 0.0f);
+        place_fish(env, 0, 9.5f, 20.0f, 0.0f);        // ... zapped by fish 0 (legitimate)
+        place_fish(env, c, 12.0f, 30.0f, 0.0f);       // an unmarked B fish ...
+        place_fish(env, 1, 9.5f, 30.0f, 0.0f);        // ... zapped by fish 1 (wrongful)
+        set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+        set_action(&h, 1, -8.0f, 0.0f, 1.0f, AH_UPPER);
+        puf_step(env);
+        CHECK(env->fish[0].bite_victim == b && env->fish[1].bite_victim == c && env->bites == 2, "wrongful %d: both zaps landed", on);
+        CHECK(env->fish[0].mark == 0 && env->fish[0].zaps_wrongful == 0 && env->zaps_on_marked == 1,
+            "the sanction on the marked fish leaves fish 0 unmarked");
+        if (on) {
+            CHECK(env->fish[1].mark == 63 && env->fish[1].zaps_wrongful == 1 && env->fish[1].violations == 1
+                && env->zaps_wrongful == 1 && env->violations == 1 && env->fish[1].trace_violated,
+                "the bite on the unmarked fish marks fish 1 (mark %d, zaps_wrongful %d, violations %d)",
+                env->fish[1].mark, env->fish[1].zaps_wrongful, env->violations);
+            CHECK(env->fish[1].bite_cooldown == 24 && env->fish[c].freeze == 24,
+                "its cost is unchanged (zap_cooldown 25, victim freeze 25)");
+            CHECK(env->fish[1].rule_acts == 0 && env->fish[1].comply_acts == 0,
+                "a wrongful bite is not a rule-governed act for comply_frac (rule_acts %d)", env->fish[1].rule_acts);
+        } else {
+            CHECK(env->fish[1].mark == 0 && env->zaps_wrongful == 0 && env->violations == 0,
+                "key off: a bite on an unmarked fish marks nobody (default behaviour)");
+        }
+        destroy(&h);
+        dict_clear(&kw);
+    }
+}
+
+// U25 (phase 3): role 15 defects until sanctioned bot_respond_zaps times, then complies; role 16 bites unmarked fish
+// and, under inst_mark_wrongful, gets marked for it.
+static void test_inst_roles_phase3(void) {
+    printf("-- INST U25: responsive defector (15) and wrongful biter (16)\n");
+    Dict kw = {0};
+    kw_inst_test(&kw, AH_FISH, 0);
+    dict_set(&kw, "bot_oracle", 1);
+    dict_set(&kw, "bot_respond_zaps", 2);
+    dict_set(&kw, "inst_mark_until_zap", 1);
+    // A group: enforcers; B group: responsive defectors (slot b) and compliers
+    puf_ini_set(&kw, "roles", AH_FISH >= 8 ? "14,14,14,14,15,13,13,13" : "14,14,15,13");
+    Harness h = make(&kw, AH_FISH);
+    Env* env = h.env;
+    int b = AH_FISH / 2;
+    int viol_at_response = -1;
+    for (int t = 0; t < 3000 && !env->fish[b].bot_responded; t++) {
+        puf_step(env);
+    }
+    FishAgent* fb = &env->fish[b];
+    CHECK(fb->bot_responded && fb->zapped_marked >= 2 && fb->violations >= 1,
+        "the defector planted B (violations %d), was sanctioned %d times and switched to complying (tick %d)",
+        fb->violations, fb->zapped_marked, env->tick);
+    viol_at_response = fb->violations;
+    for (int t = 0; t < 300; t++) {
+        puf_step(env);
+    }
+    CHECK(fb->violations == viol_at_response, "no further violation after the response (%d)", fb->violations);
+    CHECK(env->plantings_np == fb->violations, "only the defector broke the rule (plantings_np %d)", env->plantings_np);
+    destroy(&h);
+    dict_clear(&kw);
+    // role 16 among compliers, inst_mark_wrongful 1: its first bite marks it
+    Dict kw2 = {0};
+    kw_inst_test(&kw2, AH_FISH, 0);
+    dict_set(&kw2, "bot_oracle", 1);
+    dict_set(&kw2, "inst_mark_wrongful", 1);
+    puf_ini_set(&kw2, "roles", AH_FISH >= 8 ? "16,13,13,13,13,13,13,13" : "16,13,13,13");
+    Harness h2 = make(&kw2, AH_FISH);
+    env = h2.env;
+    for (int t = 0; t < 2000 && env->zaps_wrongful == 0; t++) {
+        puf_step(env);
+    }
+    CHECK(env->zaps_wrongful >= 1 && env->fish[0].zaps_wrongful == env->zaps_wrongful && env->fish[0].mark > 0,
+        "the wrongful biter bit an unmarked fish (tick %d) and is marked (%d)", env->tick, env->fish[0].mark);
+    destroy(&h2);
+    dict_clear(&kw2);
+}
+
 static void test_inst(void) {
     test_inst_layout();
     test_inst_read();
@@ -2227,10 +2355,13 @@ static void test_inst(void) {
     test_inst_log();
     test_inst_trace();
     test_inst_roles();
+    test_inst_mark_until_zap();
+    test_inst_wrongful();
+    test_inst_roles_phase3();
 }
 #else
 static void test_inst(void) {
-    printf("-- INST U13-U22: skipped (needs the -DWEF_INST build)\n");
+    printf("-- INST U13-U25: skipped (needs the -DWEF_INST build)\n");
 }
 #endif
 
@@ -2339,6 +2470,10 @@ static int run_calibration(int argc, char** argv) {
     double zap_mk[MAX_AGENTS] = {0};
     double viol_step[MAX_AGENTS] = {0};
     double zap_mk_step[MAX_AGENTS] = {0};
+    double zapped_mk[MAX_AGENTS] = {0};   // phase 3: sanctions received while marked / wrongful bites given per slot
+    double wrongful[MAX_AGENTS] = {0};
+    double inst_wrongful = 0.0;
+    double inst_sanctioned = 0.0;         // violations that met a sanction (zaps on marked / violations)
     double inst_comply = 0.0;
     double inst_informed = 0.0;
     double inst_first_visit = 0.0;
@@ -2408,6 +2543,8 @@ static int run_calibration(int argc, char** argv) {
                     zaps_taken[i] += zaps_taken_step[i];
                     viol[i] += viol_step[i];
                     zap_mk[i] += zap_mk_step[i];
+                    zapped_mk[i] += env->fish[i].zapped_marked;
+                    wrongful[i] += env->fish[i].zaps_wrongful;
                 }
                 if (env->inst_mode > 0 || env->inst_obs) {
                     int comply = 0;
@@ -2427,6 +2564,8 @@ static int run_calibration(int argc, char** argv) {
                     inst_agree += env->allelo ? (double)env->n_type[env->inst_type] / env->num_food : 0.0;
                     inst_closed += (double)env->closed_steps / env->cur_episode_length;
                     inst_eats_closed += env->eats_closed;
+                    inst_wrongful += env->zaps_wrongful;
+                    inst_sanctioned += env->violations > 0 ? (double)env->zaps_on_marked / env->violations : 0.0;
                 }
                 int n_max = env->n_type[0] > env->n_type[1] ? env->n_type[0] : env->n_type[1];
                 mono_final += (double)n_max / env->num_food;
@@ -2452,31 +2591,34 @@ static int run_calibration(int argc, char** argv) {
             vsum += viol[i];
             zsum += zap_mk[i];
         }
-        printf("  inst_mode %d   comply %.3f   informed %.3f   first_visit %.3f   violations %.1f   marked_frac %.3f   exposure %.3f   zaps_on_marked %.1f   agree_final %.3f   closed_frac %.3f   eats_closed %.1f\n",
+        printf("  inst_mode %d   comply %.3f   informed %.3f   first_visit %.3f   violations %.1f   marked_frac %.3f   exposure %.3f   zaps_on_marked %.1f   agree_final %.3f   closed_frac %.3f   eats_closed %.1f   zaps_wrongful %.1f   sanctions_per_viol %.3f\n",
             env->inst_mode, inst_comply / episodes, inst_informed / episodes, inst_first_visit / episodes,
             vsum / episodes, inst_marked / episodes, inst_exposure / episodes, zsum / episodes,
-            inst_agree / episodes, inst_closed / episodes, inst_eats_closed / episodes);
+            inst_agree / episodes, inst_closed / episodes, inst_eats_closed / episodes,
+            inst_wrongful / episodes, inst_sanctioned / episodes);
     }
     if (env->allelo) {
         printf("  mono_final %.3f   mono_mean %.3f   t_conv %.3f   plantings %.1f   plant_proactive %.1f   plant_noop %.1f   plant_attempts %.1f   zaps_cross %.1f   zaps_same %.1f   n_ripe_mean %.2f\n",
             mono_final / episodes, mono_mean / episodes, t_conv / episodes, plantings / episodes,
             proactive / episodes, plant_noop_total / episodes, plant_attempts / episodes,
             zaps_cross / episodes, zaps_same / episodes, n_ripe_mean);
-        printf("  slot role taste pellets  return plant_a plant_b plant_noop zaps_given zaps_taken viol zap_mk\n");
+        printf("  slot role taste pellets  return plant_a plant_b plant_noop zaps_given zaps_taken viol zap_mk zapped_mk wrongful\n");
         for (int i = 0; i < env->num_agents; i++) {
-            printf("  %4d %4d %5c %7.1f %7.2f %7.1f %7.1f %10.1f %10.1f %10.1f %4.1f %6.1f\n", i, env->roles[i],
+            printf("  %4d %4d %5c %7.1f %7.2f %7.1f %7.1f %10.1f %10.1f %10.1f %4.1f %6.1f %9.1f %8.1f\n", i, env->roles[i],
                 taste_of[i] == 0 ? 'A' : 'B', pellets[i] / episodes, ret[i] / episodes,
                 plant_a[i] / episodes, plant_b[i] / episodes, noop[i] / episodes,
-                zaps_given[i] / episodes, zaps_taken[i] / episodes, viol[i] / episodes, zap_mk[i] / episodes);
+                zaps_given[i] / episodes, zaps_taken[i] / episodes, viol[i] / episodes, zap_mk[i] / episodes,
+                zapped_mk[i] / episodes, wrongful[i] / episodes);
         }
     } else {
-        printf("  slot role pellets cleans strip%%  cleans/strip-step  return zaps_given zaps_taken viol zap_mk\n");
+        printf("  slot role pellets cleans strip%%  cleans/strip-step  return zaps_given zaps_taken viol zap_mk zapped_mk wrongful\n");
         for (int i = 0; i < env->num_agents; i++) {
             double strip_steps = strip[i] / episodes * env->episode_length;
-            printf("  %4d %4d %7.1f %6.1f %5.1f%%  %.3f %7.2f %10.1f %10.1f %4.1f %6.1f\n", i, env->roles[i], pellets[i] / episodes,
+            printf("  %4d %4d %7.1f %6.1f %5.1f%%  %.3f %7.2f %10.1f %10.1f %4.1f %6.1f %9.1f %8.1f\n", i, env->roles[i], pellets[i] / episodes,
                 cleans[i] / episodes, 100.0 * strip[i] / episodes,
                 strip_steps > 0 ? cleans[i] / episodes / strip_steps : 0.0,
-                ret[i] / episodes, zaps_given[i] / episodes, zaps_taken[i] / episodes, viol[i] / episodes, zap_mk[i] / episodes);
+                ret[i] / episodes, zaps_given[i] / episodes, zaps_taken[i] / episodes, viol[i] / episodes, zap_mk[i] / episodes,
+                zapped_mk[i] / episodes, wrongful[i] / episodes);
         }
     }
     puf_close(env);

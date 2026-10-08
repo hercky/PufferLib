@@ -209,6 +209,9 @@ typedef struct FishAgent {
     int rule_acts;         // rule-governed acts (AH: conversions; Commons: eats)
     bool trace_violated;   // trace only: this step's act broke the rule
     bool trace_zap_marked; // trace only: this step's zap landed on a marked fish
+    int zapped_marked;     // sanctions received: bites taken while marked this episode
+    int zaps_wrongful;     // bites given on an unmarked fish while a rule was in force (inst_mark_wrongful)
+    bool bot_responded;    // role 15: has been sanctioned bot_respond_zaps times and now complies
 } FishAgent;
 
 // Shared sensor layouts (body radius fixed → identical for every fish)
@@ -386,6 +389,8 @@ struct Log {
     float informed_frac;     // fish that read the beacon at least once / N
     float informed_mean;     // time-mean fraction of informed fish
     float beacon_visits;     // fish-steps inside inst_read_cm / N
+    float zaps_wrongful;     // bites on unmarked fish per episode (the second-order violation when inst_mark_wrongful)
+    float sanctions_per_viol;// zaps on marked fish / violations (1 = every violation met a sanction; 0 with no violation)
     float n;
 };
 
@@ -707,6 +712,10 @@ struct Env {
     float mark_zap_reward;      // bounty to the attacker for zapping a marked fish
     int mark_zap_cooldown;      // attacker bite cooldown after zapping a marked fish (-1 = BITE_COOLDOWN_STEPS)
     int mark_freeze_steps;      // freeze of a MARKED victim (-1 = bitten_freeze_steps): the sanction the institution legitimates
+    int inst_mark_until_zap;    // 1: a mark does not decay; it is cleared by the sanction (a bite on the marked fish)
+    int inst_mark_wrongful;     // 1: a bite on an UNMARKED fish is itself a violation (the biter is marked)
+    int bot_respond_zaps;       // role 15: sanctions received while marked before the bot complies (default 1)
+    int zaps_wrongful;          // per-episode counter
     int inst_pos_random;        // 0 beacon at the arena centre, 1 drawn uniformly per episode
     float inst_read_cm;         // a fish inside this radius reads the rule
     float inst_obj_radius_cm;   // the beacon's electrical signature: a waste-like conductor
@@ -1503,6 +1512,7 @@ void puf_reset(Wef* env) {
     env->closed_steps = 0;
     env->eats_closed = 0;
     env->bounty_sum = 0.0f;
+    env->zaps_wrongful = 0;
     env->plantings_p = 0;
     env->plantings_np = 0;
     // Only the first episode of an env can be shortened (desync_first_episode).
@@ -1877,17 +1887,29 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     if (env->allelo && role == 2) {
         role = 10;  // an eater that targeted unripe bushes would be trapped: the free-rider role
     }
-    // Institution roles (docs/institutions-plan.md 4; calibration only): 13 complier, 14 enforcer.
-    // Both know where the beacon is and swim to it until they have read the rule. Informed, the AH
-    // complier is a planter-own (role 8) when its taste is the prescribed type and a free-rider
-    // (role 10) otherwise; the Commons complier is role 7 whose restraint is the season as last
-    // read, and it waits AT the beacon while closed (so it keeps reading), returns to it when it
-    // has nothing to eat and re-reads it every bot_shift_steps (the season changes). The enforcer hunts the nearest marked fish within the hunt range
-    // whenever it can bite, and behaves as a complier otherwise.
-    bool inst_role = env->inst_mode > 0 && (role == 13 || role == 14);
-    bool enforcer = inst_role && role == 14;
+    // Institution roles (docs/institutions-plan.md 4 and phase 3; calibration only): 13 complier
+    // (the shirker of the phase-3 gate: complies, never bites), 14 enforcer, 15 responsive defector,
+    // 16 wrongful biter. Compliers know where the beacon is and swim to it until they have read the
+    // rule. Informed, the AH complier is a planter-own (role 8) when its taste is the prescribed type
+    // and a free-rider (role 10) otherwise; the Commons complier is role 7 whose restraint is the
+    // season as last read, and it waits AT the beacon while closed (so it keeps reading), returns to
+    // it when it has nothing to eat and re-reads it every bot_shift_steps (the season changes). The
+    // enforcer hunts the nearest marked fish within the hunt range whenever it can bite, and behaves
+    // as a complier otherwise. The responsive defector ignores the rule (AH: plants its own type, role
+    // 8; Commons: eats through the season, role 2) until it has been bitten while marked
+    // bot_respond_zaps times, then it is a complier for the rest of the episode (the simplest model of
+    // a learner that deterrence can reach). The wrongful biter is a complier that bites the nearest
+    // fish in range, marked or not, whenever it can (the deviation inst_mark_wrongful classifies).
+    bool inst_role = env->inst_mode > 0 && role >= 13 && role <= 16;
+    bool enforcer = inst_role && (role == 14 || role == 16);
+    bool hunt_any = inst_role && role == 16;
     bool go_beacon = false;
-    if (inst_role) {
+    if (inst_role && role == 15 && !fish->bot_responded && fish->zapped_marked >= env->bot_respond_zaps) {
+        fish->bot_responded = true;
+    }
+    if (inst_role && role == 15 && !fish->bot_responded) {
+        role = env->allelo ? 8 : 2;  // the defector: own type / eat regardless, never reads the rule
+    } else if (inst_role) {
         if (!fish->informed) {
             go_beacon = true;
         } else if (!env->allelo && env->tick - fish->last_read_tick > env->bot_shift_steps) {
@@ -1980,10 +2002,10 @@ void wef_bot_action(Wef* env, int i, float* raw) {
         target = env->inst_pos;
         found = true;
     } else if (enforcer && fish->bite_cooldown <= 0) {
-        // enforcer: the nearest marked, non-frozen fish within the hunt range
+        // enforcer: the nearest marked, non-frozen fish within the hunt range (role 16: any fish)
         float hunt2 = env->bot_oracle ? INFINITY : MORM_AGENT_RANGE_CM * MORM_AGENT_RANGE_CM;
         for (int j = 0; j < env->num_agents; j++) {
-            if (j == i || env->fish[j].freeze > 0 || env->fish[j].mark <= 0) {
+            if (j == i || env->fish[j].freeze > 0 || (env->fish[j].mark <= 0 && !hunt_any)) {
                 continue;
             }
             float dx = env->fish[j].pos.x - fish->pos.x;
@@ -2661,8 +2683,18 @@ void puf_step(Wef* env) {
                 // bounty configured, paid (docs/institutions-plan.md 3.2 item 4; v0 bounty 0)
                 env->zaps_on_marked++;
                 attacker->trace_zap_marked = true;
+                env->fish[victim].zapped_marked++;
                 env->agents[i].rewards[0] += env->mark_zap_reward;
                 env->bounty_sum += env->mark_zap_reward;
+                if (env->inst_mark_until_zap) {
+                    env->fish[victim].mark = 0;  // the sanction clears the label (phase 3, D11)
+                }
+            } else if (env->inst_mode > 0 && env->inst_mark_wrongful) {
+                // phase 3 (D12): punishing against the classification is itself a violation; the
+                // biter is marked like any rule-breaker (and sanctioning it is then legitimate)
+                env->zaps_wrongful++;
+                attacker->zaps_wrongful++;
+                wef_inst_violation(env, i);
             }
             if (env->allelo || env->inst_mode > 0) {
                 attacker->bite_cooldown = marked_victim
@@ -2970,7 +3002,7 @@ void puf_step(Wef* env) {
         env->fish[i].eat_cooldown -= env->fish[i].eat_cooldown > 0;
         env->fish[i].bite_cooldown -= env->fish[i].bite_cooldown > 0;
         env->fish[i].freeze -= env->fish[i].freeze > 0;
-        env->fish[i].mark -= env->fish[i].mark > 0;
+        env->fish[i].mark -= env->fish[i].mark > 0 && !env->inst_mark_until_zap;
         // Raw (pre-mixing, pre-shaping) per-fish return: what the metrics report.
         env->return_by[i] += env->agents[i].rewards[0];
         env->raw_return_sum += env->agents[i].rewards[0];
@@ -3168,6 +3200,9 @@ void puf_step(Wef* env) {
             env->log.informed_frac += (float)informed_n / (float)env->num_agents;
             env->log.informed_mean += (float)env->informed_steps / fish_steps;
             env->log.beacon_visits += (float)visits / (float)env->num_agents;
+            env->log.zaps_wrongful += (float)env->zaps_wrongful;
+            env->log.sanctions_per_viol += env->violations > 0
+                ? (float)env->zaps_on_marked / (float)env->violations : 0.0f;
         }
         env->log.n += 1.0f;
         puf_reset(env);
@@ -3665,8 +3700,11 @@ void puf_render(Wef* env) {
         }
         const char* rule = env->allelo ? (env->inst_type == 0 ? "rule: plant A" : "rule: plant B")
             : (env->inst_type ? "season: CLOSED" : "season: open");
-        const char* line = TextFormat("%s   informed %d/%d   violations %d   marked %d   zaps on marked %d/%d",
-            rule, informed, env->num_agents, env->violations, marked, env->zaps_on_marked, env->bites);
+        const char* line = env->inst_mark_wrongful
+            ? TextFormat("%s   informed %d/%d   violations %d   marked %d   zaps on marked %d/%d   wrongful %d",
+                rule, informed, env->num_agents, env->violations, marked, env->zaps_on_marked, env->bites, env->zaps_wrongful)
+            : TextFormat("%s   informed %d/%d   violations %d   marked %d   zaps on marked %d/%d",
+                rule, informed, env->num_agents, env->violations, marked, env->zaps_on_marked, env->bites);
         DrawText(line, 20, 44, 18, WEF_COLOR_INST);
         DrawText("body = taste (green A / magenta B) | white square = marked | X = frozen | yellow core = hold | tail square = rule read",
             20, 66, 14, WEF_COLOR_MIDGRAY);
@@ -3767,6 +3805,7 @@ static const char* WEF_ENV_KEYS[] = {
     "inst_mode", "inst_obs", "inst_fixed_type", "inst_theta", "inst_hyst", "inst_flip_steps",
     "inst_mark_steps", "mark_zap_reward", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
     "inst_obj_radius_cm", "inst_contrast", "inst_latch", "mark_freeze_steps",
+    "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps",
 };
 
 static void wef_check_keys(Dict* kwargs) {
@@ -3907,6 +3946,9 @@ void puf_init(Env* env, Dict* kwargs) {
     env->inst_obj_radius_cm = wef_cfg(kwargs, "inst_obj_radius_cm", 0.5);
     env->inst_contrast = wef_cfg(kwargs, "inst_contrast", 1.0);
     env->inst_latch = wef_cfg(kwargs, "inst_latch", 1);
+    env->inst_mark_until_zap = wef_cfg(kwargs, "inst_mark_until_zap", 0);
+    env->inst_mark_wrongful = wef_cfg(kwargs, "inst_mark_wrongful", 0);
+    env->bot_respond_zaps = wef_cfg(kwargs, "bot_respond_zaps", 1);
     {
         // roles = r0,r1,r2,r3 (comma list; a scalar applies to slot 0 only)
         DictItem* item = dict_find(kwargs, "roles");
@@ -3923,10 +3965,10 @@ void puf_init(Env* env, Dict* kwargs) {
     }
     assert(env->bot_shift_steps >= MAX_AGENTS);
     for (int i = 0; i < MAX_AGENTS; i++) {
-        assert(env->roles[i] >= 0 && env->roles[i] <= 14
-            && "roles: 0 policy, 1 cleaner, 2 eater, 3 shift, 4 random, 5 sustainable eater, 6 dense-first eater, 7 stock-threshold eater, 8 planter-own, 9 planter-majority, 10 free-rider, 11 zapper-planter, 12 opportunistic planter, 13 complier, 14 enforcer");
+        assert(env->roles[i] >= 0 && env->roles[i] <= 16
+            && "roles: 0 policy, 1 cleaner, 2 eater, 3 shift, 4 random, 5 sustainable eater, 6 dense-first eater, 7 stock-threshold eater, 8 planter-own, 9 planter-majority, 10 free-rider, 11 zapper-planter, 12 opportunistic planter, 13 complier, 14 enforcer, 15 responsive defector, 16 wrongful biter");
         assert((env->allelo || env->roles[i] <= 7 || env->roles[i] >= 13) && "roles 8-12 need allelo = 1");
-        assert((env->inst_mode > 0 || env->roles[i] < 13) && "roles 13-14 need inst_mode > 0");
+        assert((env->inst_mode > 0 || env->roles[i] < 13) && "roles 13-16 need inst_mode > 0");
     }
     assert(env->inst_mode >= 0 && env->inst_mode <= 3 && "inst_mode: 0 none, 1 public beacon, 2 private signals, 3 spurious rule");
     assert((env->inst_mode == 0 || env->inst_obs) && "inst_mode > 0 needs inst_obs = 1 (the beacon and the slots)");
@@ -3938,6 +3980,9 @@ void puf_init(Env* env, Dict* kwargs) {
     assert(env->inst_fixed_type >= -1 && env->inst_fixed_type <= 1);
     assert(env->inst_theta > 0.0f && env->inst_theta < 1.0f && env->inst_hyst >= 0.0f && env->inst_theta + env->inst_hyst <= 1.0f);
     assert((env->inst_mode != 3 || env->inst_flip_steps > 0) && "inst_mode 3 needs inst_flip_steps > 0");
+    assert((!env->inst_mark_until_zap && !env->inst_mark_wrongful) || (env->inst_mode > 0 && env->inst_mark_steps > 0)
+        && "inst_mark_until_zap / inst_mark_wrongful need inst_mode > 0 and inst_mark_steps > 0 (the mark value)");
+    assert(env->bot_respond_zaps >= 1);
     assert(env->inst_mark_steps >= 0 && env->mark_zap_cooldown >= -1 && env->mark_freeze_steps >= -1
         && env->inst_read_cm > 0.0f && env->inst_obj_radius_cm > 0.0f);
     assert((env->inst_pos_random == 0 || env->inst_pos_random == 1) && (env->inst_latch == 0 || env->inst_latch == 1));
@@ -4124,6 +4169,8 @@ static void wef_log_inst_tail(Log* log, Dict* out) {
     dict_set(out, "beacon_first_visit", log->beacon_first_visit);
     dict_set(out, "informed_mean", log->informed_mean);
     dict_set(out, "beacon_visits", log->beacon_visits);
+    dict_set(out, "zaps_wrongful", log->zaps_wrongful);
+    dict_set(out, "sanctions_per_viol", log->sanctions_per_viol);
 }
 
 // The rest of the AH keys (off the 30-key live dashboard in the AH build, in the [metrics] series).
