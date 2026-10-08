@@ -3559,17 +3559,17 @@ void puf_render(Wef* env) {
         FishAgent* agent = &env->fish[i];
         Vector2 center = world_to_screen(env, agent->pos);
         float radius = BODY_RADIUS_CM * scale;
+        if (env->allelo) {
+            // taste: a faint body fill in the type colour (the body ring below is the same colour)
+            Color tc = agent->taste == 0 ? WEF_COLOR_FOOD : WEF_COLOR_FOOD_B;
+            DrawCircleV(center, radius - 1.0f, ColorAlpha(tc, 0.28f));
+        }
         if (agent->freeze > 0) {
             DrawCircleV(center, radius, ColorAlpha(WEF_COLOR_MIDGRAY, 0.8f));  // frozen (sanction)
         } else if (env->allelo && agent->eat_cooldown > EAT_COOLDOWN_STEPS) {
             // planting hold: fill shrinks as the hold runs out
             float frac = (float)agent->eat_cooldown / (float)(env->plant_steps > 0 ? env->plant_steps : 1);
             DrawCircleV(center, radius * fmaxf(0.3f, fminf(1.0f, frac)), ColorAlpha(WEF_COLOR_HOLD, 0.8f));
-        }
-        if (env->allelo) {
-            // taste: a small ring in the type colour just inside the body ring
-            Color tc = agent->taste == 0 ? WEF_COLOR_FOOD : WEF_COLOR_FOOD_B;
-            DrawRing(center, radius - 4.0f, radius - 2.0f, 0.0f, 360.0f, 32, ColorAlpha(tc, 0.9f));
         }
         if (agent->mark > 0) {
             // violation mark: a thick white ring with a dark outline outside the body (the taste ring
@@ -3596,8 +3596,14 @@ void puf_render(Wef* env) {
 
         float heading_x = cosf(agent->orientation);
         float heading_y = -sinf(agent->orientation);
-        DrawRing(center, radius - 1.5f, radius + 1.5f,
-            0.0f, 360.0f, 32, WEF_COLOR_FISH);
+        if (env->allelo) {
+            // AH: the body ring IS the taste colour, thick, and the only ring on the body
+            Color tc = agent->taste == 0 ? WEF_COLOR_FOOD : WEF_COLOR_FOOD_B;
+            DrawRing(center, radius - 2.5f, radius + 2.0f, 0.0f, 360.0f, 32, ColorAlpha(tc, 1.0f));
+        } else {
+            DrawRing(center, radius - 1.5f, radius + 1.5f,
+                0.0f, 360.0f, 32, WEF_COLOR_FISH);
+        }
         Vector2 nose = {
             center.x + heading_x * radius * 1.35f,
             center.y + heading_y * radius * 1.35f,
@@ -3619,7 +3625,7 @@ void puf_render(Wef* env) {
                 );
             }
         }
-        DrawText(TextFormat("%d", i + 1),
+        DrawText(env->allelo ? TextFormat("%d%c", i + 1, agent->taste == 0 ? 'A' : 'B') : TextFormat("%d", i + 1),
             (int)(center.x + radius + 4), (int)(center.y - radius), 16,
             WEF_COLOR_TEXT);
         if (env->client->bites_given[i] > 0 || env->client->bites_taken[i] > 0) {
