@@ -1998,11 +1998,11 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     bool ah_plant_target = false; // the target is a bush to plant (plant cone radius, bite in cone)
     bool ah_hunt = false;         // the target is a rival fish (bite cone radius)
     bool ah_bite_now = false;     // role 12: bite this step without a travel target
-    if (go_beacon) {
-        target = env->inst_pos;
-        found = true;
-    } else if (enforcer && fish->bite_cooldown <= 0) {
-        // enforcer: the nearest marked, non-frozen fish within the hunt range (role 16: any fish)
+    if (enforcer && fish->informed && fish->bite_cooldown <= 0) {
+        // enforcer: the nearest marked, non-frozen fish within the hunt range (role 16: any fish).
+        // Hunting outranks the beacon once the fish has read the rule: a Commons enforcer waiting
+        // out the closed season at the beacon is exactly the fish that must leave it to sanction
+        // (phase 3 fix; before, go_beacon took priority and enforcement stopped while closed).
         float hunt2 = env->bot_oracle ? INFINITY : MORM_AGENT_RANGE_CM * MORM_AGENT_RANGE_CM;
         for (int j = 0; j < env->num_agents; j++) {
             if (j == i || env->fish[j].freeze > 0 || (env->fish[j].mark <= 0 && !hunt_any)) {
@@ -2018,6 +2018,10 @@ void wef_bot_action(Wef* env, int i, float* raw) {
                 ah_hunt = true;
             }
         }
+    }
+    if (!found && go_beacon) {
+        target = env->inst_pos;
+        found = true;
     }
     if (!found && env->allelo && role >= 8) {
         int taste = fish->taste;
