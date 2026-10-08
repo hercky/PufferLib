@@ -200,6 +200,7 @@ typedef struct FishAgent {
     float inst_val;        // the rule as last read at the beacon: +1 / -1, 0 = never read (latched)
     bool informed;         // has read the beacon this episode
     int first_visit_tick;  // first tick inside inst_read_cm, 0 = never
+    int last_read_tick;    // last tick inside inst_read_cm (scripted compliers re-read the season)
     int visits;            // fish-steps inside inst_read_cm
     int inst_private;      // inst_mode 2 (AH): this fish's private prescribed type 0 / 1
     float inst_private_theta;  // inst_mode 2 (Commons): this fish's private closing threshold
@@ -1879,8 +1880,8 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     // Both know where the beacon is and swim to it until they have read the rule. Informed, the AH
     // complier is a planter-own (role 8) when its taste is the prescribed type and a free-rider
     // (role 10) otherwise; the Commons complier is role 7 whose restraint is the season as last
-    // read, and it waits AT the beacon while closed (so it keeps reading) and returns to it when
-    // it has nothing to eat. The enforcer hunts the nearest marked fish within the hunt range
+    // read, and it waits AT the beacon while closed (so it keeps reading), returns to it when it
+    // has nothing to eat and re-reads it every bot_shift_steps (the season changes). The enforcer hunts the nearest marked fish within the hunt range
     // whenever it can bite, and behaves as a complier otherwise.
     bool inst_role = env->inst_mode > 0 && (role == 13 || role == 14);
     bool enforcer = inst_role && role == 14;
@@ -1888,6 +1889,8 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     if (inst_role) {
         if (!fish->informed) {
             go_beacon = true;
+        } else if (!env->allelo && env->tick - fish->last_read_tick > env->bot_shift_steps) {
+            go_beacon = true;  // Commons: the season changes, so re-read it every bot_shift_steps
         } else if (env->allelo) {
             role = fish->taste == wef_inst_rule_type(env, i) ? 8 : 10;
         } else {
@@ -2491,6 +2494,7 @@ void puf_step(Wef* env) {
             }
             if (wef_at_beacon(env, agent)) {
                 agent->visits++;
+                agent->last_read_tick = env->tick;
                 if (!agent->informed) {
                     agent->informed = true;
                     agent->first_visit_tick = env->tick;
