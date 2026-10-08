@@ -3663,7 +3663,7 @@ void puf_render(Wef* env) {
         const char* line = TextFormat("%s   informed %d/%d   violations %d   marked %d   zaps on marked %d/%d",
             rule, informed, env->num_agents, env->violations, marked, env->zaps_on_marked, env->bites);
         DrawText(line, 20, 44, 18, WEF_COLOR_INST);
-        DrawText("legend: beacon disc = the rule's colour (label beside it); white ring = marked rule-breaker; tail dot = rule as read; grey fill = frozen; yellow fill = planting hold",
+        DrawText("beacon disc = rule colour | white ring = marked | tail dot = rule read | grey = frozen | yellow = planting hold",
             20, 66, 14, WEF_COLOR_MIDGRAY);
     }
     if (env->allelo) {
