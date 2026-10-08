@@ -3559,51 +3559,49 @@ void puf_render(Wef* env) {
         FishAgent* agent = &env->fish[i];
         Vector2 center = world_to_screen(env, agent->pos);
         float radius = BODY_RADIUS_CM * scale;
-        if (env->allelo) {
-            // taste: a faint body fill in the type colour (the body ring below is the same colour)
-            Color tc = agent->taste == 0 ? WEF_COLOR_FOOD : WEF_COLOR_FOOD_B;
-            DrawCircleV(center, radius - 1.0f, ColorAlpha(tc, 0.28f));
+        // Visual language (institution builds and AH): one shape per state, no stacked rings.
+        //   body = a SOLID disc in the fish's taste colour (AH: green A / magenta B; else lavender)
+        //   planting hold = a yellow core inside the disc, shrinking as the hold runs out
+        //   frozen = a dark X across the body
+        //   marked rule-breaker = a WHITE SQUARE frame around the fish
+        //   rule read = a small square at the tail in the colour of the rule as read
+        //   EOD = a thin faint pulsing circle (unchanged)
+        Color body = env->allelo ? (agent->taste == 0 ? WEF_COLOR_FOOD : WEF_COLOR_FOOD_B) : WEF_COLOR_FISH;
+        DrawCircleV(center, radius + 1.0f, (Color){8, 8, 8, 255});          // thin dark outline
+        DrawCircleV(center, radius - 1.0f, ColorAlpha(body, 0.95f));
+        if (env->allelo && agent->eat_cooldown > EAT_COOLDOWN_STEPS && agent->freeze <= 0) {
+            float frac = (float)agent->eat_cooldown / (float)(env->plant_steps > 0 ? env->plant_steps : 1);
+            DrawCircleV(center, 0.7f * radius * fmaxf(0.35f, fminf(1.0f, frac)), WEF_COLOR_HOLD);
         }
         if (agent->freeze > 0) {
-            DrawCircleV(center, radius, ColorAlpha(WEF_COLOR_MIDGRAY, 0.8f));  // frozen (sanction)
-        } else if (env->allelo && agent->eat_cooldown > EAT_COOLDOWN_STEPS) {
-            // planting hold: fill shrinks as the hold runs out
-            float frac = (float)agent->eat_cooldown / (float)(env->plant_steps > 0 ? env->plant_steps : 1);
-            DrawCircleV(center, radius * fmaxf(0.3f, fminf(1.0f, frac)), ColorAlpha(WEF_COLOR_HOLD, 0.8f));
+            float d = radius * 0.75f;
+            DrawLineEx((Vector2){center.x - d, center.y - d}, (Vector2){center.x + d, center.y + d}, 4.0f, (Color){30, 30, 30, 255});
+            DrawLineEx((Vector2){center.x - d, center.y + d}, (Vector2){center.x + d, center.y - d}, 4.0f, (Color){30, 30, 30, 255});
         }
         if (agent->mark > 0) {
-            // violation mark: a thick white ring with a dark outline outside the body (the taste ring
-            // inside the body is green / magenta, so the mark is unmistakable), fading as it runs out
-            float a = 0.45f + 0.55f * (float)agent->mark / (float)(env->inst_mark_steps > 0 ? env->inst_mark_steps : 1);
-            DrawRing(center, radius + 3.0f, radius + 9.0f, 0.0f, 360.0f, 32, ColorAlpha((Color){0, 0, 0, 255}, a));
-            DrawRing(center, radius + 4.5f, radius + 7.5f, 0.0f, 360.0f, 32, ColorAlpha(WEF_COLOR_MARK, a));
+            float a = 0.5f + 0.5f * (float)agent->mark / (float)(env->inst_mark_steps > 0 ? env->inst_mark_steps : 1);
+            float side = 2.0f * (radius + 7.0f);
+            DrawRectangleLinesEx((Rectangle){center.x - radius - 7.0f, center.y - radius - 7.0f, side, side}, 3.0f,
+                ColorAlpha(WEF_COLOR_MARK, a));
         }
         if (env->inst_mode > 0 && agent->informed) {
-            // informed fish: a small dot in the rule colour it last read, at the tail
             Color ic = agent->inst_val > 0.0f ? (env->allelo ? WEF_COLOR_FOOD : WEF_COLOR_BITE)
                 : agent->inst_val < 0.0f ? (env->allelo ? WEF_COLOR_FOOD_B : WEF_COLOR_FOOD) : WEF_COLOR_MIDGRAY;
-            Vector2 tail = {center.x - cosf(agent->orientation) * radius * 1.4f,
-                center.y + sinf(agent->orientation) * radius * 1.4f};
-            DrawCircleV(tail, 3.0f, ic);
+            Vector2 tail = {center.x - cosf(agent->orientation) * radius * 1.55f,
+                center.y + sinf(agent->orientation) * radius * 1.55f};
+            DrawRectangle((int)(tail.x - 4.0f), (int)(tail.y - 4.0f), 8, 8, (Color){8, 8, 8, 255});
+            DrawRectangle((int)(tail.x - 3.0f), (int)(tail.y - 3.0f), 6, 6, ic);
         }
 
         if (agent->emits_eod) {
             float pulse = radius + 5.0f +
                 5.0f * sinf((float)env->tick * 0.18f);
             DrawCircleLines((int)center.x, (int)center.y, pulse,
-                WEF_COLOR_FISH_PULSE);
+                ColorAlpha(WEF_COLOR_FISH_PULSE, 0.5f));
         }
 
         float heading_x = cosf(agent->orientation);
         float heading_y = -sinf(agent->orientation);
-        if (env->allelo) {
-            // AH: the body ring IS the taste colour, thick, and the only ring on the body
-            Color tc = agent->taste == 0 ? WEF_COLOR_FOOD : WEF_COLOR_FOOD_B;
-            DrawRing(center, radius - 2.5f, radius + 2.0f, 0.0f, 360.0f, 32, ColorAlpha(tc, 1.0f));
-        } else {
-            DrawRing(center, radius - 1.5f, radius + 1.5f,
-                0.0f, 360.0f, 32, WEF_COLOR_FISH);
-        }
         Vector2 nose = {
             center.x + heading_x * radius * 1.35f,
             center.y + heading_y * radius * 1.35f,
@@ -3628,7 +3626,8 @@ void puf_render(Wef* env) {
         DrawText(env->allelo ? TextFormat("%d%c", i + 1, agent->taste == 0 ? 'A' : 'B') : TextFormat("%d", i + 1),
             (int)(center.x + radius + 4), (int)(center.y - radius), 16,
             WEF_COLOR_TEXT);
-        if (env->client->bites_given[i] > 0 || env->client->bites_taken[i] > 0) {
+        if (!env->inst_obs && (env->client->bites_given[i] > 0 || env->client->bites_taken[i] > 0)) {
+            // (institution builds: the per-fish tally is dropped to keep the arena legible; the HUD counts zaps)
             const char* tally = TextFormat("bit %d / bitten %d",
                 env->client->bites_given[i], env->client->bites_taken[i]);
             int w = MeasureText(tally, 12);
@@ -3669,7 +3668,7 @@ void puf_render(Wef* env) {
         const char* line = TextFormat("%s   informed %d/%d   violations %d   marked %d   zaps on marked %d/%d",
             rule, informed, env->num_agents, env->violations, marked, env->zaps_on_marked, env->bites);
         DrawText(line, 20, 44, 18, WEF_COLOR_INST);
-        DrawText("beacon disc = rule colour | white ring = marked | tail dot = rule read | grey = frozen | yellow = planting hold",
+        DrawText("body colour = taste (green A / magenta B) | WHITE SQUARE = marked | X = frozen | yellow core = planting hold | tail square = rule read",
             20, 66, 14, WEF_COLOR_MIDGRAY);
     }
     if (env->allelo) {
