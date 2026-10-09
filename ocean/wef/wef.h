@@ -3724,8 +3724,8 @@ void puf_render(Wef* env) {
             : TextFormat("%s   informed %d/%d   violations %d   marked %d   zaps on marked %d/%d",
                 rule, informed, env->num_agents, env->violations, marked, env->zaps_on_marked, env->bites);
         DrawText(line, 20, 44, 18, WEF_COLOR_INST);
-        DrawText("body = taste (green A / magenta B) | white square = marked | X = frozen | yellow core = hold | tail square = rule read | gold crown = Queen",
-            20, 66, 14, WEF_COLOR_MIDGRAY);
+        DrawText("body = taste (green A / magenta B) | white square = marked | X = frozen | yellow core = hold | tail square = rule read | crown = Queen",
+            20, 66, 13, WEF_COLOR_MIDGRAY);
     }
     if (env->allelo) {
         const char* status = TextFormat("bushes A %d  B %d   ripe %d   eaten %d   plantings %d   zaps %d",
