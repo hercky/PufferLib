@@ -3662,9 +3662,23 @@ void puf_render(Wef* env) {
                 );
             }
         }
-        DrawText(env->allelo ? TextFormat("%d%c", i + 1, agent->taste == 0 ? 'A' : 'B') : TextFormat("%d", i + 1),
-            (int)(center.x + radius + 4), (int)(center.y - radius), 16,
-            WEF_COLOR_TEXT);
+        if (env->roles[i] != 0) {
+            // a scripted fish (the Queen of the institution programme, role 14; any bot): a gold crown above
+            // the body and the label "Q" + taste instead of the slot number
+            float cw = radius * 1.1f;
+            float cy = center.y - radius - 4.0f;
+            Color gold = (Color){255, 200, 40, 255};
+            DrawTriangle((Vector2){center.x - cw, cy}, (Vector2){center.x - cw, cy - cw * 1.2f}, (Vector2){center.x - cw * 0.45f, cy}, gold);
+            DrawTriangle((Vector2){center.x - cw * 0.45f, cy}, (Vector2){center.x, cy - cw * 1.5f}, (Vector2){center.x + cw * 0.45f, cy}, gold);
+            DrawTriangle((Vector2){center.x + cw * 0.45f, cy}, (Vector2){center.x + cw, cy - cw * 1.2f}, (Vector2){center.x + cw, cy}, gold);
+            DrawRectangle((int)(center.x - cw), (int)(cy - 2.0f), (int)(2.0f * cw), 4, gold);
+            DrawText(env->allelo ? TextFormat("Q%c", agent->taste == 0 ? 'A' : 'B') : "Q",
+                (int)(center.x + radius + 4), (int)(center.y - radius), 16, gold);
+        } else {
+            DrawText(env->allelo ? TextFormat("%d%c", i + 1, agent->taste == 0 ? 'A' : 'B') : TextFormat("%d", i + 1),
+                (int)(center.x + radius + 4), (int)(center.y - radius), 16,
+                WEF_COLOR_TEXT);
+        }
         if (!env->inst_obs && (env->client->bites_given[i] > 0 || env->client->bites_taken[i] > 0)) {
             // (institution builds: the per-fish tally is dropped to keep the arena legible; the HUD counts zaps)
             const char* tally = TextFormat("bit %d / bitten %d",
@@ -3710,7 +3724,7 @@ void puf_render(Wef* env) {
             : TextFormat("%s   informed %d/%d   violations %d   marked %d   zaps on marked %d/%d",
                 rule, informed, env->num_agents, env->violations, marked, env->zaps_on_marked, env->bites);
         DrawText(line, 20, 44, 18, WEF_COLOR_INST);
-        DrawText("body = taste (green A / magenta B) | white square = marked | X = frozen | yellow core = hold | tail square = rule read",
+        DrawText("body = taste (green A / magenta B) | white square = marked | X = frozen | yellow core = hold | tail square = rule read | gold crown = Queen",
             20, 66, 14, WEF_COLOR_MIDGRAY);
     }
     if (env->allelo) {
