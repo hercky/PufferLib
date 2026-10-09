@@ -391,6 +391,7 @@ struct Log {
     float beacon_visits;     // fish-steps inside inst_read_cm / N
     float zaps_wrongful;     // bites on unmarked fish per episode (the second-order violation when inst_mark_wrongful)
     float sanctions_per_viol;// zaps on marked fish / violations (1 = every violation met a sanction; 0 with no violation)
+    float auto_sanctions;    // direct sanctions by the institution itself (inst_auto_freeze) per episode
     float n;
 };
 
@@ -716,6 +717,8 @@ struct Env {
     int inst_mark_wrongful;     // 1: a bite on an UNMARKED fish is itself a violation (the biter is marked)
     int bot_respond_zaps;       // role 15: sanctions received while marked before the bot complies (default 1)
     int zaps_wrongful;          // per-episode counter
+    int inst_auto_freeze;       // learnability ablation: a violation freezes the violator on the spot for this many steps (0 = off)
+    int auto_sanctions;         // per-episode counter of those direct sanctions
     int inst_pos_random;        // 0 beacon at the arena centre, 1 drawn uniformly per episode
     float inst_read_cm;         // a fish inside this radius reads the rule
     float inst_obj_radius_cm;   // the beacon's electrical signature: a waste-like conductor
@@ -777,6 +780,16 @@ static inline void wef_inst_violation(Wef* env, int i) {
     fish->trace_violated = true;
     if (env->inst_mark_steps > 0) {
         fish->mark = env->inst_mark_steps;
+    }
+    if (env->inst_auto_freeze > 0) {
+        // learnability ablation (docs/institutions-plan.md 9.6): the institution sanctions directly, certainly
+        // and at once; no enforcer, no chase. The freeze runs from the act (an AH planting hold runs inside it).
+        if (fish->freeze < env->inst_auto_freeze) {
+            fish->freeze = env->inst_auto_freeze;
+        }
+        fish->zapped_marked++;
+        env->freezes++;
+        env->auto_sanctions++;
     }
 }
 
@@ -1513,6 +1526,7 @@ void puf_reset(Wef* env) {
     env->eats_closed = 0;
     env->bounty_sum = 0.0f;
     env->zaps_wrongful = 0;
+    env->auto_sanctions = 0;
     env->plantings_p = 0;
     env->plantings_np = 0;
     // Only the first episode of an env can be shortened (desync_first_episode).
@@ -3207,6 +3221,7 @@ void puf_step(Wef* env) {
             env->log.zaps_wrongful += (float)env->zaps_wrongful;
             env->log.sanctions_per_viol += env->violations > 0
                 ? (float)env->zaps_on_marked / (float)env->violations : 0.0f;
+            env->log.auto_sanctions += (float)env->auto_sanctions;
         }
         env->log.n += 1.0f;
         puf_reset(env);
@@ -3823,7 +3838,7 @@ static const char* WEF_ENV_KEYS[] = {
     "inst_mode", "inst_obs", "inst_fixed_type", "inst_theta", "inst_hyst", "inst_flip_steps",
     "inst_mark_steps", "mark_zap_reward", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
     "inst_obj_radius_cm", "inst_contrast", "inst_latch", "mark_freeze_steps",
-    "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps",
+    "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze",
 };
 
 static void wef_check_keys(Dict* kwargs) {
@@ -3967,6 +3982,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->inst_mark_until_zap = wef_cfg(kwargs, "inst_mark_until_zap", 0);
     env->inst_mark_wrongful = wef_cfg(kwargs, "inst_mark_wrongful", 0);
     env->bot_respond_zaps = wef_cfg(kwargs, "bot_respond_zaps", 1);
+    env->inst_auto_freeze = wef_cfg(kwargs, "inst_auto_freeze", 0);
     {
         // roles = r0,r1,r2,r3 (comma list; a scalar applies to slot 0 only)
         DictItem* item = dict_find(kwargs, "roles");
@@ -4001,6 +4017,8 @@ void puf_init(Env* env, Dict* kwargs) {
     assert((!env->inst_mark_until_zap && !env->inst_mark_wrongful) || (env->inst_mode > 0 && env->inst_mark_steps > 0)
         && "inst_mark_until_zap / inst_mark_wrongful need inst_mode > 0 and inst_mark_steps > 0 (the mark value)");
     assert(env->bot_respond_zaps >= 1);
+    assert(env->inst_auto_freeze >= 0 && (env->inst_auto_freeze == 0 || env->inst_mode > 0)
+        && "inst_auto_freeze needs inst_mode > 0");
     assert(env->inst_mark_steps >= 0 && env->mark_zap_cooldown >= -1 && env->mark_freeze_steps >= -1
         && env->inst_read_cm > 0.0f && env->inst_obj_radius_cm > 0.0f);
     assert((env->inst_pos_random == 0 || env->inst_pos_random == 1) && (env->inst_latch == 0 || env->inst_latch == 1));
@@ -4189,6 +4207,7 @@ static void wef_log_inst_tail(Log* log, Dict* out) {
     dict_set(out, "beacon_visits", log->beacon_visits);
     dict_set(out, "zaps_wrongful", log->zaps_wrongful);
     dict_set(out, "sanctions_per_viol", log->sanctions_per_viol);
+    dict_set(out, "auto_sanctions", log->auto_sanctions);
 }
 
 // The rest of the AH keys (off the 30-key live dashboard in the AH build, in the [metrics] series).

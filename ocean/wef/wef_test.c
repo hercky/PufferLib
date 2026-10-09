@@ -2344,6 +2344,38 @@ static void test_inst_roles_phase3(void) {
     dict_clear(&kw2);
 }
 
+// U26 (plan 9.6): inst_auto_freeze: a violation freezes the violator at once; a compliant act does not.
+static void test_inst_auto_freeze(void) {
+    printf("-- INST U26: direct sanction (inst_auto_freeze)\n");
+    Dict kw = {0};
+    kw_inst_test(&kw, AH_FISH, 0);
+    dict_set(&kw, "inst_auto_freeze", 100);
+    Harness h = make(&kw, AH_FISH);
+    Env* env = h.env;
+    clear_objects(env);
+    ah_park(&h, 0);
+    int b = AH_FISH / 2;
+    ah_bush(env, 0, 12.0f, 20.0f, 0, false);      // unripe A ahead of the B fish: plants B = violation
+    ah_bush(env, 1, 12.0f, 30.0f, 1, false);      // unripe B ahead of an A fish: plants A = compliant
+    ah_recount(env);
+    place_fish(env, b, 10.0f, 20.0f, 0.0f);
+    place_fish(env, 0, 10.0f, 30.0f, 0.0f);
+    set_action(&h, b, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    puf_step(env);
+    CHECK(env->plantings == 2 && env->violations == 1, "both planted, one violation");
+    CHECK(env->fish[b].freeze == 99 && env->fish[b].zapped_marked == 1 && env->auto_sanctions == 1 && env->freezes == 1,
+        "the violator is frozen on the spot (freeze %d = 100 - 1), auto_sanctions 1", env->fish[b].freeze);
+    CHECK(env->fish[0].freeze == 0 && env->fish[0].zapped_marked == 0, "the compliant planter is not frozen");
+    CHECK(env->fish[b].mark == 63, "the mark is set as usual (%d)", env->fish[b].mark);
+    for (int t = 0; t < 99; t++) {
+        puf_step(env);
+    }
+    CHECK(env->fish[b].freeze == 0, "and the freeze ends after 100 steps");
+    destroy(&h);
+    dict_clear(&kw);
+}
+
 static void test_inst(void) {
     test_inst_layout();
     test_inst_read();
@@ -2358,10 +2390,11 @@ static void test_inst(void) {
     test_inst_mark_until_zap();
     test_inst_wrongful();
     test_inst_roles_phase3();
+    test_inst_auto_freeze();
 }
 #else
 static void test_inst(void) {
-    printf("-- INST U13-U25: skipped (needs the -DWEF_INST build)\n");
+    printf("-- INST U13-U26: skipped (needs the -DWEF_INST build)\n");
 }
 #endif
 
