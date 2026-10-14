@@ -57,7 +57,7 @@ typedef float obs_t;
 // 110 at MAX_AGENTS 4 (upstream), 162 at 8.
 #define OBS_BASE_SIZE (NUM_MORMYROMASTS + NUM_AMPULLARY + (NUM_KNOLLEN + 1) * (MAX_AGENTS - 1) + ACTION_SIZE + 7)
 // Institution build (-DWEF_INST, docs/institutions-plan.md section 4): the row grows by one rule
-// slot, one own-mark slot and one mark slot per other fish (114 at 4 fish, 170 at 8). The default
+// slot, one own-mark slot and one mark slot per other fish (115 at 4 fish, 171 at 8). The default
 // and the 8-fish AH builds add nothing, so their rows and checkpoints are untouched.
 #ifdef WEF_INST
 #define INST_OBS_EXTRA (2 + (MAX_AGENTS - 1))
