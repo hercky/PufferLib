@@ -18,7 +18,7 @@
  *      min(8, MAX_AGENTS) fish; the slot numbers in the messages are derived from OBS_SIZE.
  *      U11 (default bench hash) and U12 (projection identity, `bench project=4`) are run
  *      by run_test.sh.
- *   6. Institutions (docs/institutions-plan.md section 4), checks U13-U28 (slot layout, beacon read
+ *   6. Institutions (docs/institutions-plan.md section 4), checks U13-U30 (slot layout, beacon read
  *      and latch, rule draws, violations and marks, zap cost, Commons season, beacon sensing, the
  *      Log, the V4 trace, the complier / enforcer roles). They need the -DWEF_INST build
  *      (build/wef_test8i via CFLAGS="-DMAX_AGENTS=8 -DWEF_INST") and are skipped elsewhere;
@@ -2332,7 +2332,7 @@ static void test_inst_wrongful(void) {
             "the sanction on the marked fish leaves fish 0 unmarked");
         if (on) {
             CHECK(env->fish[1].mark == 63 && env->fish[1].zaps_wrongful == 1 && env->fish[1].violations == 1
-                && env->zaps_wrongful == 1 && env->violations == 1 && env->fish[1].trace_violated,
+                && env->zaps_wrongful == 1 && env->violations == 1 && env->fish[1].trace_violated == 2,
                 "the bite on the unmarked fish marks fish 1 (mark %d, zaps_wrongful %d, violations %d)",
                 env->fish[1].mark, env->fish[1].zaps_wrongful, env->violations);
             CHECK(env->fish[1].bite_cooldown == 24 && env->fish[c].freeze == 24,
@@ -2665,6 +2665,168 @@ static void test_inst_rotating(void) {
     dict_clear(&kw);
 }
 
+// U29 (plan 11.1, D18b): duty to enforce. A bystander within inst_duty_cm of a marked fish takes the duty;
+// inst_duty_steps able, in-range steps without a sanction = a shirk (class 2, marked); out-of-range and
+// frozen steps do not count; its own or anyone's sanction discharges it; key off = no effect.
+static void test_inst_duty(void) {
+    printf("-- INST U29: duty to enforce (inst_duty_cm / inst_duty_steps)\n");
+    Dict kw = {0};
+    kw_inst_test(&kw, AH_FISH, 0);
+    dict_set(&kw, "inst_mark_until_zap", 1);
+    dict_set(&kw, "inst_duty_cm", 10);
+    dict_set(&kw, "inst_duty_steps", 5);
+    Harness h = make(&kw, AH_FISH);
+    Env* env = h.env;
+    clear_objects(env);
+    ah_park(&h, 0);                               // parked at y 36: >= 16 cm from the scene on y 20
+    int b = AH_FISH / 2;
+    ah_bush(env, 0, 12.0f, 20.0f, 0, false);      // unripe A ahead of the B fish: it plants B (first-order violation)
+    ah_recount(env);
+    place_fish(env, b, 10.0f, 20.0f, 0.0f);
+    place_fish(env, 0, 15.0f, 20.0f, 0.0f);       // bystander 5 cm away, still, never bites
+    ah_still(&h, 0);
+    set_action(&h, b, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    puf_step(env);
+    ah_still(&h, b);
+    FishAgent* f0 = &env->fish[0];
+    FishAgent* fb = &env->fish[b];
+    CHECK(fb->mark == 64 && fb->trace_violated == 1 && env->violations == 1,
+        "the planting marks fish b (class 0 -> trace violated 1, mark %d)", fb->mark);
+    CHECK(f0->duty_target == b && f0->duty_count == 0 && f0->duties == 1 && env->duties == 1 && fb->duty_target == -1,
+        "the bystander within 10 cm takes the duty the same step (count 0); nobody else is in range (duties %d)", env->duties);
+    for (int t = 0; t < 4; t++) {
+        puf_step(env);
+    }
+    CHECK(f0->duty_target == b && f0->duty_count == 4 && env->shirks == 0,
+        "4 able in-range steps counted (count %d), no shirk yet", f0->duty_count);
+    place_fish(env, 0, 25.0f, 20.0f, 0.0f);       // 15 cm: out of range
+    for (int t = 0; t < 3; t++) {
+        puf_step(env);
+    }
+    CHECK(f0->duty_target == b && f0->duty_count == 4 && env->shirks == 0,
+        "3 steps out of range: count still %d, the duty is kept", f0->duty_count);
+    place_fish(env, 0, 15.0f, 20.0f, 0.0f);
+    f0->freeze = 3;                               // frozen (place_fish cleared it): steps do not count
+    for (int t = 0; t < 3; t++) {
+        puf_step(env);
+    }
+    CHECK(f0->duty_target == b && f0->duty_count == 4 && f0->freeze == 0 && env->shirks == 0,
+        "3 frozen steps in range: count still %d", f0->duty_count);
+    puf_step(env);
+    CHECK(env->shirks == 1 && f0->shirks == 1 && f0->mark == 64 && f0->trace_violated == 3 && f0->violations == 1
+        && env->violations == 2 && f0->duty_target == -1 && f0->duty_count == 0 && f0->freeze == 0,
+        "the 5th able step is a shirk: fish 0 marked (class 2 -> trace 3), duty cleared, no auto-freeze (violations %d)",
+        env->violations);
+    CHECK(fb->duty_target == 0 && env->duties == 2, "the marked fish b now has a duty of its own on fish 0 (marked fish have duties too)");
+    puf_step(env);
+    CHECK(f0->duty_target == b && f0->duty_count == 0 && env->duties == 3, "a new duty on the still-marked b starts the next step");
+    // fish 0 sanctions b itself: the duty is discharged
+    place_fish(env, 0, 7.5f, 20.0f, 0.0f);
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    puf_step(env);
+    ah_still(&h, 0);
+    CHECK(f0->bite_victim == b && fb->mark == 0 && env->zaps_on_marked == 1, "fish 0 zaps b (mark cleared)");
+    CHECK(f0->duty_target == -1 && f0->duties_discharged == 1 && env->duties_discharged == 1 && env->shirks == 1,
+        "its own sanction discharges the duty (discharged %d, no second shirk)", env->duties_discharged);
+    // b marked again, another fish sanctions it: discharged as well
+    fb->mark = 64;
+    fb->freeze = 0;
+    place_fish(env, 0, 15.0f, 20.0f, 0.0f);
+    puf_step(env);
+    CHECK(f0->duty_target == b && env->duties == 4, "b marked again: fish 0 takes a new duty (duties %d)", env->duties);
+    place_fish(env, 1, 7.5f, 20.0f, 0.0f);
+    set_action(&h, 1, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    puf_step(env);
+    ah_still(&h, 1);
+    CHECK(env->fish[1].bite_victim == b && fb->mark == 0 && f0->duty_target == -1 && env->duties_discharged == 2,
+        "another fish's sanction discharges it too (discharged %d)", env->duties_discharged);
+    CHECK(env->fish[1].duty_target == 0 && env->duties == 5,
+        "fish 1, 7.5 cm from the marked fish 0, took a duty on it in the same step (duties %d)", env->duties);
+    // Log at the episode end: fish 0 (still marked) parked out of everyone's range, so no duty ends from here on
+    place_fish(env, 0, 50.0f, 20.0f, 0.0f);
+    while (env->episode == 0) {
+        puf_step(env);
+    }
+    CHECK(env->log.n == 1.0f && env->log.shirks == 1.0f && env->log.duties == 5.0f
+        && fabsf(env->log.duties_discharged_frac - 2.0f / 3.0f) < 1e-6f && env->log.violations == 2.0f,
+        "Log: shirks %.0f, duties %.0f, duties_discharged_frac %.3f (2 of 3 ended duties; 2 still open)",
+        env->log.shirks, env->log.duties, env->log.duties_discharged_frac);
+    destroy(&h);
+    // key off (default): the same scene, no duty
+    dict_set(&kw, "inst_duty_cm", 0);
+    Harness h2 = make(&kw, AH_FISH);
+    env = h2.env;
+    clear_objects(env);
+    ah_park(&h2, 0);
+    ah_bush(env, 0, 12.0f, 20.0f, 0, false);
+    ah_recount(env);
+    place_fish(env, b, 10.0f, 20.0f, 0.0f);
+    place_fish(env, 0, 15.0f, 20.0f, 0.0f);
+    ah_still(&h2, 0);
+    set_action(&h2, b, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    for (int t = 0; t < 10; t++) {
+        puf_step(env);
+    }
+    CHECK(env->fish[b].mark == 64 && env->fish[0].duty_target == -1 && env->duties == 0 && env->shirks == 0
+        && env->fish[0].mark == 0 && env->violations == 1,
+        "inst_duty_cm 0: b marked, the bystander has no duty after 10 steps (duties %d, shirks %d)", env->duties, env->shirks);
+    destroy(&h2);
+    dict_clear(&kw);
+}
+
+// U30 (plan 11.1, D18c): inst_auto_freeze_scope 1: a first-order violation marks without a freeze; a wrongful
+// bite and a shirk (second-order) freeze. U26 keeps scope 0 (every violation freezes).
+static void test_inst_freeze_scope(void) {
+    printf("-- INST U30: auto-freeze scope (inst_auto_freeze_scope)\n");
+    Dict kw = {0};
+    kw_inst_test(&kw, AH_FISH, 0);
+    dict_set(&kw, "inst_mark_until_zap", 1);
+    dict_set(&kw, "inst_mark_wrongful", 1);
+    dict_set(&kw, "inst_auto_freeze", 100);
+    dict_set(&kw, "inst_auto_freeze_scope", 1);
+    dict_set(&kw, "inst_duty_cm", 10);
+    dict_set(&kw, "inst_duty_steps", 2);
+    Harness h = make(&kw, AH_FISH);
+    Env* env = h.env;
+    clear_objects(env);
+    ah_park(&h, 0);
+    int b = AH_FISH / 2;
+    ah_bush(env, 0, 12.0f, 20.0f, 0, false);      // the B fish plants B: first-order violation
+    ah_recount(env);
+    place_fish(env, b, 10.0f, 20.0f, 0.0f);
+    place_fish(env, 0, 15.0f, 20.0f, 0.0f);       // bystander 5 cm from b
+    ah_still(&h, 0);
+    set_action(&h, b, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    place_fish(env, 1, 40.0f, 20.0f, 0.0f);       // fish 1 zaps the unmarked fish 3: a wrongful bite
+    place_fish(env, 3, 42.5f, 20.0f, 0.0f);
+    ah_still(&h, 3);
+    set_action(&h, 1, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    puf_step(env);
+    ah_still(&h, b);
+    ah_still(&h, 1);
+    FishAgent* f0 = &env->fish[0];
+    FishAgent* f1 = &env->fish[1];
+    FishAgent* fb = &env->fish[b];
+    CHECK(env->plantings == 1 && fb->mark == 64 && fb->trace_violated == 1 && fb->freeze == 0 && fb->zapped_marked == 0,
+        "scope 1: the first-order violation marks (mark %d) but does not freeze (freeze %d)", fb->mark, fb->freeze);
+    CHECK(f1->bite_victim == 3 && env->zaps_wrongful == 1 && f1->mark == 64 && f1->trace_violated == 2 && f1->freeze == 99
+        && f1->zapped_marked == 1 && env->auto_sanctions == 1,
+        "the wrongful bite marks AND freezes the biter (class 1 -> trace 2, freeze %d = 100 - 1)", f1->freeze);
+    CHECK(f0->duty_target == b && env->fish[3].duty_target == 1 && env->duties == 2,
+        "fish 0 took the duty on b; the frozen victim 3 took one on fish 1 (duties %d)", env->duties);
+    puf_step(env);
+    CHECK(f0->duty_count == 1 && env->fish[3].duty_count == 0 && env->shirks == 0,
+        "one able step counted for fish 0, none for the frozen fish 3");
+    puf_step(env);
+    CHECK(env->shirks == 1 && f0->mark == 64 && f0->trace_violated == 3 && f0->freeze == 99 && f0->zapped_marked == 1
+        && env->auto_sanctions == 2 && f0->duty_target == -1,
+        "the shirk marks and freezes fish 0 (class 2 -> trace 3, freeze %d), auto_sanctions 2", f0->freeze);
+    CHECK(fb->freeze == 0 && fb->mark == 64 && env->violations == 3,
+        "b is still only marked (violations %d: planting, wrongful bite, shirk)", env->violations);
+    destroy(&h);
+    dict_clear(&kw);
+}
+
 static void test_inst(void) {
     test_inst_layout();
     test_inst_read();
@@ -2682,10 +2844,12 @@ static void test_inst(void) {
     test_inst_auto_freeze();
     test_per_patch();
     test_inst_rotating();
+    test_inst_duty();
+    test_inst_freeze_scope();
 }
 #else
 static void test_inst(void) {
-    printf("-- INST U13-U28: skipped (needs the -DWEF_INST build)\n");
+    printf("-- INST U13-U30: skipped (needs the -DWEF_INST build)\n");
 }
 #endif
 
@@ -2801,6 +2965,10 @@ static int run_calibration(int argc, char** argv) {
     double zap_mk_step[MAX_AGENTS] = {0};
     double zapped_mk[MAX_AGENTS] = {0};   // phase 3: sanctions received while marked / wrongful bites given per slot
     double wrongful[MAX_AGENTS] = {0};
+    double shirks[MAX_AGENTS] = {0};      // phase 4: shirked duties per slot
+    double inst_shirks = 0.0;
+    double inst_duties = 0.0;
+    double inst_discharged = 0.0;         // discharged / ended duties
     double inst_wrongful = 0.0;
     double inst_sanctioned = 0.0;         // violations that met a sanction (zaps on marked / violations)
     double inst_comply = 0.0;
@@ -2841,7 +3009,7 @@ static int run_calibration(int argc, char** argv) {
                     FishAgent* f = &env->fish[i];
                     zaps_given_step[i] += f->bite_victim >= 0;
                     zaps_taken_step[i] += f->was_bitten;
-                    viol_step[i] += f->trace_violated;
+                    viol_step[i] += f->trace_violated > 0;  // class + 1: any class counts once
                     zap_mk_step[i] += f->trace_zap_marked;
                     plant_a_step[i] += f->trace_plant_type == 1;
                     plant_b_step[i] += f->trace_plant_type == 2;
@@ -2880,6 +3048,7 @@ static int run_calibration(int argc, char** argv) {
                     zap_mk[i] += zap_mk_step[i];
                     zapped_mk[i] += env->fish[i].zapped_marked;
                     wrongful[i] += env->fish[i].zaps_wrongful;
+                    shirks[i] += env->fish[i].shirks;
                 }
                 if (env->inst_mode > 0 || env->inst_obs) {
                     int comply = 0;
@@ -2901,6 +3070,10 @@ static int run_calibration(int argc, char** argv) {
                     inst_eats_closed += env->eats_closed;
                     inst_wrongful += env->zaps_wrongful;
                     inst_sanctioned += env->violations > 0 ? (double)env->zaps_on_marked / env->violations : 0.0;
+                    inst_shirks += env->shirks;
+                    inst_duties += env->duties;
+                    int ended = env->duties_discharged + env->shirks;
+                    inst_discharged += ended > 0 ? (double)env->duties_discharged / ended : 0.0;
                 }
                 if (env->inst_mode == 4) {
                     double fish_steps = (double)env->cur_episode_length * env->num_agents;
@@ -2941,11 +3114,12 @@ static int run_calibration(int argc, char** argv) {
             vsum += viol[i];
             zsum += zap_mk[i];
         }
-        printf("  inst_mode %d   comply %.3f   informed %.3f   first_visit %.3f   violations %.1f   marked_frac %.3f   exposure %.3f   zaps_on_marked %.1f   agree_final %.3f   closed_frac %.3f   eats_closed %.1f   zaps_wrongful %.1f   sanctions_per_viol %.3f\n",
+        printf("  inst_mode %d   comply %.3f   informed %.3f   first_visit %.3f   violations %.1f   marked_frac %.3f   exposure %.3f   zaps_on_marked %.1f   agree_final %.3f   closed_frac %.3f   eats_closed %.1f   zaps_wrongful %.1f   sanctions_per_viol %.3f   shirks %.1f   duties %.1f   discharged %.3f\n",
             env->inst_mode, inst_comply / episodes, inst_informed / episodes, inst_first_visit / episodes,
             vsum / episodes, inst_marked / episodes, inst_exposure / episodes, zsum / episodes,
             inst_agree / episodes, inst_closed / episodes, inst_eats_closed / episodes,
-            inst_wrongful / episodes, inst_sanctioned / episodes);
+            inst_wrongful / episodes, inst_sanctioned / episodes, inst_shirks / episodes, inst_duties / episodes,
+            inst_discharged / episodes);
     }
     if (env->inst_mode == 4 || env->regrow_per_patch) {
         printf("  rot: rotations %.1f   open_patch_frac %.3f   closed_patch_frac %.3f   stock_open_mean %.3f   patches_collapsed %.2f   in_open per slot:",
@@ -2961,23 +3135,23 @@ static int run_calibration(int argc, char** argv) {
             mono_final / episodes, mono_mean / episodes, t_conv / episodes, plantings / episodes,
             proactive / episodes, plant_noop_total / episodes, plant_attempts / episodes,
             zaps_cross / episodes, zaps_same / episodes, n_ripe_mean);
-        printf("  slot role taste pellets  return plant_a plant_b plant_noop zaps_given zaps_taken viol zap_mk zapped_mk wrongful\n");
+        printf("  slot role taste pellets  return plant_a plant_b plant_noop zaps_given zaps_taken viol zap_mk zapped_mk wrongful shirks\n");
         for (int i = 0; i < env->num_agents; i++) {
-            printf("  %4d %4d %5c %7.1f %7.2f %7.1f %7.1f %10.1f %10.1f %10.1f %4.1f %6.1f %9.1f %8.1f\n", i, env->roles[i],
+            printf("  %4d %4d %5c %7.1f %7.2f %7.1f %7.1f %10.1f %10.1f %10.1f %4.1f %6.1f %9.1f %8.1f %6.1f\n", i, env->roles[i],
                 taste_of[i] == 0 ? 'A' : 'B', pellets[i] / episodes, ret[i] / episodes,
                 plant_a[i] / episodes, plant_b[i] / episodes, noop[i] / episodes,
                 zaps_given[i] / episodes, zaps_taken[i] / episodes, viol[i] / episodes, zap_mk[i] / episodes,
-                zapped_mk[i] / episodes, wrongful[i] / episodes);
+                zapped_mk[i] / episodes, wrongful[i] / episodes, shirks[i] / episodes);
         }
     } else {
-        printf("  slot role pellets cleans strip%%  cleans/strip-step  return zaps_given zaps_taken viol zap_mk zapped_mk wrongful\n");
+        printf("  slot role pellets cleans strip%%  cleans/strip-step  return zaps_given zaps_taken viol zap_mk zapped_mk wrongful shirks\n");
         for (int i = 0; i < env->num_agents; i++) {
             double strip_steps = strip[i] / episodes * env->episode_length;
-            printf("  %4d %4d %7.1f %6.1f %5.1f%%  %.3f %7.2f %10.1f %10.1f %4.1f %6.1f %9.1f %8.1f\n", i, env->roles[i], pellets[i] / episodes,
+            printf("  %4d %4d %7.1f %6.1f %5.1f%%  %.3f %7.2f %10.1f %10.1f %4.1f %6.1f %9.1f %8.1f %6.1f\n", i, env->roles[i], pellets[i] / episodes,
                 cleans[i] / episodes, 100.0 * strip[i] / episodes,
                 strip_steps > 0 ? cleans[i] / episodes / strip_steps : 0.0,
                 ret[i] / episodes, zaps_given[i] / episodes, zaps_taken[i] / episodes, viol[i] / episodes, zap_mk[i] / episodes,
-                zapped_mk[i] / episodes, wrongful[i] / episodes);
+                zapped_mk[i] / episodes, wrongful[i] / episodes, shirks[i] / episodes);
         }
     }
     puf_close(env);

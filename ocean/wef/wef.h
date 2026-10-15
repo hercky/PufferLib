@@ -207,13 +207,19 @@ typedef struct FishAgent {
     int violations;        // rule-breaking acts this episode
     int comply_acts;       // rule-governed acts that followed the rule
     int rule_acts;         // rule-governed acts (AH: conversions; Commons: eats)
-    bool trace_violated;   // trace only: this step's act broke the rule
+    int trace_violated;    // trace only: 0 none; else violation class + 1 (1 first-order, 2 wrongful bite, 3 shirk)
     bool trace_zap_marked; // trace only: this step's zap landed on a marked fish
     int zapped_marked;     // sanctions received: bites taken while marked this episode
     int zaps_wrongful;     // bites given on an unmarked fish while a rule was in force (inst_mark_wrongful)
     bool bot_responded;    // role 15: has been sanctioned bot_respond_zaps times and now complies
     int in_open_steps;     // inst_mode 4: fish-steps inside the open patch's disk this episode (harness per-slot output)
     int in_closed_steps;   // inst_mode 4: ... inside the closed patch's disk
+    // duty to enforce (inst_duty_cm, plan 11.1 / D18b)
+    int duty_target;       // the marked fish this fish must sanction, -1 none
+    int duty_count;        // steps spent within inst_duty_cm of the target while able (not frozen)
+    int duties;            // duties taken this episode
+    int duties_discharged; // duties ended by the target losing its mark (any sanction, own or another's)
+    int shirks;            // class-2 violations: duties that ran to inst_duty_steps
 } FishAgent;
 
 // Shared sensor layouts (body radius fixed → identical for every fish)
@@ -394,6 +400,9 @@ struct Log {
     float zaps_wrongful;     // bites on unmarked fish per episode (the second-order violation when inst_mark_wrongful)
     float sanctions_per_viol;// zaps on marked fish / violations (1 = every violation met a sanction; 0 with no violation)
     float auto_sanctions;    // direct sanctions by the institution itself (inst_auto_freeze) per episode
+    float shirks;            // duty rule (inst_duty_cm): shirking violations per episode
+    float duties;            // duties taken per episode
+    float duties_discharged_frac; // discharged / ended duties (discharged + shirked; 0 with none)
     // Phase 4 (docs/institutions-plan.md 11.1): per-patch Commons (regrow_per_patch) and the rotating-patch rule (inst_mode 4).
     float patches_collapsed; // regrow_per_patch: patches at or below their Allee threshold at episode end
     float stock_open_mean;   // inst_mode 4: time-mean S_open / K_open (0 otherwise)
@@ -732,6 +741,12 @@ struct Env {
     int zaps_wrongful;          // per-episode counter
     int inst_auto_freeze;       // learnability ablation: a violation freezes the violator on the spot for this many steps (0 = off)
     int auto_sanctions;         // per-episode counter of those direct sanctions
+    int inst_auto_freeze_scope; // 0: every violation triggers inst_auto_freeze; 1: only second-order ones (wrongful bites, shirks)
+    float inst_duty_cm;         // duty to enforce (D18b): a fish within this range of a marked fish must sanction it (0 = off)
+    int inst_duty_steps;        // ... within this many able, in-range steps, or it is marked itself (class-2 violation)
+    int shirks;                 // per-episode counters of the duty rule
+    int duties;
+    int duties_discharged;
     int inst_pos_random;        // 0 beacon at the arena centre, 1 drawn uniformly per episode
     float inst_read_cm;         // a fish inside this radius reads the rule
     float inst_obj_radius_cm;   // the beacon's electrical signature: a waste-like conductor
@@ -826,16 +841,22 @@ static inline bool wef_at_beacon(const Wef* env, const FishAgent* fish) {
     return dx * dx + dy * dy <= env->inst_read_cm * env->inst_read_cm;
 }
 
-// A violation: mark the fish (public label) and count it.
-static inline void wef_inst_violation(Wef* env, int i) {
+// A violation: mark the fish (public label) and count it. cls: 0 first-order (the rule-governed
+// act: a wrong planting, an eat while closed / in the closed patch), 1 a wrongful bite
+// (inst_mark_wrongful), 2 shirking a duty (inst_duty_cm). The trace carries cls + 1.
+static inline void wef_inst_violation(Wef* env, int i, int cls) {
     FishAgent* fish = &env->fish[i];
     env->violations++;
     fish->violations++;
-    fish->trace_violated = true;
+    fish->trace_violated = cls + 1;
+    if (cls == 2) {
+        env->shirks++;
+        fish->shirks++;
+    }
     if (env->inst_mark_steps > 0) {
         fish->mark = env->inst_mark_steps;
     }
-    if (env->inst_auto_freeze > 0) {
+    if (env->inst_auto_freeze > 0 && (env->inst_auto_freeze_scope == 0 || cls > 0)) {
         // learnability ablation (docs/institutions-plan.md 9.6): the institution sanctions directly, certainly
         // and at once; no enforcer, no chase. The freeze runs from the act (an AH planting hold runs inside it).
         if (fish->freeze < env->inst_auto_freeze) {
@@ -1599,6 +1620,9 @@ void puf_reset(Wef* env) {
     env->bounty_sum = 0.0f;
     env->zaps_wrongful = 0;
     env->auto_sanctions = 0;
+    env->shirks = 0;
+    env->duties = 0;
+    env->duties_discharged = 0;
     env->plantings_p = 0;
     env->plantings_np = 0;
     // Only the first episode of an env can be shortened (desync_first_episode).
@@ -1616,6 +1640,7 @@ void puf_reset(Wef* env) {
         agent.last_plant_type = -1;
         agent.last_eaten_slot = -1;
         agent.trace_planted_slot = -1;
+        agent.duty_target = -1;
         // Size draw: exactly one random_uniform per fish in every mode, so the RNG stream of
         // the default path is unchanged. AH taste (0 = A, 1 = B) follows size: taste_n_a == -1
         // thresholds the free draw at taste_split; n >= 0 pins slots < n to band A and the rest
@@ -2493,7 +2518,7 @@ void puf_step(Wef* env) {
         env->fish[i].trace_planted_slot = -1;
         env->fish[i].trace_ate_type = 0;
         env->fish[i].trace_plant_noop = false;
-        env->fish[i].trace_violated = false;
+        env->fish[i].trace_violated = 0;
         env->fish[i].trace_zap_marked = false;
         env->clean_pending[i] = 0;
         env->plant_pending[i] = 0;
@@ -2584,7 +2609,7 @@ void puf_step(Wef* env) {
                         bool closed = env->inst_mode == 4 ? wef_inst_pellet_closed(env, f) : wef_inst_closed(env, i);
                         if (closed) {
                             env->eats_closed++;
-                            wef_inst_violation(env, i);
+                            wef_inst_violation(env, i, 0);
                         } else {
                             agent->comply_acts++;
                         }
@@ -2840,7 +2865,7 @@ void puf_step(Wef* env) {
                 // biter is marked like any rule-breaker (and sanctioning it is then legitimate)
                 env->zaps_wrongful++;
                 attacker->zaps_wrongful++;
-                wef_inst_violation(env, i);
+                wef_inst_violation(env, i, 1);
             }
             if (env->allelo || env->inst_mode > 0) {
                 attacker->bite_cooldown = marked_victim
@@ -2891,7 +2916,7 @@ void puf_step(Wef* env) {
                 if (plant_type == rule) {
                     attacker->comply_acts++;
                 } else {
-                    wef_inst_violation(env, i);
+                    wef_inst_violation(env, i, 0);
                 }
             }
             attacker->last_plant_type = plant_type;
@@ -3196,6 +3221,59 @@ void puf_step(Wef* env) {
         if (env->allelo) {
             env->inst_agree_sum += (float)env->n_type[env->inst_type] / (float)env->num_food;
         }
+        if (env->inst_duty_cm > 0.0f) {
+            // Duty to enforce (plan 11.1, D18b), after this step's bites and marks: a fish with no
+            // duty takes the nearest OTHER marked fish within inst_duty_cm as its target; a fish
+            // with a duty is discharged once the target is unmarked (any sanction, its own or
+            // another's), and otherwise counts the steps it spends in range and able (not frozen);
+            // at inst_duty_steps it has shirked (a class-2 violation: marked, counted in shirks)
+            // and the duty is cleared (a new one may start next step). Marked fish have duties too.
+            float r2 = env->inst_duty_cm * env->inst_duty_cm;
+            for (int i = 0; i < env->num_agents; i++) {
+                FishAgent* fish = &env->fish[i];
+                if (fish->duty_target < 0) {
+                    int target = -1;
+                    float best = INFINITY;
+                    for (int j = 0; j < env->num_agents; j++) {
+                        if (j == i || env->fish[j].mark <= 0) {
+                            continue;
+                        }
+                        float dx = env->fish[j].pos.x - fish->pos.x;
+                        float dy = env->fish[j].pos.y - fish->pos.y;
+                        float d2 = dx * dx + dy * dy;
+                        if (d2 <= r2 && d2 < best) {
+                            best = d2;
+                            target = j;
+                        }
+                    }
+                    if (target >= 0) {
+                        fish->duty_target = target;
+                        fish->duty_count = 0;
+                        fish->duties++;
+                        env->duties++;
+                    }
+                    continue;
+                }
+                const FishAgent* target = &env->fish[fish->duty_target];
+                if (target->mark <= 0) {
+                    fish->duties_discharged++;
+                    env->duties_discharged++;
+                    fish->duty_target = -1;
+                    fish->duty_count = 0;
+                    continue;
+                }
+                float dx = target->pos.x - fish->pos.x;
+                float dy = target->pos.y - fish->pos.y;
+                if (dx * dx + dy * dy <= r2 && fish->freeze <= 0) {
+                    fish->duty_count++;
+                    if (fish->duty_count >= env->inst_duty_steps) {
+                        wef_inst_violation(env, i, 2);
+                        fish->duty_target = -1;
+                        fish->duty_count = 0;
+                    }
+                }
+            }
+        }
         // marks, exposure (the mark-blind null for zap targeting) and informed fish
         for (int i = 0; i < env->num_agents; i++) {
             env->marked_steps += env->fish[i].mark > 0;
@@ -3431,6 +3509,11 @@ void puf_step(Wef* env) {
             env->log.sanctions_per_viol += env->violations > 0
                 ? (float)env->zaps_on_marked / (float)env->violations : 0.0f;
             env->log.auto_sanctions += (float)env->auto_sanctions;
+            env->log.shirks += (float)env->shirks;
+            env->log.duties += (float)env->duties;
+            int duties_ended = env->duties_discharged + env->shirks;
+            env->log.duties_discharged_frac += duties_ended > 0
+                ? (float)env->duties_discharged / (float)duties_ended : 0.0f;
             if (env->inst_mode == 4) {
                 env->log.stock_open_mean += env->stock_open_sum / ticks;
                 env->log.rotations += (float)env->rotations;
@@ -3868,6 +3951,10 @@ void puf_render(Wef* env) {
             DrawRectangleLinesEx((Rectangle){center.x - radius - 7.0f, center.y - radius - 7.0f, side, side}, 3.0f,
                 ColorAlpha(WEF_COLOR_MARK, a));
         }
+        if (env->inst_duty_cm > 0.0f && agent->duty_target >= 0) {
+            // an active duty to sanction a marked fish: a thin yellow ring outside the mark square
+            DrawRing(center, radius + 11.0f, radius + 12.5f, 0.0f, 360.0f, 48, ColorAlpha(WEF_COLOR_HOLD, 0.9f));
+        }
         if (env->inst_mode > 0 && agent->informed) {
             Color ic = agent->inst_val > 0.0f ? (env->allelo ? WEF_COLOR_FOOD : WEF_COLOR_BITE)
                 : agent->inst_val < 0.0f ? (env->allelo ? WEF_COLOR_FOOD_B : WEF_COLOR_FOOD) : WEF_COLOR_MIDGRAY;
@@ -3969,6 +4056,9 @@ void puf_render(Wef* env) {
                 rule, informed, env->num_agents, env->violations, marked, env->zaps_on_marked, env->bites, env->zaps_wrongful)
             : TextFormat("%s   informed %d/%d   violations %d   marked %d   zaps on marked %d/%d",
                 rule, informed, env->num_agents, env->violations, marked, env->zaps_on_marked, env->bites);
+        if (env->inst_duty_cm > 0.0f) {
+            line = TextFormat("%s   shirks %d", line, env->shirks);
+        }
         DrawText(line, 20, 44, 18, WEF_COLOR_INST);
         DrawText("body = taste (green A / magenta B) | white square = marked | X = frozen | yellow core = hold | tail square = rule read | crown = Queen",
             20, 66, 13, WEF_COLOR_MIDGRAY);
@@ -4070,6 +4160,7 @@ static const char* WEF_ENV_KEYS[] = {
     "inst_mark_steps", "mark_zap_reward", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
     "inst_obj_radius_cm", "inst_contrast", "inst_latch", "mark_freeze_steps",
     "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze",
+    "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps",
 };
 
 static void wef_check_keys(Dict* kwargs) {
@@ -4216,6 +4307,9 @@ void puf_init(Env* env, Dict* kwargs) {
     env->inst_mark_wrongful = wef_cfg(kwargs, "inst_mark_wrongful", 0);
     env->bot_respond_zaps = wef_cfg(kwargs, "bot_respond_zaps", 1);
     env->inst_auto_freeze = wef_cfg(kwargs, "inst_auto_freeze", 0);
+    env->inst_auto_freeze_scope = wef_cfg(kwargs, "inst_auto_freeze_scope", 0);
+    env->inst_duty_cm = wef_cfg(kwargs, "inst_duty_cm", 0.0);
+    env->inst_duty_steps = wef_cfg(kwargs, "inst_duty_steps", 64);
     {
         // roles = r0,r1,r2,r3 (comma list; a scalar applies to slot 0 only)
         DictItem* item = dict_find(kwargs, "roles");
@@ -4254,6 +4348,11 @@ void puf_init(Env* env, Dict* kwargs) {
     assert(env->bot_respond_zaps >= 1);
     assert(env->inst_auto_freeze >= 0 && (env->inst_auto_freeze == 0 || env->inst_mode > 0)
         && "inst_auto_freeze needs inst_mode > 0");
+    assert((env->inst_auto_freeze_scope == 0 || (env->inst_auto_freeze_scope == 1 && env->inst_auto_freeze > 0))
+        && "inst_auto_freeze_scope: 0 every violation, 1 second-order only (needs inst_auto_freeze > 0)");
+    assert(env->inst_duty_cm >= 0.0f && env->inst_duty_steps > 0
+        && (env->inst_duty_cm == 0.0f || (env->inst_mode > 0 && env->inst_mark_steps > 0 && env->inst_mark_until_zap))
+        && "inst_duty_cm > 0 needs inst_mode > 0, inst_mark_steps > 0 and inst_mark_until_zap 1 (a persistent mark)");
     assert(env->inst_mark_steps >= 0 && env->mark_zap_cooldown >= -1 && env->mark_freeze_steps >= -1
         && env->inst_read_cm > 0.0f && env->inst_obj_radius_cm > 0.0f);
     assert((env->inst_pos_random == 0 || env->inst_pos_random == 1) && (env->inst_latch == 0 || env->inst_latch == 1));
@@ -4448,6 +4547,10 @@ static void wef_log_inst_tail(Log* log, Dict* out) {
     dict_set(out, "zaps_wrongful", log->zaps_wrongful);
     dict_set(out, "sanctions_per_viol", log->sanctions_per_viol);
     dict_set(out, "auto_sanctions", log->auto_sanctions);
+    // phase 4 duty rule (zero unless inst_duty_cm > 0)
+    dict_set(out, "shirks", log->shirks);
+    dict_set(out, "duties", log->duties);
+    dict_set(out, "duties_discharged_frac", log->duties_discharged_frac);
     // phase 4: per-patch Commons and the rotating-patch rule (zero unless regrow_per_patch / inst_mode 4)
     dict_set(out, "patches_collapsed", log->patches_collapsed);
     dict_set(out, "stock_open_mean", log->stock_open_mean);
