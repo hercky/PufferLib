@@ -609,6 +609,7 @@ struct Env {
     float sustain_frac;         // metrics only: stock fraction at/below which eating counts as defecting
     int num_patches;            // patchy layout: patches per episode (0 = ceil(patch_density * area), upstream)
     int regrow_in_patches;      // commons (modes 2/3): regrown pellets land inside this episode's patches
+    int patch_layout;           // patchy layout: 0 centres drawn uniformly (upstream), 1 opposite corners (then the other two; the rest random)
     float bot_camp;             // scripted eaters: > 0 = with no pellet in range, circle the last eating spot at this radius (cm) instead of patrolling
     Vec2 patch_center[MAX_PATCHES];   // this episode's patches (patchy layout only)
     float patch_radius_ep[MAX_PATCHES];
@@ -1655,6 +1656,29 @@ void puf_reset(Wef* env) {
             1, MAX_PATCHES
         );
         for (int p = 0; p < num_patches; p++) {
+            if (env->patch_layout == 1 && p < 4) {
+                // patch_layout 1: the first two patches sit in opposite corners (bottom-left,
+                // top-right), the next two in the other corners, each inset by its radius plus
+                // one body length so the whole disk is inside the arena; further patches are
+                // random. The radius is drawn first (the centre needs it); the default layout
+                // keeps upstream's draw order (x, y, radius), so its RNG stream is unchanged.
+                radii[p] = clamp(
+                    env->patch_radius_cm + random_uniform(
+                        env, -env->patch_radius_std_cm, env->patch_radius_std_cm
+                    ),
+                    1.0f, max_radius
+                );
+                float inset = radii[p] + 2.0f * BODY_RADIUS_CM;
+                float lo_x = fminf(inset, 0.5f * env->arena_size_x);
+                float lo_y = fminf(inset, 0.5f * env->arena_size_y);
+                bool right = p == 1 || p == 3;
+                bool top = p == 1 || p == 2;
+                centers_x[p] = right ? env->arena_size_x - lo_x : lo_x;
+                centers_y[p] = top ? env->arena_size_y - lo_y : lo_y;
+                env->patch_center[p] = (Vec2){centers_x[p], centers_y[p]};
+                env->patch_radius_ep[p] = radii[p];
+                continue;
+            }
             centers_x[p] = random_uniform(env, 0.0f, env->arena_size_x);
             centers_y[p] = random_uniform(env, 0.0f, env->arena_size_y);
             radii[p] = clamp(
@@ -3824,7 +3848,7 @@ static const char* WEF_ENV_KEYS[] = {
     "proximity_shaping", "obs_extra", "size_min", "size_max", "desync_first_episode",
     "policy1_agents", "no_clean_agents", "roles", "bot_shift_steps", "bot_oracle", "bot_theta",
     "render_field", "render_field_alpha", "sustain_frac", "num_patches", "regrow_in_patches",
-    "bot_camp",
+    "bot_camp", "patch_layout",
     // Allelopathic Harvest (docs/wef-allelopathic-harvest-v0-design.md 4.1)
     "allelo", "ripen_lin", "ripen_cubic", "ripen_pow", "ripen_min_steps", "start_frac_a",
     "start_ripe_frac", "food_contrast_a", "food_contrast_b", "food_radius_unripe_cm",
@@ -3922,6 +3946,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->sustain_frac = wef_cfg(kwargs, "sustain_frac", 0.5);
     env->num_patches = wef_cfg(kwargs, "num_patches", 0);
     env->regrow_in_patches = wef_cfg(kwargs, "regrow_in_patches", 0);
+    env->patch_layout = wef_cfg(kwargs, "patch_layout", 0);
     env->bot_camp = wef_cfg(kwargs, "bot_camp", 0);
     // Allelopathic Harvest (section 4.1). Defaults reproduce upstream.
     env->allelo = wef_cfg(kwargs, "allelo", 0);
@@ -4091,6 +4116,7 @@ void puf_init(Env* env, Dict* kwargs) {
         && "regrow_mode 3 (seasonal) needs season_steps > 0 and cleanup = 0");
     env->regrows = env->regrow_p_max > 0.0f || env->regrow_mode == 3;
     assert(env->num_patches >= 0 && env->num_patches <= MAX_PATCHES);
+    assert(env->patch_layout == 0 || env->patch_layout == 1);
     assert((!env->regrow_in_patches || (env->regrow_mode >= 2 && env->food_distribution != FOOD_UNIFORM))
         && "regrow_in_patches needs a commons mode (2/3) and a patchy food layout");
     assert(env->regrow_radius_cm > 0.0f);

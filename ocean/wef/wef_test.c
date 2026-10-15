@@ -639,6 +639,37 @@ static void test_patchy_commons(void) {
     CHECK(h2.env->food_active == 24 && h2.env->num_food == 64, "commons food_start: %d of %d active at reset",
         h2.env->food_active, h2.env->num_food);
     dict_clear(&kw2);
+    // patch_layout 1: two patches in opposite corners, whole disks inside the arena, every pellet in one of them.
+    Dict kw3 = {0};
+    kw_base(&kw3, 1);
+    kw_harvest(&kw3);
+    dict_set(&kw3, "regrow_mode", 2);
+    dict_set(&kw3, "food_distribution", FOOD_PATCHY);
+    dict_set(&kw3, "num_patches", 2);
+    dict_set(&kw3, "patch_radius", 6);
+    dict_set(&kw3, "patch_radius_std", 0);
+    dict_set(&kw3, "regrow_in_patches", 1);
+    dict_set(&kw3, "patch_layout", 1);
+    Harness h3 = make(&kw3, 1);
+    Env* e3 = h3.env;
+    float inset = 6.0f + 2.0f * BODY_RADIUS_CM;
+    bool corners = fabsf(e3->patch_center[0].x - inset) < 1e-4f && fabsf(e3->patch_center[0].y - inset) < 1e-4f
+        && fabsf(e3->patch_center[1].x - (e3->arena_size_x - inset)) < 1e-4f
+        && fabsf(e3->patch_center[1].y - (e3->arena_size_y - inset)) < 1e-4f;
+    int out3 = 0;
+    for (int f = 0; f < e3->num_food; f++) {
+        bool inside = false;
+        for (int p = 0; p < 2; p++) {
+            float dx = e3->food[f].pos.x - e3->patch_center[p].x;
+            float dy = e3->food[f].pos.y - e3->patch_center[p].y;
+            inside |= dx * dx + dy * dy <= 36.0f + 1e-3f;
+        }
+        out3 += !inside;
+    }
+    CHECK(corners && out3 == 0, "patch_layout 1: patches at (%.1f, %.1f) and (%.1f, %.1f) in a %.0f x %.0f arena, %d pellets outside",
+        e3->patch_center[0].x, e3->patch_center[0].y, e3->patch_center[1].x, e3->patch_center[1].y,
+        e3->arena_size_x, e3->arena_size_y, out3);
+    dict_clear(&kw3);
 }
 
 static void test_baseline(void) {
