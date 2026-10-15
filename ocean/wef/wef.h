@@ -4417,8 +4417,7 @@ void puf_init(Env* env, Dict* kwargs) {
     assert(env->bot_respond_zaps >= 1);
     assert(env->inst_auto_freeze >= 0 && (env->inst_auto_freeze == 0 || env->inst_mode > 0)
         && "inst_auto_freeze needs inst_mode > 0");
-    assert(env->inst_grace_steps >= 0 && (env->inst_grace_steps == 0 || env->inst_mode == 4)
-        && "inst_grace_steps needs inst_mode 4");
+    assert(env->inst_grace_steps >= 0 && "inst_grace_steps >= 0 (inert unless inst_mode 4, so a preset can carry it into the control arm)");
     assert((env->inst_auto_freeze_scope == 0 || (env->inst_auto_freeze_scope == 1 && env->inst_auto_freeze > 0))
         && "inst_auto_freeze_scope: 0 every violation, 1 second-order only (needs inst_auto_freeze > 0)");
     assert(env->inst_duty_cm >= 0.0f && env->inst_duty_steps > 0
