@@ -162,7 +162,7 @@ typedef struct FishAgent {
     bool was_bitten;
     bool ate;         // trace only: ate a pellet this step
     bool collided;    // trace only: move reverted by a fish collision this step
-    int bite_victim;  // trace only: index of fish bitten this step, -1 if none
+    int bite_victim;  // trace and enf_* metrics: index of fish bitten this step, -1 if none
     int freeze;       // cleanup: steps left of the bitten timeout (0 unless bitten_freeze_steps > 0)
     bool can_clean;   // cleanup: false for enforced free-riders (no_clean_agents)
     int cleaned;      // trace only: waste items removed this step
@@ -210,10 +210,10 @@ typedef struct FishAgent {
     int comply_acts;       // rule-governed acts that followed the rule
     int rule_acts;         // rule-governed acts (AH: conversions; Commons: eats)
     int trace_violated;    // trace only: 0 none; else violation class + 1 (1 first-order, 2 wrongful bite, 3 shirk)
-    bool trace_zap_marked; // trace only: this step's zap landed on a marked fish
+    bool trace_zap_marked; // trace and enf_* metrics: this step's zap landed on a marked fish
     int zapped_marked;     // sanctions received: bites taken while marked this episode
     int zaps_wrongful;     // bites given on an unmarked fish while a rule was in force (inst_mark_wrongful)
-    int opp_steps;         // second-order free riding: steps with another fish marked within MORM_AGENT_RANGE_CM while this fish was not frozen
+    int opp_steps;         // second-order free riding: steps with another fish marked and biteable (not frozen) within MORM_AGENT_RANGE_CM while this fish was not frozen
     int zaps_marked;       // sanctions given: bites by this fish that landed on a marked fish this episode
     bool bot_responded;    // role 15: has been sanctioned bot_respond_zaps times and now complies
     int in_open_steps;     // inst_mode 4: fish-steps inside the open patch's disk this episode (harness per-slot output)
@@ -418,10 +418,18 @@ struct Log {
     float open_patch_frac;   // inst_mode 4: fish-steps inside the open patch's disk / fish-steps (migration)
     float closed_patch_frac; // inst_mode 4: the same for the closed patch
     // Second-order free riding (enforcement; docs/env-changes.md 3h). inst_mode > 0 only, 0 otherwise. A fish-episode is
-    // exposed with >= WEF_ENF_OMIN opportunity steps (another fish marked within MORM_AGENT_RANGE_CM while it was not frozen).
+    // exposed with >= WEF_ENF_OMIN opportunity steps (another fish marked and biteable within MORM_AGENT_RANGE_CM while it
+    // was not frozen). The Log aggregator divides every key by n, so the first three are per-episode means with 0 for an
+    // episode in which they are undefined; the four counts make the pooled / conditional values: free riders / exposed
+    // = the pooled free-rider share, enf_premium / enf_premium_n = the within-episode premium over the episodes that
+    // have both kinds of exposed fish, enf_gini / enf_gini_n = the Gini over the episodes with a sanction.
     float enf_free_rider_share; // exposed fish with no zap on a marked fish / exposed fish (0 if none exposed)
     float enf_gini;          // Gini of zaps on marked fish across the fish (0 without a sanction)
     float enf_premium;       // mean return of exposed non-sanctioners - exposed sanctioners (0 if either group is empty)
+    float enf_exposed;       // exposed fish per episode
+    float enf_free_riders;   // exposed fish with no zap on a marked fish per episode
+    float enf_premium_n;     // 1 if the episode had both exposed sanctioners and exposed non-sanctioners (enf_premium defined)
+    float enf_gini_n;        // 1 if the episode had a zap on a marked fish (enf_gini defined)
     float n;
 };
 
@@ -2551,29 +2559,42 @@ float wef_gini(const int* x, int n) {
 
 // Second-order free riding (enforcement) metrics of the episode so far (Log keys enf_*; the harness
 // prints the same). Exposed = opp_steps >= WEF_ENF_OMIN; sanctioner = zaps_marked >= 1. Metrics only.
-static void wef_enf_metrics(const Wef* env, float* free_rider_share, float* gini, float* premium) {
+typedef struct {
+    int exposed;          // exposed fish
+    int riders;           // exposed fish with no zap on a marked fish
+    int premium_defined;  // both exposed sanctioners and exposed non-sanctioners present
+    int gini_defined;     // at least one zap on a marked fish
+    float share;          // riders / exposed (0 if none exposed)
+    float gini;           // Gini of zaps_marked across all fish (0 without a sanction)
+    float premium;        // mean return of the riders - mean return of the exposed sanctioners (0 if undefined)
+} WefEnf;
+
+static WefEnf wef_enf_metrics(const Wef* env) {
+    WefEnf m = {0};
     int zm[MAX_AGENTS];
-    int exposed = 0;
-    int riders = 0;
+    int zm_total = 0;
     float ret_rider = 0.0f;
     float ret_enf = 0.0f;
     for (int i = 0; i < env->num_agents; i++) {
         zm[i] = env->fish[i].zaps_marked;
+        zm_total += zm[i];
         if (env->fish[i].opp_steps >= WEF_ENF_OMIN) {
-            exposed++;
+            m.exposed++;
             if (zm[i] == 0) {
-                riders++;
+                m.riders++;
                 ret_rider += env->return_by[i];
             } else {
                 ret_enf += env->return_by[i];
             }
         }
     }
-    int enforcers = exposed - riders;
-    *free_rider_share = exposed > 0 ? (float)riders / (float)exposed : 0.0f;
-    *gini = wef_gini(zm, env->num_agents);
-    *premium = riders > 0 && enforcers > 0
-        ? ret_rider / (float)riders - ret_enf / (float)enforcers : 0.0f;
+    int enforcers = m.exposed - m.riders;
+    m.premium_defined = m.riders > 0 && enforcers > 0;
+    m.gini_defined = zm_total > 0;
+    m.share = m.exposed > 0 ? (float)m.riders / (float)m.exposed : 0.0f;
+    m.gini = wef_gini(zm, env->num_agents);
+    m.premium = m.premium_defined ? ret_rider / (float)m.riders - ret_enf / (float)enforcers : 0.0f;
+    return m;
 }
 
 // Bite-selectivity helpers (metrics only; no effect on dynamics or RNG).
@@ -3411,6 +3432,16 @@ void puf_step(Wef* env) {
             }
         }
         // marks, exposure (the mark-blind null for zap targeting) and informed fish
+        // Sanction opportunities (enf_* keys): fish j could be sanctioned at this step if it is marked and not frozen
+        // (frozen fish are bite-immune) after this step's bites, or if a sanction landed on it this step (the bite block
+        // has already frozen it and, under inst_mark_until_zap, cleared its mark; before the bite it was marked and
+        // biteable, which is why the sanction landed). Freeze values are read before this step's decrement.
+        bool sanctioned_now[MAX_AGENTS] = {false};
+        for (int i = 0; i < env->num_agents; i++) {
+            if (env->fish[i].bite_victim >= 0 && env->fish[i].trace_zap_marked) {
+                sanctioned_now[env->fish[i].bite_victim] = true;
+            }
+        }
         for (int i = 0; i < env->num_agents; i++) {
             env->marked_steps += env->fish[i].mark > 0;
             env->informed_steps += env->fish[i].informed;
@@ -3423,8 +3454,8 @@ void puf_step(Wef* env) {
                 if (dx * dx + dy * dy <= MORM_AGENT_RANGE_CM * MORM_AGENT_RANGE_CM) {
                     env->pair_steps++;
                     env->pair_marked_steps += env->fish[j].mark > 0;
-                    // an opportunity to sanction (enf_* keys): j marked, i able to bite (freeze read before this step's decrement)
-                    env->fish[i].opp_steps += env->fish[j].mark > 0 && env->fish[i].freeze == 0;
+                    bool j_biteable = sanctioned_now[j] || (env->fish[j].mark > 0 && env->fish[j].freeze == 0);
+                    env->fish[i].opp_steps += j_biteable && env->fish[i].freeze == 0;
                 }
             }
         }
@@ -3660,11 +3691,14 @@ void puf_step(Wef* env) {
                 env->log.closed_patch_frac += (float)env->closed_patch_steps / fish_steps;
             }
             if (env->inst_mode > 0) {
-                float share, gini, premium;
-                wef_enf_metrics(env, &share, &gini, &premium);
-                env->log.enf_free_rider_share += share;
-                env->log.enf_gini += gini;
-                env->log.enf_premium += premium;
+                WefEnf m = wef_enf_metrics(env);
+                env->log.enf_free_rider_share += m.share;
+                env->log.enf_gini += m.gini;
+                env->log.enf_premium += m.premium;
+                env->log.enf_exposed += (float)m.exposed;
+                env->log.enf_free_riders += (float)m.riders;
+                env->log.enf_premium_n += (float)m.premium_defined;
+                env->log.enf_gini_n += (float)m.gini_defined;
             }
         }
         env->log.n += 1.0f;
@@ -4712,6 +4746,10 @@ static void wef_log_inst_tail(Log* log, Dict* out) {
     dict_set(out, "enf_free_rider_share", log->enf_free_rider_share);
     dict_set(out, "enf_gini", log->enf_gini);
     dict_set(out, "enf_premium", log->enf_premium);
+    dict_set(out, "enf_exposed", log->enf_exposed);
+    dict_set(out, "enf_free_riders", log->enf_free_riders);
+    dict_set(out, "enf_premium_n", log->enf_premium_n);
+    dict_set(out, "enf_gini_n", log->enf_gini_n);
 }
 
 // The rest of the AH keys (off the 30-key live dashboard in the AH build, in the [metrics] series).

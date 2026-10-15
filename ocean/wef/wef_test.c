@@ -3071,15 +3071,17 @@ static void test_inst_freeze_scope(void) {
 }
 
 
-// U33: second-order free riding Log keys (enf_free_rider_share, enf_gini, enf_premium). A marked fish b; fish 0 sits 2.5 cm
-// behind it for the whole mark (exposed) and zaps it once at step 40 (the enforcer); fish 1 sits 5 cm ahead of it for the
-// whole mark and never bites (the free rider); the last slot is beside b for 10 steps only (below WEF_ENF_OMIN: not exposed).
+// U33: second-order free riding Log keys (enf_free_rider_share, enf_gini, enf_premium and the enf_* counts). A marked fish b;
+// fish 0 sits 2.5 cm behind it for the whole mark (exposed) and zaps it once at step 43 (the enforcer); fish 1 sits 5 cm ahead
+// of it for the whole mark and never bites (the free rider); the last slot is beside b for 10 steps only (below WEF_ENF_OMIN:
+// not exposed). The sanction freezes b for 10 steps: a frozen marked fish is bite-immune and is no opportunity for anyone.
 static void test_inst_free_riding(void) {
-    printf("-- INST U33: second-order free riding (enf_free_rider_share, enf_gini, enf_premium)\n");
+    printf("-- INST U33: second-order free riding (enf_free_rider_share, enf_gini, enf_premium, enf_* counts)\n");
     Dict kw = {0};
     kw_inst_test(&kw, AH_FISH, 0);
     dict_set(&kw, "episode_length", 80);
     dict_set(&kw, "mark_zap_reward", 0.25);       // a bounty, so the enforcer's return differs from the free rider's
+    dict_set(&kw, "mark_freeze_steps", 10);       // the sanction freezes b for steps 44..52 (9 opportunity-free steps)
     Harness h = make(&kw, AH_FISH);
     Env* env = h.env;
     const int n = env->num_agents;
@@ -3113,16 +3115,24 @@ static void test_inst_free_riding(void) {
     ah_still(&h, 0);
     CHECK(env->fish[0].bite_victim == b && env->zaps_on_marked == 1 && env->fish[0].zaps_marked == 1 && env->fish[1].zaps_marked == 0,
         "fish 0 zapped the marked b (zaps_marked 1; fish 1 0)");
-    float share, gini, premium;
-    wef_enf_metrics(env, &share, &gini, &premium);
-    CHECK(share == 0.5f && fabsf(gini - (float)(n - 1) / (float)n) < 1e-6f && fabsf(premium + 0.25f) < 1e-5f,
+    CHECK(fb->freeze == 9 && env->fish[0].opp_steps == 43 && env->fish[1].opp_steps == 41,
+        "the sanction step counts as an opportunity for both (43 / 41: %d %d) although b is already frozen (%d)",
+        env->fish[0].opp_steps, env->fish[1].opp_steps, fb->freeze);
+    puf_step(env);
+    puf_step(env);
+    CHECK(fb->mark > 0 && fb->freeze == 7 && env->fish[0].opp_steps == 43 && env->fish[1].opp_steps == 41,
+        "a frozen marked fish is bite-immune: no opportunity while b is frozen (%d %d)", env->fish[0].opp_steps, env->fish[1].opp_steps);
+    WefEnf m = wef_enf_metrics(env);
+    CHECK(m.share == 0.5f && fabsf(m.gini - (float)(n - 1) / (float)n) < 1e-6f && fabsf(m.premium + 0.25f) < 1e-5f,
         "mid-episode: share 1/2 (fish 0 and 1 exposed, fish %d not), Gini (N-1)/N = %.4f, premium -0.25 (the bounty) (%.4f %.4f %.4f)",
-        s, (float)(n - 1) / (float)n, share, gini, premium);
+        s, (float)(n - 1) / (float)n, m.share, m.gini, m.premium);
+    CHECK(m.exposed == 2 && m.riders == 1 && m.premium_defined && m.gini_defined,
+        "mid-episode counts: exposed 2, free riders 1, premium and Gini defined (%d %d %d %d)", m.exposed, m.riders, m.premium_defined, m.gini_defined);
     while (env->tick < env->cur_episode_length - 1) {
         puf_step(env);
     }
-    CHECK(env->fish[0].opp_steps == 64 && env->fish[1].opp_steps == 62 && env->fish[s].opp_steps == 10 && fb->mark == 0,
-        "the mark lasted 64 steps: opportunities 64 / 62 / 10 (%d %d %d)", env->fish[0].opp_steps, env->fish[1].opp_steps, env->fish[s].opp_steps);
+    CHECK(env->fish[0].opp_steps == 55 && env->fish[1].opp_steps == 53 && env->fish[s].opp_steps == 10 && fb->mark == 0,
+        "the mark lasted 64 steps, 9 of them frozen: opportunities 55 / 53 / 10 (%d %d %d)", env->fish[0].opp_steps, env->fish[1].opp_steps, env->fish[s].opp_steps);
     float r0 = env->return_by[0];
     float r1 = env->return_by[1];
     puf_step(env);
@@ -3131,6 +3141,9 @@ static void test_inst_free_riding(void) {
     CHECK(fabsf(l->enf_gini - (float)(n - 1) / (float)n) < 1e-6f, "Log: enf_gini (N-1)/N (%.4f)", l->enf_gini);
     CHECK(fabsf(l->enf_premium + 0.25f) < 1e-5f && fabsf(l->enf_premium - (r1 - r0)) < 1e-5f,
         "Log: enf_premium = free rider's return - enforcer's = -0.25 (%.4f; returns %.3f / %.3f)", l->enf_premium, r1, r0);
+    CHECK(l->enf_exposed == 2.0f && l->enf_free_riders == 1.0f && l->enf_premium_n == 1.0f && l->enf_gini_n == 1.0f,
+        "Log counts: enf_exposed 2, enf_free_riders 1, enf_premium_n 1, enf_gini_n 1 (%.0f %.0f %.0f %.0f)",
+        l->enf_exposed, l->enf_free_riders, l->enf_premium_n, l->enf_gini_n);
     CHECK(env->fish[0].opp_steps == 0 && env->fish[0].zaps_marked == 0, "per-fish counters reset with the episode");
     destroy(&h);
     dict_clear(&kw);
@@ -3152,7 +3165,9 @@ static void test_inst_free_riding(void) {
     while (env->episode == 0) {
         puf_step(env);
     }
-    CHECK(env->log.enf_free_rider_share == 0.0f && env->log.enf_gini == 0.0f && env->log.enf_premium == 0.0f, "no rule: the three keys are 0");
+    CHECK(env->log.enf_free_rider_share == 0.0f && env->log.enf_gini == 0.0f && env->log.enf_premium == 0.0f
+        && env->log.enf_exposed == 0.0f && env->log.enf_free_riders == 0.0f && env->log.enf_premium_n == 0.0f && env->log.enf_gini_n == 0.0f,
+        "no rule: the seven enf_* keys are 0");
     destroy(&h0);
     dict_clear(&kw0);
 }
@@ -3302,9 +3317,12 @@ static int run_calibration(int argc, char** argv) {
     double inst_shirks = 0.0;
     double inst_duties = 0.0;
     double inst_discharged = 0.0;         // discharged / ended duties
-    double enf_share = 0.0;               // second-order free riding (wef_enf_metrics: the enf_* Log keys)
-    double enf_gini = 0.0;
-    double enf_premium = 0.0;
+    double enf_exposed = 0.0;             // second-order free riding (wef_enf_metrics: the enf_* Log keys), pooled over episodes
+    double enf_riders = 0.0;
+    double enf_gini = 0.0;                // sum over the episodes with a sanction
+    double enf_gini_n = 0.0;
+    double enf_premium = 0.0;             // sum over the episodes with both exposed sanctioners and non-sanctioners
+    double enf_premium_n = 0.0;
     double inst_wrongful = 0.0;
     double inst_sanctioned = 0.0;         // violations that met a sanction (zaps on marked / violations)
     double inst_comply = 0.0;
@@ -3412,11 +3430,13 @@ static int run_calibration(int argc, char** argv) {
                     inst_duties += env->duties;
                     int ended = env->duties_discharged + env->shirks;
                     inst_discharged += ended > 0 ? (double)env->duties_discharged / ended : 0.0;
-                    float e_share, e_gini, e_premium;
-                    wef_enf_metrics(env, &e_share, &e_gini, &e_premium);
-                    enf_share += e_share;
-                    enf_gini += e_gini;
-                    enf_premium += e_premium;
+                    WefEnf m = wef_enf_metrics(env);
+                    enf_exposed += m.exposed;
+                    enf_riders += m.riders;
+                    enf_gini += m.gini;
+                    enf_gini_n += m.gini_defined;
+                    enf_premium += m.premium;
+                    enf_premium_n += m.premium_defined;
                 }
                 if (env->inst_mode == 4) {
                     double fish_steps = (double)env->cur_episode_length * env->num_agents;
@@ -3457,12 +3477,14 @@ static int run_calibration(int argc, char** argv) {
             vsum += viol[i];
             zsum += zap_mk[i];
         }
-        printf("  inst_mode %d   comply %.3f   informed %.3f   first_visit %.3f   violations %.1f   marked_frac %.3f   exposure %.3f   zaps_on_marked %.1f   agree_final %.3f   closed_frac %.3f   eats_closed %.1f   zaps_wrongful %.1f   sanctions_per_viol %.3f   shirks %.1f   duties %.1f   discharged %.3f   violations_first %.1f   free_rider_share %.3f   enf_gini %.3f   enf_premium %.3f\n",
+        printf("  inst_mode %d   comply %.3f   informed %.3f   first_visit %.3f   violations %.1f   marked_frac %.3f   exposure %.3f   zaps_on_marked %.1f   agree_final %.3f   closed_frac %.3f   eats_closed %.1f   zaps_wrongful %.1f   sanctions_per_viol %.3f   shirks %.1f   duties %.1f   discharged %.3f   violations_first %.1f   enf_exposed %.2f   free_rider_share %.3f   enf_gini %.3f   enf_premium %.3f   (pooled; Gini over %.0f, premium over %.0f episodes)\n",
             env->inst_mode, inst_comply / episodes, inst_informed / episodes, inst_first_visit / episodes,
             vsum / episodes, inst_marked / episodes, inst_exposure / episodes, zsum / episodes,
             inst_agree / episodes, inst_closed / episodes, inst_eats_closed / episodes,
             inst_wrongful / episodes, inst_sanctioned / episodes, inst_shirks / episodes, inst_duties / episodes,
-            inst_discharged / episodes, inst_viol_first / episodes, enf_share / episodes, enf_gini / episodes, enf_premium / episodes);
+            inst_discharged / episodes, inst_viol_first / episodes, enf_exposed / episodes,
+            enf_exposed > 0 ? enf_riders / enf_exposed : 0.0, enf_gini_n > 0 ? enf_gini / enf_gini_n : 0.0,
+            enf_premium_n > 0 ? enf_premium / enf_premium_n : 0.0, enf_gini_n, enf_premium_n);
     }
     if (env->inst_mode == 4 || env->regrow_per_patch) {
         printf("  rot: rotations %.1f   open_patch_frac %.3f   closed_patch_frac %.3f   stock_open_mean %.3f   patches_collapsed %.2f   in_open per slot:",
