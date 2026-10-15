@@ -95,6 +95,7 @@ typedef float obs_t;
 // Food/prey and conspecifics (other agents) have separate cutoffs for morm & amp.
 #define MORM_FOOD_RANGE_CM 5.0f       // prey ≤ 5 cm
 #define MORM_AGENT_RANGE_CM 10.0f     // agents ≤ 10 cm
+#define WEF_ENF_OMIN 32               // institutions: opportunity steps that make a fish-episode 'exposed' (enf_* Log keys)
 #define AMP_FOOD_RANGE_CM 4.0f        // prey ≤ 4 cm
 #define AMP_AGENT_RANGE_CM 8.0f       // conspecifics ≤ 8 cm
 #define KNOLLEN_AGENT_RANGE_CM 100.0f // conspecific EOD ≤ 100 cm
@@ -212,6 +213,8 @@ typedef struct FishAgent {
     bool trace_zap_marked; // trace only: this step's zap landed on a marked fish
     int zapped_marked;     // sanctions received: bites taken while marked this episode
     int zaps_wrongful;     // bites given on an unmarked fish while a rule was in force (inst_mark_wrongful)
+    int opp_steps;         // second-order free riding: steps with another fish marked within MORM_AGENT_RANGE_CM while this fish was not frozen
+    int zaps_marked;       // sanctions given: bites by this fish that landed on a marked fish this episode
     bool bot_responded;    // role 15: has been sanctioned bot_respond_zaps times and now complies
     int in_open_steps;     // inst_mode 4: fish-steps inside the open patch's disk this episode (harness per-slot output)
     int in_closed_steps;   // inst_mode 4: ... inside the closed patch's disk
@@ -414,6 +417,11 @@ struct Log {
     float rotations;         // inst_mode 4: open-patch switches per episode
     float open_patch_frac;   // inst_mode 4: fish-steps inside the open patch's disk / fish-steps (migration)
     float closed_patch_frac; // inst_mode 4: the same for the closed patch
+    // Second-order free riding (enforcement; docs/env-changes.md 3h). inst_mode > 0 only, 0 otherwise. A fish-episode is
+    // exposed with >= WEF_ENF_OMIN opportunity steps (another fish marked within MORM_AGENT_RANGE_CM while it was not frozen).
+    float enf_free_rider_share; // exposed fish with no zap on a marked fish / exposed fish (0 if none exposed)
+    float enf_gini;          // Gini of zaps on marked fish across the fish (0 without a sanction)
+    float enf_premium;       // mean return of exposed non-sanctioners - exposed sanctioners (0 if either group is empty)
     float n;
 };
 
@@ -2541,6 +2549,33 @@ float wef_gini(const int* x, int n) {
     return abs_diff / (2.0f * (float)n * total);
 }
 
+// Second-order free riding (enforcement) metrics of the episode so far (Log keys enf_*; the harness
+// prints the same). Exposed = opp_steps >= WEF_ENF_OMIN; sanctioner = zaps_marked >= 1. Metrics only.
+static void wef_enf_metrics(const Wef* env, float* free_rider_share, float* gini, float* premium) {
+    int zm[MAX_AGENTS];
+    int exposed = 0;
+    int riders = 0;
+    float ret_rider = 0.0f;
+    float ret_enf = 0.0f;
+    for (int i = 0; i < env->num_agents; i++) {
+        zm[i] = env->fish[i].zaps_marked;
+        if (env->fish[i].opp_steps >= WEF_ENF_OMIN) {
+            exposed++;
+            if (zm[i] == 0) {
+                riders++;
+                ret_rider += env->return_by[i];
+            } else {
+                ret_enf += env->return_by[i];
+            }
+        }
+    }
+    int enforcers = exposed - riders;
+    *free_rider_share = exposed > 0 ? (float)riders / (float)exposed : 0.0f;
+    *gini = wef_gini(zm, env->num_agents);
+    *premium = riders > 0 && enforcers > 0
+        ? ret_rider / (float)riders - ret_enf / (float)enforcers : 0.0f;
+}
+
 // Bite-selectivity helpers (metrics only; no effect on dynamics or RNG).
 static inline int wef_recent(const Wef* env, int mark, int window) {
     return mark > 0 && env->tick - mark < window;
@@ -2929,6 +2964,7 @@ void puf_step(Wef* env) {
                 // sanctioning a labelled rule-breaker: cheaper (mark_zap_cooldown) and, with a
                 // bounty configured, paid (docs/institutions-plan.md 3.2 item 4; v0 bounty 0)
                 env->zaps_on_marked++;
+                attacker->zaps_marked++;
                 attacker->trace_zap_marked = true;
                 env->fish[victim].zapped_marked++;
                 env->agents[i].rewards[0] += env->mark_zap_reward;
@@ -3387,6 +3423,8 @@ void puf_step(Wef* env) {
                 if (dx * dx + dy * dy <= MORM_AGENT_RANGE_CM * MORM_AGENT_RANGE_CM) {
                     env->pair_steps++;
                     env->pair_marked_steps += env->fish[j].mark > 0;
+                    // an opportunity to sanction (enf_* keys): j marked, i able to bite (freeze read before this step's decrement)
+                    env->fish[i].opp_steps += env->fish[j].mark > 0 && env->fish[i].freeze == 0;
                 }
             }
         }
@@ -3620,6 +3658,13 @@ void puf_step(Wef* env) {
                 env->log.rotations += (float)env->rotations;
                 env->log.open_patch_frac += (float)env->open_patch_steps / fish_steps;
                 env->log.closed_patch_frac += (float)env->closed_patch_steps / fish_steps;
+            }
+            if (env->inst_mode > 0) {
+                float share, gini, premium;
+                wef_enf_metrics(env, &share, &gini, &premium);
+                env->log.enf_free_rider_share += share;
+                env->log.enf_gini += gini;
+                env->log.enf_premium += premium;
             }
         }
         env->log.n += 1.0f;
@@ -4663,6 +4708,10 @@ static void wef_log_inst_tail(Log* log, Dict* out) {
     dict_set(out, "rotations", log->rotations);
     dict_set(out, "open_patch_frac", log->open_patch_frac);
     dict_set(out, "closed_patch_frac", log->closed_patch_frac);
+    // second-order free riding (enforcement; zero unless inst_mode > 0)
+    dict_set(out, "enf_free_rider_share", log->enf_free_rider_share);
+    dict_set(out, "enf_gini", log->enf_gini);
+    dict_set(out, "enf_premium", log->enf_premium);
 }
 
 // The rest of the AH keys (off the 30-key live dashboard in the AH build, in the [metrics] series).
