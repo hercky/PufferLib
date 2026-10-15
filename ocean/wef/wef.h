@@ -212,6 +212,8 @@ typedef struct FishAgent {
     int zapped_marked;     // sanctions received: bites taken while marked this episode
     int zaps_wrongful;     // bites given on an unmarked fish while a rule was in force (inst_mark_wrongful)
     bool bot_responded;    // role 15: has been sanctioned bot_respond_zaps times and now complies
+    int in_open_steps;     // inst_mode 4: fish-steps inside the open patch's disk this episode (harness per-slot output)
+    int in_closed_steps;   // inst_mode 4: ... inside the closed patch's disk
 } FishAgent;
 
 // Shared sensor layouts (body radius fixed → identical for every fish)
@@ -392,6 +394,12 @@ struct Log {
     float zaps_wrongful;     // bites on unmarked fish per episode (the second-order violation when inst_mark_wrongful)
     float sanctions_per_viol;// zaps on marked fish / violations (1 = every violation met a sanction; 0 with no violation)
     float auto_sanctions;    // direct sanctions by the institution itself (inst_auto_freeze) per episode
+    // Phase 4 (docs/institutions-plan.md 11.1): per-patch Commons (regrow_per_patch) and the rotating-patch rule (inst_mode 4).
+    float patches_collapsed; // regrow_per_patch: patches at or below their Allee threshold at episode end
+    float stock_open_mean;   // inst_mode 4: time-mean S_open / K_open (0 otherwise)
+    float rotations;         // inst_mode 4: open-patch switches per episode
+    float open_patch_frac;   // inst_mode 4: fish-steps inside the open patch's disk / fish-steps (migration)
+    float closed_patch_frac; // inst_mode 4: the same for the closed patch
     float n;
 };
 
@@ -614,6 +622,10 @@ struct Env {
     Vec2 patch_center[MAX_PATCHES];   // this episode's patches (patchy layout only)
     float patch_radius_ep[MAX_PATCHES];
     int num_patches_ep;         // 0 when the episode is not patchy
+    int regrow_per_patch;       // commons mode 2: per-patch stocks (slot f belongs to patch f % num_patches_ep; logistic growth and Allee per patch)
+    int food_patch[MAX_FOOD];   // regrow_per_patch: the patch each slot belongs to for the episode
+    bool patch_collapsed[MAX_PATCHES];  // regrow_per_patch: patch stock fell to its Allee threshold (absorbing)
+    float stock_open_sum;       // inst_mode 4: sum over steps of S_open / K_open
     int season_steps;           // regrow_mode 3: steps per season (stock grows only at season ends)
     float season_growth;        // regrow_mode 3: stock multiplier per season, capped at K (GovSim: 2)
     bool regrows;               // any regrowth mode active (fixed-length episodes, V2 traces, stock perf)
@@ -704,7 +716,7 @@ struct Env {
     int convention_tick;        // first tick at or above conv_theta, 0 = never
     // --- Institutions (docs/institutions-plan.md section 4). Inert when inst_mode == 0 and
     // inst_obs == 0; inst_obs needs the -DWEF_INST build (the obs row grows).
-    int inst_mode;              // 0 none; 1 public beacon; 2 private signals; 3 spurious public signal
+    int inst_mode;              // 0 none; 1 public beacon; 2 private signals; 3 spurious public signal; 4 rotating patch (Commons, regrow_per_patch)
     int inst_obs;               // 1: the beacon object sits in the arena and the institution slots are filled
     int inst_fixed_type;        // AH: -1 draw the prescribed type per episode, 0 / 1 pin it
     float inst_theta;           // Commons: the public season closes while S <= theta K ...
@@ -726,7 +738,10 @@ struct Env {
     float inst_contrast;
     int inst_latch;             // 1: the obs slot keeps the last value read; 0: in range only
     // institution episode state
-    int inst_type;              // public rule: AH prescribed type 0 A / 1 B; Commons 1 closed / 0 open
+    int inst_type;              // public rule: AH prescribed type 0 A / 1 B; Commons 1 closed / 0 open; mode 4: the open patch 0 / 1
+    int rotations;              // mode 4: open-patch switches this episode
+    int open_patch_steps;       // mode 4: fish-steps inside the open / closed patch's disk
+    int closed_patch_steps;
     int inst_type_reset;        // AH: the prescribed type drawn at reset (inst_type_a)
     Vec2 inst_pos;
     Vec2 inst_moment;           // beacon induced dipole this step
@@ -752,17 +767,55 @@ static inline int wef_inst_rule_type(const Wef* env, int i) {
     return env->inst_mode == 2 ? env->fish[i].inst_private : env->inst_type;
 }
 
+// Patchy layout: is a point inside patch p's disk (the per-patch Commons / rotating rule geometry).
+static inline bool wef_in_patch(const Wef* env, Vec2 pos, int p) {
+    float dx = pos.x - env->patch_center[p].x;
+    float dy = pos.y - env->patch_center[p].y;
+    return dx * dx + dy * dy <= env->patch_radius_ep[p] * env->patch_radius_ep[p];
+}
+
+// regrow_per_patch: stock S_p (active slots of patch p) and capacity K_p (slots of patch p).
+static inline int wef_patch_stock(const Wef* env, int p) {
+    int s = 0;
+    for (int f = 0; f < env->num_food; f++) {
+        s += env->food[f].active && env->food_patch[f] == p;
+    }
+    return s;
+}
+
+static inline int wef_patch_k(const Wef* env, int p) {
+    int k = 0;
+    for (int f = 0; f < env->num_food; f++) {
+        k += env->food_patch[f] == p;
+    }
+    return k;
+}
+
 static inline int wef_inst_closed(const Wef* env, int i) {
     if (env->inst_mode == 2) {
         return (float)env->food_active <= env->fish[i].inst_private_theta * (float)env->num_food;
     }
+    if (env->inst_mode == 4) {
+        // rotating patch: the season is "closed" for a fish standing inside the closed patch's disk
+        // (the eat block judges pellets with wef_inst_pellet_closed; this is the fish-level reading)
+        return wef_in_patch(env, env->fish[i].pos, 1 - env->inst_type);
+    }
     return env->inst_type;
 }
 
-// The value a fish reads at the beacon: +1 / -1 (AH: type A / B; Commons: closed / open).
+// inst_mode 4: the rule "eat only in the open patch", per pellet (slot f's patch vs the open one).
+static inline int wef_inst_pellet_closed(const Wef* env, int f) {
+    return env->food_patch[f] != env->inst_type;
+}
+
+// The value a fish reads at the beacon: +1 / -1 (AH: type A / B; Commons: closed / open; mode 4:
+// patch 0 open / patch 1 open).
 static inline float wef_inst_signal(const Wef* env, int i) {
     if (env->allelo) {
         return wef_inst_rule_type(env, i) == 0 ? 1.0f : -1.0f;
+    }
+    if (env->inst_mode == 4) {
+        return env->inst_type == 0 ? 1.0f : -1.0f;
     }
     return wef_inst_closed(env, i) ? 1.0f : -1.0f;
 }
@@ -1452,6 +1505,17 @@ Vec2 wef_commons_spawn_pos(Wef* env) {
     return (Vec2){x, y};
 }
 
+// regrow_per_patch: a pellet of patch p lands uniformly inside that patch's disk (the draw order of
+// wef_commons_spawn_pos without the patch draw: angle, then radius).
+Vec2 wef_patch_spawn_pos(Wef* env, int p) {
+    float angle = random_uniform(env, 0.0f, 2.0f * PI_F);
+    float r = env->patch_radius_ep[p] * sqrtf(random_uniform(env, 0.0f, 1.0f));
+    return (Vec2){
+        clamp(env->patch_center[p].x + r * cosf(angle), 0.0f, env->arena_size_x),
+        clamp(env->patch_center[p].y + r * sinf(angle), 0.0f, env->arena_size_y),
+    };
+}
+
 void puf_reset(Wef* env) {
     // Sample arena size from configured min/max
     env->arena_size_x = random_uniform(env, env->min_arena_size_x, env->max_arena_size_x);
@@ -1482,6 +1546,13 @@ void puf_reset(Wef* env) {
     env->frozen_steps = 0;
     env->collapsed = false;
     env->collapse_tick = 0;
+    for (int p = 0; p < MAX_PATCHES; p++) {
+        env->patch_collapsed[p] = false;
+    }
+    env->stock_open_sum = 0.0f;
+    env->rotations = 0;
+    env->open_patch_steps = 0;
+    env->closed_patch_steps = 0;
     env->open_steps = 0;
     env->waste_frac_sum = 0.0f;
     env->raw_return_sum = 0.0f;
@@ -1692,6 +1763,18 @@ void puf_reset(Wef* env) {
         }
         env->num_patches_ep = num_patches;
         for (int i = 0; i < env->num_food; i++) {
+            if (env->regrow_per_patch) {
+                // per-patch Commons: slot i belongs to patch i % num_patches for the episode (K_p =
+                // K / num_patches) and starts inside that disk; no patch draw
+                int p = i % num_patches;
+                env->food_patch[i] = p;
+                env->food[i] = (FishFood){
+                    .pos = wef_patch_spawn_pos(env, p),
+                    .orientation = random_uniform(env, 0.0f, 2.0f * PI_F),
+                    .active = true,
+                };
+                continue;
+            }
             int p = (int)(rand_r(&env->rng) % (unsigned)num_patches);
             float angle = random_uniform(env, 0.0f, 2.0f * PI_F);
             float r = radii[p] * sqrtf(random_uniform(env, 0.0f, 1.0f));
@@ -1748,6 +1831,10 @@ void puf_reset(Wef* env) {
         if (env->allelo) {
             env->inst_type = env->inst_fixed_type >= 0 ? env->inst_fixed_type
                 : env->inst_mode > 0 ? (random_uniform(env, 0.0f, 1.0f) < 0.5f ? 0 : 1) : 0;
+        } else if (env->inst_mode == 4) {
+            // rotating patch: the open patch is drawn per episode (p 1/2; inst_fixed_type pins it)
+            env->inst_type = env->inst_fixed_type >= 0 ? env->inst_fixed_type
+                : (random_uniform(env, 0.0f, 1.0f) < 0.5f ? 0 : 1);
         } else {
             env->inst_type = (float)env->food_active <= env->inst_theta * (float)env->num_food ? 1 : 0;
         }
@@ -2010,7 +2097,15 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     int min_neighbours = (role == 5 || role == 6) ? 2 : 0;
     // Role 7 (Commons cooperator): a nearest-pellet eater that stops eating while the
     // global stock is at or below bot_theta * K (the cue obs_extra = 3 gives a policy).
-    bool restrain = role == 7
+    // inst_mode 4 (rotating patch): the complier does not wait out a season; it eats only pellets of
+    // the patch its last read says is open (+1 patch 0, -1 patch 1) and swims to that patch's centre
+    // when none is in reach (bots know the patch positions).
+    int bot_open = -1;
+    if (inst_role && role == 7 && env->inst_mode == 4) {
+        bot_open = fish->inst_val > 0.0f ? 0 : fish->inst_val < 0.0f ? 1 : -1;
+    }
+    bool bot_wait = false;  // mode 4 complier heading for / holding at the open patch's centre
+    bool restrain = role == 7 && env->inst_mode != 4
         && (inst_role ? fish->inst_val > 0.0f
             : (float)(env->allelo ? env->n_ripe : env->food_active) <= env->bot_theta * (float)env->num_food);
     bool at_beacon = inst_role && wef_at_beacon(env, fish);
@@ -2166,6 +2261,9 @@ void wef_bot_action(Wef* env, int i, float* raw) {
             if (env->allelo && !env->food[f].ripe) {
                 continue;  // only ripe bushes are edible
             }
+            if (bot_open >= 0 && env->food_patch[f] != bot_open) {
+                continue;  // mode 4 complier: pellets of the closed patch are off limits
+            }
             float dx = env->food[f].pos.x - fish->pos.x;
             float dy = env->food[f].pos.y - fish->pos.y;
             float d2 = dx * dx + dy * dy;
@@ -2193,8 +2291,10 @@ void wef_bot_action(Wef* env, int i, float* raw) {
         }
     }
     if (!found && inst_role) {
-        // nothing to eat / plant / zap: back to the beacon (re-read the rule)
-        target = env->inst_pos;
+        // nothing to eat / plant / zap: back to the beacon (re-read the rule); the mode 4 complier
+        // goes to the centre of the patch it believes open instead (and waits there)
+        target = bot_open >= 0 ? env->patch_center[bot_open] : env->inst_pos;
+        bot_wait = bot_open >= 0;
         found = true;
     }
     if (!found && role != 1 && env->bot_camp > 0.0f && fish->bot_has_eat) {
@@ -2279,6 +2379,9 @@ void wef_bot_action(Wef* env, int i, float* raw) {
         raw[0] = -8.0f;
         raw[1] = 0.0f;
         fish->bot_stall = 0;
+    }
+    if (bot_wait && dist < 2.0f * radius) {
+        fish->bot_stall = 0;  // holding at the open patch's centre on purpose is not a stall
     }
 }
 
@@ -2478,7 +2581,8 @@ void puf_step(Wef* env) {
                         // the rule "do not eat while the season is closed", judged before this
                         // eat changes the stock
                         agent->rule_acts++;
-                        if (wef_inst_closed(env, i)) {
+                        bool closed = env->inst_mode == 4 ? wef_inst_pellet_closed(env, f) : wef_inst_closed(env, i);
+                        if (closed) {
                             env->eats_closed++;
                             wef_inst_violation(env, i);
                         } else {
@@ -2888,6 +2992,45 @@ void puf_step(Wef* env) {
                     wef_obj_event(env, 0, f, 2, env->food[f].pos);
                 }
             }
+        } else if (env->regrow_mode == 2 && env->regrow_per_patch) {
+            // Per-patch Commons (plan 11.1): patch p has its own stock S_p over its K_p slots. An
+            // empty slot of p regrows w.p. p_max S_p / K_p while S_p > allee K_p (else 0) and lands
+            // uniformly in patch p; a patch at or below its threshold is collapsed for the episode
+            // (absorbing), the global flag is set once every patch is. Off, the block below runs.
+            int np = env->num_patches_ep;
+            float p_patch[MAX_PATCHES];
+            for (int p = 0; p < np; p++) {
+                float stock = (float)wef_patch_stock(env, p);
+                float kp = (float)wef_patch_k(env, p);
+                p_patch[p] = kp > 0.0f && stock > env->regrow_allee * kp ? env->regrow_p_max * stock / kp : 0.0f;
+            }
+            for (int f = 0; f < env->num_food; f++) {
+                if (env->food[f].active || random_uniform(env, 0.0f, 1.0f) >= p_patch[env->food_patch[f]]) {
+                    continue;
+                }
+                env->food[f] = (FishFood){
+                    .pos = wef_patch_spawn_pos(env, env->food_patch[f]),
+                    .orientation = random_uniform(env, 0.0f, 2.0f * PI_F),
+                    .active = true,
+                };
+                env->food_active++;
+                env->regrown++;
+                any_spawned = true;
+                wef_obj_event(env, 0, f, 2, env->food[f].pos);
+            }
+            bool all_collapsed = true;
+            for (int p = 0; p < np; p++) {
+                int stock = wef_patch_stock(env, p);
+                if (!env->patch_collapsed[p]
+                        && ((float)stock <= env->regrow_allee * (float)wef_patch_k(env, p) || stock == 0)) {
+                    env->patch_collapsed[p] = true;
+                }
+                all_collapsed = all_collapsed && env->patch_collapsed[p];
+            }
+            if (all_collapsed && !env->collapsed) {
+                env->collapsed = true;
+                env->collapse_tick = env->tick;
+            }
         } else if (env->regrow_mode == 2) {
             // Commons: one global stock S with logistic growth. Each empty slot regrows
             // w.p. p_max * S / K, so expected growth is p_max * S * (K - S) / K (zero at
@@ -2933,7 +3076,7 @@ void puf_step(Wef* env) {
                 env->fish[i].has_previous_food_distance = false;
             }
         }
-        if (env->regrow_mode == 2 && !env->collapsed
+        if (env->regrow_mode == 2 && !env->regrow_per_patch && !env->collapsed
                 && ((float)env->food_active <= env->regrow_allee * (float)env->num_food
                     || env->food_active == 0)) {
             env->collapsed = true;  // absorbing: growth is zero at or below the threshold
@@ -2997,7 +3140,40 @@ void puf_step(Wef* env) {
         if (env->inst_mode > 0 && !env->allelo) {
             // Commons: the public season from the stock (hysteresis), or, in mode 3, a random
             // on / off schedule with mean block length inst_flip_steps (the spurious rule)
-            if (env->inst_mode == 3) {
+            if (env->inst_mode == 4) {
+                // Rotating patch (plan 11.1): the open patch switches once its stock is at or below
+                // theta K_open while the other has recovered to (theta + hyst) K_other; with
+                // inst_flip_steps > 0 it switches w.p. 1 / flip per step instead (the useless rule).
+                int open = env->inst_type;
+                int other = 1 - open;
+                bool rotate;
+                if (env->inst_flip_steps > 0) {
+                    rotate = random_uniform(env, 0.0f, 1.0f) < 1.0f / (float)env->inst_flip_steps;
+                } else {
+                    float s_open = (float)wef_patch_stock(env, open);
+                    float s_other = (float)wef_patch_stock(env, other);
+                    float k_open = (float)wef_patch_k(env, open);
+                    float k_other = (float)wef_patch_k(env, other);
+                    rotate = s_open <= env->inst_theta * k_open
+                        && s_other >= (env->inst_theta + env->inst_hyst) * k_other;
+                }
+                if (rotate) {
+                    env->inst_type = other;
+                    env->rotations++;
+                }
+                int k_open = wef_patch_k(env, env->inst_type);
+                env->stock_open_sum += k_open > 0
+                    ? (float)wef_patch_stock(env, env->inst_type) / (float)k_open : 0.0f;
+                for (int i = 0; i < env->num_agents; i++) {
+                    // the migration measure: fish-steps inside the open / the closed patch's disk
+                    bool in_open = wef_in_patch(env, env->fish[i].pos, env->inst_type);
+                    bool in_closed = wef_in_patch(env, env->fish[i].pos, 1 - env->inst_type);
+                    env->open_patch_steps += in_open;
+                    env->closed_patch_steps += in_closed;
+                    env->fish[i].in_open_steps += in_open;
+                    env->fish[i].in_closed_steps += in_closed;
+                }
+            } else if (env->inst_mode == 3) {
                 if (random_uniform(env, 0.0f, 1.0f) < 1.0f / (float)env->inst_flip_steps) {
                     env->inst_type = 1 - env->inst_type;
                 }
@@ -3010,7 +3186,9 @@ void puf_step(Wef* env) {
                     env->inst_type = 0;
                 }
             }
-            env->closed_steps += env->inst_type;
+            if (env->inst_mode != 4) {
+                env->closed_steps += env->inst_type;  // mode 4: no season, closed_frac stays 0
+            }
         } else if (env->inst_mode == 3 && env->allelo && env->inst_flip_steps > 0
                 && env->tick % env->inst_flip_steps == 0) {
             env->inst_type = 1 - env->inst_type;  // AH spurious rule: the prescription flips
@@ -3144,6 +3322,13 @@ void puf_step(Wef* env) {
             env->log.frozen_frac += (float)env->frozen_steps / fish_steps;
             env->log.collapsed += env->collapsed ? 1.0f : 0.0f;
             env->log.survival_frac += env->collapsed ? (float)env->collapse_tick / ticks : 1.0f;
+            if (env->regrow_per_patch) {
+                int n_coll = 0;
+                for (int p = 0; p < env->num_patches_ep; p++) {
+                    n_coll += env->patch_collapsed[p];
+                }
+                env->log.patches_collapsed += (float)n_coll;
+            }
         }
         float pol_sum[2] = {0.0f, 0.0f};
         int pol_n[2] = {0, 0};
@@ -3246,6 +3431,12 @@ void puf_step(Wef* env) {
             env->log.sanctions_per_viol += env->violations > 0
                 ? (float)env->zaps_on_marked / (float)env->violations : 0.0f;
             env->log.auto_sanctions += (float)env->auto_sanctions;
+            if (env->inst_mode == 4) {
+                env->log.stock_open_mean += env->stock_open_sum / ticks;
+                env->log.rotations += (float)env->rotations;
+                env->log.open_patch_frac += (float)env->open_patch_steps / fish_steps;
+                env->log.closed_patch_frac += (float)env->closed_patch_steps / fish_steps;
+            }
         }
         env->log.n += 1.0f;
         puf_reset(env);
@@ -3598,14 +3789,29 @@ void puf_render(Wef* env) {
             DrawCircleV(position, fmaxf(3.0f, env->waste_radius_cm * scale), WEF_COLOR_WASTE);
         }
     }
+    if (env->inst_mode == 4 && env->num_patches_ep >= 2) {
+        // Rotating patch: the open patch's disk outlined green, the closed one red.
+        for (int p = 0; p < 2; p++) {
+            Vector2 pc = world_to_screen(env, env->patch_center[p]);
+            float pr = env->patch_radius_ep[p] * scale;
+            Color oc = p == env->inst_type ? WEF_COLOR_FOOD : WEF_COLOR_BITE;
+            DrawRing(pc, pr - 1.5f, pr + 1.5f, 0.0f, 360.0f, 96, ColorAlpha(oc, 0.8f));
+            DrawText(TextFormat("P%d %s", p, p == env->inst_type ? "open" : "closed"),
+                (int)(pc.x - 24.0f), (int)(pc.y - pr - 18.0f), 14, oc);
+        }
+    }
     if (env->inst_obs) {
         // Institution beacon: the read radius as a faint ring, the object as a dot in the rule's
-        // colour (AH: the prescribed type; Commons: red while closed, green while open; grey in
-        // the control arm, which has no rule).
+        // colour (AH: the prescribed type; Commons: red while closed, green while open; mode 4: the
+        // open patch's colour (green) with the open patch's index; grey in the control arm, which
+        // has no rule).
         Vector2 bp = world_to_screen(env, env->inst_pos);
         Color rc = WEF_COLOR_MIDGRAY;
         const char* label = "BEACON: mute";
-        if (env->inst_mode > 0) {
+        if (env->inst_mode == 4) {
+            rc = WEF_COLOR_FOOD;
+            label = TextFormat("OPEN PATCH: P%d", env->inst_type);
+        } else if (env->inst_mode > 0) {
             rc = env->allelo ? (env->inst_type == 0 ? WEF_COLOR_FOOD : WEF_COLOR_FOOD_B)
                 : (env->inst_type ? WEF_COLOR_BITE : WEF_COLOR_FOOD);
             label = env->allelo ? (env->inst_type == 0 ? "RULE: PLANT GREEN (A)" : "RULE: PLANT MAGENTA (B)")
@@ -3755,7 +3961,8 @@ void puf_render(Wef* env) {
             marked += env->fish[i].mark > 0;
             informed += env->fish[i].informed;
         }
-        const char* rule = env->allelo ? (env->inst_type == 0 ? "rule: plant A" : "rule: plant B")
+        const char* rule = env->inst_mode == 4 ? TextFormat("open P%d rot %d", env->inst_type, env->rotations)
+            : env->allelo ? (env->inst_type == 0 ? "rule: plant A" : "rule: plant B")
             : (env->inst_type ? "season: CLOSED" : "season: open");
         const char* line = env->inst_mark_wrongful
             ? TextFormat("%s   informed %d/%d   violations %d   marked %d   zaps on marked %d/%d   wrongful %d",
@@ -3848,7 +4055,7 @@ static const char* WEF_ENV_KEYS[] = {
     "proximity_shaping", "obs_extra", "size_min", "size_max", "desync_first_episode",
     "policy1_agents", "no_clean_agents", "roles", "bot_shift_steps", "bot_oracle", "bot_theta",
     "render_field", "render_field_alpha", "sustain_frac", "num_patches", "regrow_in_patches",
-    "bot_camp", "patch_layout",
+    "bot_camp", "patch_layout", "regrow_per_patch",
     // Allelopathic Harvest (docs/wef-allelopathic-harvest-v0-design.md 4.1)
     "allelo", "ripen_lin", "ripen_cubic", "ripen_pow", "ripen_min_steps", "start_frac_a",
     "start_ripe_frac", "food_contrast_a", "food_contrast_b", "food_radius_unripe_cm",
@@ -3947,6 +4154,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->num_patches = wef_cfg(kwargs, "num_patches", 0);
     env->regrow_in_patches = wef_cfg(kwargs, "regrow_in_patches", 0);
     env->patch_layout = wef_cfg(kwargs, "patch_layout", 0);
+    env->regrow_per_patch = wef_cfg(kwargs, "regrow_per_patch", 0);
     env->bot_camp = wef_cfg(kwargs, "bot_camp", 0);
     // Allelopathic Harvest (section 4.1). Defaults reproduce upstream.
     env->allelo = wef_cfg(kwargs, "allelo", 0);
@@ -4029,7 +4237,9 @@ void puf_init(Env* env, Dict* kwargs) {
         assert((env->allelo || env->roles[i] <= 7 || env->roles[i] >= 13) && "roles 8-12 need allelo = 1");
         assert((env->inst_mode > 0 || env->roles[i] < 13) && "roles 13-16 need inst_mode > 0");
     }
-    assert(env->inst_mode >= 0 && env->inst_mode <= 3 && "inst_mode: 0 none, 1 public beacon, 2 private signals, 3 spurious rule");
+    assert(env->inst_mode >= 0 && env->inst_mode <= 4 && "inst_mode: 0 none, 1 public beacon, 2 private signals, 3 spurious rule, 4 rotating patch");
+    assert((env->inst_mode != 4 || (!env->allelo && env->regrow_per_patch && env->num_patches == 2))
+        && "inst_mode 4 (rotating patch) needs a Commons with regrow_per_patch 1 and num_patches 2");
     assert((env->inst_mode == 0 || env->inst_obs) && "inst_mode > 0 needs inst_obs = 1 (the beacon and the slots)");
 #ifndef WEF_INST
     assert(env->inst_obs == 0 && "inst_obs needs the institution build (NVCC_EXTRA / CFLAGS -DWEF_INST)");
@@ -4117,6 +4327,10 @@ void puf_init(Env* env, Dict* kwargs) {
     env->regrows = env->regrow_p_max > 0.0f || env->regrow_mode == 3;
     assert(env->num_patches >= 0 && env->num_patches <= MAX_PATCHES);
     assert(env->patch_layout == 0 || env->patch_layout == 1);
+    assert(env->regrow_per_patch == 0 || env->regrow_per_patch == 1);
+    assert((!env->regrow_per_patch || (env->regrow_mode == 2 && env->food_distribution == FOOD_PATCHY
+            && env->regrow_in_patches && env->num_patches >= 2))
+        && "regrow_per_patch needs regrow_mode 2, food_distribution 1, regrow_in_patches 1 and num_patches >= 2");
     assert((!env->regrow_in_patches || (env->regrow_mode >= 2 && env->food_distribution != FOOD_UNIFORM))
         && "regrow_in_patches needs a commons mode (2/3) and a patchy food layout");
     assert(env->regrow_radius_cm > 0.0f);
@@ -4234,6 +4448,12 @@ static void wef_log_inst_tail(Log* log, Dict* out) {
     dict_set(out, "zaps_wrongful", log->zaps_wrongful);
     dict_set(out, "sanctions_per_viol", log->sanctions_per_viol);
     dict_set(out, "auto_sanctions", log->auto_sanctions);
+    // phase 4: per-patch Commons and the rotating-patch rule (zero unless regrow_per_patch / inst_mode 4)
+    dict_set(out, "patches_collapsed", log->patches_collapsed);
+    dict_set(out, "stock_open_mean", log->stock_open_mean);
+    dict_set(out, "rotations", log->rotations);
+    dict_set(out, "open_patch_frac", log->open_patch_frac);
+    dict_set(out, "closed_patch_frac", log->closed_patch_frac);
 }
 
 // The rest of the AH keys (off the 30-key live dashboard in the AH build, in the [metrics] series).

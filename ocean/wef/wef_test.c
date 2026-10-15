@@ -18,7 +18,7 @@
  *      min(8, MAX_AGENTS) fish; the slot numbers in the messages are derived from OBS_SIZE.
  *      U11 (default bench hash) and U12 (projection identity, `bench project=4`) are run
  *      by run_test.sh.
- *   6. Institutions (docs/institutions-plan.md section 4), checks U13-U22 (slot layout, beacon read
+ *   6. Institutions (docs/institutions-plan.md section 4), checks U13-U28 (slot layout, beacon read
  *      and latch, rule draws, violations and marks, zap cost, Commons season, beacon sensing, the
  *      Log, the V4 trace, the complier / enforcer roles). They need the -DWEF_INST build
  *      (build/wef_test8i via CFLAGS="-DMAX_AGENTS=8 -DWEF_INST") and are skipped elsewhere;
@@ -183,6 +183,26 @@ static void kw_inst_commons(Dict* kw) {
     dict_set(kw, "sustain_frac", 0.5);
     dict_set(kw, "episode_length", 1024);
     kw_inst(kw);
+}
+
+// preset=inst_commons_rot: the rotating-patch Commons (scripts/inst_commons_rot.args, plan 11.1): 50 x 50,
+// two corner patches with per-patch stocks, inst_mode 4, broadcast beacon (36 cm), persistent marks,
+// wrongful bites marked, the sanction freezes 100 steps.
+static void kw_inst_commons_rot(Dict* kw) {
+    kw_inst_commons(kw);
+    dict_set(kw, "min_arena_width", 50);
+    dict_set(kw, "max_arena_width", 50);
+    dict_set(kw, "min_arena_height", 50);
+    dict_set(kw, "max_arena_height", 50);
+    dict_set(kw, "patch_layout", 1);
+    dict_set(kw, "regrow_per_patch", 1);
+    dict_set(kw, "inst_mode", 4);
+    dict_set(kw, "inst_read_cm", 36);
+    dict_set(kw, "inst_mark_steps", 64);
+    dict_set(kw, "inst_mark_until_zap", 1);
+    dict_set(kw, "inst_mark_wrongful", 1);
+    dict_set(kw, "mark_freeze_steps", 100);
+    dict_set(kw, "bitten_freeze_steps", 25);
 }
 
 // shape=conv: the AH-conv keys on top of kw_allelo (paper cubic F, hold 8, 2048 steps).
@@ -2407,6 +2427,244 @@ static void test_inst_auto_freeze(void) {
     dict_clear(&kw);
 }
 
+// U27 (plan 11.1): per-patch regrowth and collapse are independent per patch; key off = the global path.
+static void test_per_patch(void) {
+    printf("-- INST U27: per-patch Commons (regrow_per_patch)\n");
+    Dict kw = {0};
+    kw_base(&kw, 1);                            // 60 x 40: patches at (8, 8) and (52, 32), r 6
+    dict_set(&kw, "food_distribution", FOOD_PATCHY);
+    dict_set(&kw, "num_patches", 2);
+    dict_set(&kw, "patch_radius", 6);
+    dict_set(&kw, "patch_radius_std", 0);
+    dict_set(&kw, "patch_layout", 1);
+    dict_set(&kw, "regrow_mode", 2);
+    dict_set(&kw, "regrow_p_max", 0.2);
+    dict_set(&kw, "regrow_allee", 0.25);        // 8 of K_p 32
+    dict_set(&kw, "regrow_in_patches", 1);
+    dict_set(&kw, "regrow_per_patch", 1);
+    dict_set(&kw, "size_min", 0.5);
+    dict_set(&kw, "size_max", 0.5);
+    dict_set(&kw, "proximity_shaping", 0);
+    Harness h = make(&kw, 1);
+    Env* env = h.env;
+    bool assign = true;
+    bool inside = true;
+    for (int f = 0; f < env->num_food; f++) {
+        assign = assign && env->food_patch[f] == f % 2;
+        inside = inside && env->food[f].active && wef_in_patch(env, env->food[f].pos, env->food_patch[f]);
+    }
+    CHECK(assign && inside && wef_patch_k(env, 0) == 32 && wef_patch_k(env, 1) == 32
+        && wef_patch_stock(env, 0) == 32 && wef_patch_stock(env, 1) == 32,
+        "reset: slot f in patch f %% 2, inside its disk, K_p = 32, S_p = 32");
+    place_fish(env, 0, 30.0f, 20.0f, 0.0f);     // away from both patches, still
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, -1.0f);
+    for (int f = 0; f < env->num_food; f++) {   // patch 1 emptied, patch 0 at 16 of 32
+        if (f % 2 == 1 || f >= 32) {
+            env->food[f].active = false;
+        }
+    }
+    env->food_active = 16;
+    for (int t = 0; t < 60; t++) {
+        puf_step(env);
+    }
+    int s0 = wef_patch_stock(env, 0);
+    int s1 = wef_patch_stock(env, 1);
+    bool in_own = true;
+    for (int f = 0; f < env->num_food; f++) {
+        in_own = in_own && (!env->food[f].active || (env->food_patch[f] == 0 && wef_in_patch(env, env->food[f].pos, 0)));
+    }
+    CHECK(s0 > 16 && s1 == 0 && env->patch_collapsed[1] && !env->patch_collapsed[0] && !env->collapsed,
+        "patch 0 regrew 16 -> %d while the emptied patch 1 stayed at 0 and collapsed alone (global flag off)", s0);
+    CHECK(in_own && env->regrown == s0 - 16 && env->food_active == s0,
+        "the %d regrown pellets kept their slot's patch and landed inside patch 0's disk", env->regrown);
+    int keep = 0;
+    for (int f = 0; f < env->num_food; f++) {   // patch 0 down to the Allee threshold 8
+        if (env->food[f].active && keep < 8) {
+            keep++;
+        } else {
+            env->food[f].active = false;
+        }
+    }
+    env->food_active = 8;
+    puf_step(env);
+    CHECK(env->patch_collapsed[0] && env->collapsed && env->collapse_tick == env->tick,
+        "patch 0 at S_p = 8 = allee K_p collapses; both collapsed -> the episode's collapsed flag at tick %d", env->tick);
+    for (int t = 0; t < 30; t++) {
+        puf_step(env);
+    }
+    CHECK(env->food_active == 8 && env->regrown == s0 - 16, "no regrowth after the collapse");
+    destroy(&h);
+    // key off: one global stock, regrowth draws a patch per pellet, no per-patch flags
+    dict_set(&kw, "regrow_per_patch", 0);
+    Harness h2 = make(&kw, 1);
+    env = h2.env;
+    place_fish(env, 0, 30.0f, 20.0f, 0.0f);
+    set_action(&h2, 0, -8.0f, 0.0f, 1.0f, -1.0f);
+    for (int f = 0; f < env->num_food; f++) {
+        if (f % 2 == 1 || f >= 40) {
+            env->food[f].active = false;
+        }
+    }
+    env->food_active = 20;                      // > 0.25 K = 16: the global stock grows
+    for (int t = 0; t < 60; t++) {
+        puf_step(env);
+    }
+    int in1 = 0;
+    for (int f = 0; f < env->num_food; f++) {
+        in1 += env->food[f].active && wef_in_patch(env, env->food[f].pos, 1);
+    }
+    CHECK(env->regrown > 0 && in1 > 0 && !env->patch_collapsed[0] && !env->patch_collapsed[1] && !env->collapsed,
+        "key off: the global path (%d regrown, %d landed in the emptied patch 1, no per-patch flags)", env->regrown, in1);
+    destroy(&h2);
+    dict_clear(&kw);
+}
+
+// U28 (plan 11.1): the rotating-patch rule (inst_mode 4): switch when the open patch is depleted and the
+// other recovered, not otherwise; a closed-patch eat is a violation, an open-patch eat a compliant act;
+// the migration counters; spurious flips; the per-episode draw; the complier bot follows the signal.
+static void test_inst_rotating(void) {
+    printf("-- INST U28: rotating-patch rule (inst_mode 4)\n");
+    Dict kw = {0};
+    kw_base(&kw, 4);
+    kw_inst_commons_rot(&kw);                   // 50 x 50: patches at (8, 8) and (42, 42) (inset r + 2 cm), beacon (25, 25)
+    dict_set(&kw, "inst_fixed_type", 0);        // patch 0 open at reset
+    dict_set(&kw, "regrow_allee", 0.9);         // no regrowth below 0.9 K_p: the stocks are what the test sets
+    Harness h = make(&kw, 4);
+    Env* env = h.env;
+    CHECK(env->inst_type == 0 && env->rotations == 0 && env->num_patches_ep == 2
+        && fabsf(env->patch_center[0].x - 8.0f) < 1e-4f && fabsf(env->patch_center[1].x - 42.0f) < 1e-4f,
+        "reset: patch 0 open, patches at (%.0f, %.0f) / (%.0f, %.0f)", env->patch_center[0].x, env->patch_center[0].y,
+        env->patch_center[1].x, env->patch_center[1].y);
+    clear_objects(env);
+    place_fish(env, 0, 10.0f, 30.0f, 0.0f);     // all outside both disks, still, non-biting
+    place_fish(env, 1, 30.0f, 10.0f, 0.0f);
+    place_fish(env, 2, 25.0f, 40.0f, 0.0f);
+    place_fish(env, 3, 40.0f, 25.0f, 0.0f);
+    for (int i = 0; i < 4; i++) {
+        ah_still(&h, i);
+    }
+    // patch 0 (even slots) at 16 = theta K_p, patch 1 (odd slots) at 18 < (theta + hyst) K_p = 19.2: no switch
+    for (int f = 0; f < 32; f += 2) {
+        env->food[f] = (FishFood){.pos = {2.0f + (float)f, 2.0f}, .active = true};
+    }
+    for (int f = 1; f < 36; f += 2) {
+        env->food[f] = (FishFood){.pos = {2.0f + (float)f, 48.0f}, .active = true};
+    }
+    env->food_active = 34;
+    puf_step(env);
+    CHECK(env->inst_type == 0 && env->rotations == 0 && env->closed_steps == 0,
+        "S_open 16 <= 16 but S_other 18 < 19.2: no switch (closed_steps stays 0)");
+    CHECK(fabsf(env->stock_open_sum - 0.5f) < 1e-6f, "stock_open_sum += S_open / K_open = 0.5");
+    CHECK(env->fish[0].informed && env->fish[0].inst_val == 1.0f, "the broadcast beacon reads +1 (patch 0 open)");
+    env->food[37] = (FishFood){.pos = {39.0f, 48.0f}, .active = true};
+    env->food[39] = (FishFood){.pos = {41.0f, 48.0f}, .active = true};
+    env->food_active = 36;                      // patch 1 at 20 >= 19.2
+    puf_step(env);
+    CHECK(env->inst_type == 1 && env->rotations == 1 && env->fish[0].inst_val == 1.0f,
+        "S_other 20 >= 19.2: the open patch switches to 1 (rotations 1); reads precede the update within a step");
+    // eating a patch-0 pellet (closed) is a violation; a patch-1 pellet (open) a compliant act
+    env->food[40] = (FishFood){.pos = {11.5f, 30.0f}, .active = true};   // slot 40: patch 0, ahead of fish 0
+    env->food_active = 37;
+    puf_step(env);
+    CHECK(env->fish[0].ate && env->eats_closed == 1 && env->violations == 1 && env->fish[0].mark == 64
+        && env->fish[0].rule_acts == 1 && env->fish[0].comply_acts == 0 && env->fish[0].inst_val == -1.0f,
+        "eating a pellet of the closed patch: eats_closed 1, violation, mark %d (persistent); the beacon now reads -1", env->fish[0].mark);
+    env->food[41] = (FishFood){.pos = {31.5f, 10.0f}, .active = true};   // slot 41: patch 1, ahead of fish 1
+    env->food_active = 37;
+    puf_step(env);
+    CHECK(env->fish[1].ate && env->eats_closed == 1 && env->fish[1].comply_acts == 1 && env->fish[1].mark == 0,
+        "eating a pellet of the open patch is compliant (no mark)");
+    CHECK(env->inst_type == 1 && env->closed_steps == 0, "still patch 1 open; closed_frac unused (closed_steps 0)");
+    // migration counters: fish 2 inside the open patch's disk, fish 3 inside the closed one
+    place_fish(env, 2, 42.0f, 42.0f, 0.0f);
+    place_fish(env, 3, 8.0f, 8.0f, 0.0f);
+    int open_before = env->open_patch_steps;
+    int closed_before = env->closed_patch_steps;
+    puf_step(env);
+    CHECK(env->open_patch_steps == open_before + 1 && env->closed_patch_steps == closed_before + 1
+        && env->fish[2].in_open_steps == 1 && env->fish[3].in_closed_steps == 1 && env->fish[2].in_closed_steps == 0,
+        "one fish-step in the open disk, one in the closed disk (open %d, closed %d)", env->open_patch_steps, env->closed_patch_steps);
+    CHECK(wef_inst_closed(env, 3) == 1 && wef_inst_closed(env, 2) == 0 && wef_inst_closed(env, 0) == 0,
+        "wef_inst_closed under mode 4: a fish is closed inside the closed patch's disk");
+    // rotation back: patch 1 down to 16, patch 0 up to 20
+    for (int f = 33; f < 42; f += 2) {
+        env->food[f].active = false;
+    }
+    for (int f = 32; f < 40; f += 2) {
+        env->food[f] = (FishFood){.pos = {2.0f + (float)f, 2.0f}, .active = true};
+    }
+    env->food_active = 36;                      // patch 0: 16 + 4 = 20, patch 1: 20 - 4 = 16
+    puf_step(env);
+    CHECK(env->inst_type == 0 && env->rotations == 2, "patch 1 down to 16, patch 0 up to 20: back to patch 0 (rotations 2)");
+    destroy(&h);
+    // spurious rotation: inst_flip_steps 8 switches w.p. 1/8 per step
+    dict_set(&kw, "inst_flip_steps", 8);
+    Harness h2 = make(&kw, 4);
+    env = h2.env;
+    clear_objects(env);
+    ah_park(&h2, 0);
+    int toggles = 0;
+    int prev = env->inst_type;
+    for (int t = 0; t < 800; t++) {
+        puf_step(env);
+        toggles += env->inst_type != prev;
+        prev = env->inst_type;
+    }
+    CHECK(toggles > 60 && toggles < 140 && env->rotations == toggles,
+        "inst_flip_steps 8: %d switches in 800 steps (expect ~100), rotations counts them", toggles);
+    destroy(&h2);
+    // the open patch is drawn per episode unless pinned
+    dict_set(&kw, "inst_flip_steps", 0);
+    dict_set(&kw, "inst_fixed_type", -1);
+    Harness h3 = make(&kw, 4);
+    env = h3.env;
+    int seen[2] = {0, 0};
+    for (int e = 0; e < 40; e++) {
+        puf_reset(env);
+        seen[env->inst_type]++;
+    }
+    CHECK(seen[0] > 8 && seen[1] > 8, "inst_fixed_type -1: patch 0 open in %d of 40 episodes, patch 1 in %d", seen[0], seen[1]);
+    destroy(&h3);
+    // the complier (13) eats only pellets of the patch its read says is open and heads for that patch
+    dict_set(&kw, "inst_fixed_type", 1);
+    puf_ini_set(&kw, "roles", "13,0,0,0");
+    Harness h4 = make(&kw, 4);
+    env = h4.env;
+    clear_objects(env);
+    place_fish(env, 0, 10.0f, 30.0f, 0.0f);
+    place_fish(env, 1, 45.0f, 5.0f, 0.0f);
+    place_fish(env, 2, 5.0f, 45.0f, 0.0f);
+    place_fish(env, 3, 25.0f, 5.0f, 0.0f);
+    for (int i = 1; i < 4; i++) {
+        ah_still(&h4, i);
+    }
+    env->food[0] = (FishFood){.pos = {10.0f, 27.0f}, .active = true};   // patch 0 (closed), 3 cm to the fish's right
+    env->food[1] = (FishFood){.pos = {42.0f, 42.0f}, .active = true};   // patch 1 (open), at its centre
+    env->food_active = 2;
+    float d0 = 0.0f;
+    for (int t = 0; t < 30; t++) {
+        puf_step(env);
+        if (t == 1) {
+            float dx = env->fish[0].pos.x - 42.0f;
+            float dy = env->fish[0].pos.y - 42.0f;
+            d0 = sqrtf(dx * dx + dy * dy);
+        }
+    }
+    float dx = env->fish[0].pos.x - 42.0f;
+    float dy = env->fish[0].pos.y - 42.0f;
+    float d1 = sqrtf(dx * dx + dy * dy);
+    CHECK(env->food[0].active && env->violations == 0 && d1 < d0 - 5.0f,
+        "the complier left the closed patch's pellet alone and closed in on the open patch (%.1f -> %.1f cm)", d0, d1);
+    for (int t = 0; t < 400 && env->food[1].active; t++) {
+        puf_step(env);
+    }
+    CHECK(!env->food[1].active && env->food_by[0] == 1 && env->fish[0].comply_acts == 1 && env->violations == 0
+        && env->food[0].active,
+        "and ate the open patch's pellet (1 compliant act, 0 violations; the closed one is still there)");
+    destroy(&h4);
+    dict_clear(&kw);
+}
+
 static void test_inst(void) {
     test_inst_layout();
     test_inst_read();
@@ -2422,10 +2680,12 @@ static void test_inst(void) {
     test_inst_wrongful();
     test_inst_roles_phase3();
     test_inst_auto_freeze();
+    test_per_patch();
+    test_inst_rotating();
 }
 #else
 static void test_inst(void) {
-    printf("-- INST U13-U26: skipped (needs the -DWEF_INST build)\n");
+    printf("-- INST U13-U28: skipped (needs the -DWEF_INST build)\n");
 }
 #endif
 
@@ -2440,6 +2700,7 @@ static int run_calibration(int argc, char** argv) {
     bool allelo = false;
     bool inst_ah = false;
     bool inst_commons = false;
+    bool inst_commons_rot = false;
     bool conv = false;
     for (int a = 1; a < argc; a++) {
         if (strcmp(argv[a], "preset=harvest") == 0) {
@@ -2450,12 +2711,16 @@ static int run_calibration(int argc, char** argv) {
             inst_ah = true;
         } else if (strcmp(argv[a], "preset=inst_commons") == 0) {
             inst_commons = true;
+        } else if (strcmp(argv[a], "preset=inst_commons_rot") == 0) {
+            inst_commons_rot = true;
         } else if (strcmp(argv[a], "shape=conv") == 0) {
             conv = true;
         }
     }
     if (inst_ah) {
         kw_inst_ah(&kw);
+    } else if (inst_commons_rot) {
+        kw_inst_commons_rot(&kw);
     } else if (inst_commons) {
         kw_inst_commons(&kw);
     } else if (allelo) {
@@ -2473,7 +2738,7 @@ static int run_calibration(int argc, char** argv) {
     for (int a = 1; a < argc; a++) {
         if (strcmp(argv[a], "preset=harvest") == 0 || strcmp(argv[a], "preset=allelo") == 0
                 || strcmp(argv[a], "preset=inst_ah") == 0 || strcmp(argv[a], "preset=inst_commons") == 0
-                || strcmp(argv[a], "shape=conv") == 0) {
+                || strcmp(argv[a], "preset=inst_commons_rot") == 0 || strcmp(argv[a], "shape=conv") == 0) {
             continue;
         }
         char key[64];
@@ -2546,6 +2811,12 @@ static int run_calibration(int argc, char** argv) {
     double inst_agree = 0.0;
     double inst_closed = 0.0;
     double inst_eats_closed = 0.0;
+    double rot_rotations = 0.0;        // phase 4: rotating patch / per-patch counters
+    double rot_open_frac = 0.0;
+    double rot_closed_frac = 0.0;
+    double rot_stock_open = 0.0;
+    double pp_collapsed = 0.0;
+    double in_open[MAX_AGENTS] = {0};  // per slot: fish-steps inside the open patch's disk / steps
     double zaps_given_step[MAX_AGENTS] = {0};  // per-episode accumulators (reset each episode)
     double zaps_taken_step[MAX_AGENTS] = {0};
     double plant_a_step[MAX_AGENTS] = {0};
@@ -2631,6 +2902,21 @@ static int run_calibration(int argc, char** argv) {
                     inst_wrongful += env->zaps_wrongful;
                     inst_sanctioned += env->violations > 0 ? (double)env->zaps_on_marked / env->violations : 0.0;
                 }
+                if (env->inst_mode == 4) {
+                    double fish_steps = (double)env->cur_episode_length * env->num_agents;
+                    rot_rotations += env->rotations;
+                    rot_open_frac += env->open_patch_steps / fish_steps;
+                    rot_closed_frac += env->closed_patch_steps / fish_steps;
+                    rot_stock_open += env->stock_open_sum / env->cur_episode_length;
+                    for (int i = 0; i < env->num_agents; i++) {
+                        in_open[i] += (double)env->fish[i].in_open_steps / env->cur_episode_length;
+                    }
+                }
+                if (env->regrow_per_patch) {
+                    for (int p = 0; p < env->num_patches_ep; p++) {
+                        pp_collapsed += env->patch_collapsed[p];
+                    }
+                }
                 int n_max = env->n_type[0] > env->n_type[1] ? env->n_type[0] : env->n_type[1];
                 mono_final += (double)n_max / env->num_food;
                 mono_mean += env->mono_frac_sum / env->cur_episode_length;
@@ -2660,6 +2946,15 @@ static int run_calibration(int argc, char** argv) {
             vsum / episodes, inst_marked / episodes, inst_exposure / episodes, zsum / episodes,
             inst_agree / episodes, inst_closed / episodes, inst_eats_closed / episodes,
             inst_wrongful / episodes, inst_sanctioned / episodes);
+    }
+    if (env->inst_mode == 4 || env->regrow_per_patch) {
+        printf("  rot: rotations %.1f   open_patch_frac %.3f   closed_patch_frac %.3f   stock_open_mean %.3f   patches_collapsed %.2f   in_open per slot:",
+            rot_rotations / episodes, rot_open_frac / episodes, rot_closed_frac / episodes,
+            rot_stock_open / episodes, pp_collapsed / episodes);
+        for (int i = 0; i < env->num_agents; i++) {
+            printf(" %.3f", in_open[i] / episodes);
+        }
+        printf("\n");
     }
     if (env->allelo) {
         printf("  mono_final %.3f   mono_mean %.3f   t_conv %.3f   plantings %.1f   plant_proactive %.1f   plant_noop %.1f   plant_attempts %.1f   zaps_cross %.1f   zaps_same %.1f   n_ripe_mean %.2f\n",
