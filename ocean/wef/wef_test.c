@@ -194,6 +194,8 @@ static void kw_inst_commons_rot(Dict* kw) {
     dict_set(kw, "max_arena_width", 50);
     dict_set(kw, "min_arena_height", 50);
     dict_set(kw, "max_arena_height", 50);
+    dict_set(kw, "regrow_p_max", 0.03);         // the calibrated per-patch ecology (calibration doc 6.1)
+    dict_set(kw, "regrow_allee", 0.2);
     dict_set(kw, "patch_layout", 1);
     dict_set(kw, "regrow_per_patch", 1);
     dict_set(kw, "inst_mode", 4);
@@ -2731,6 +2733,100 @@ static void test_inst_rotating(void) {
 // U29 (plan 11.1, D18b): duty to enforce. A bystander within inst_duty_cm of a marked fish takes the duty;
 // inst_duty_steps able, in-range steps without a sanction = a shirk (class 2, marked); out-of-range and
 // frozen steps do not count; its own or anyone's sanction discharges it; key off = no effect.
+// U31 (plan 11, D20): inst_grace_steps: under the rotating rule an eat in the closed patch is a violation only once
+// the fish has dwelt there for more than G steps (closed_dwell +1 inside / -1 outside, reset at a switch); G 0 = U28.
+static void test_inst_grace(void) {
+    printf("-- INST U31: dwell grace in the closed patch (inst_grace_steps)\n");
+    Dict kw = {0};
+    kw_base(&kw, 4);
+    kw_inst_commons_rot(&kw);                   // patches (8, 8) open and (42, 42) closed at reset
+    dict_set(&kw, "inst_fixed_type", 0);
+    dict_set(&kw, "regrow_allee", 0.9);
+    dict_set(&kw, "inst_grace_steps", 16);
+    Harness h = make(&kw, 4);
+    Env* env = h.env;
+    clear_objects(env);
+    place_fish(env, 0, 40.0f, 42.0f, 0.0f);     // inside the closed disk (2 cm from its centre), still
+    place_fish(env, 1, 10.0f, 30.0f, 0.0f);     // the others outside both disks
+    place_fish(env, 2, 25.0f, 40.0f, 0.0f);
+    place_fish(env, 3, 40.0f, 25.0f, 0.0f);
+    for (int i = 0; i < 4; i++) {
+        ah_still(&h, i);
+    }
+    for (int f = 0; f < 32; f += 2) {           // patch 0 full enough that nothing switches
+        env->food[f] = (FishFood){.pos = {2.0f + (float)f, 2.0f}, .active = true};
+    }
+    env->food_active = 16;
+    for (int t = 0; t < 10; t++) {
+        puf_step(env);
+    }
+    CHECK(env->fish[0].closed_dwell == 10 && env->inst_type == 0, "10 still steps inside the closed disk: closed_dwell 10 (%d), patch 0 open",
+        env->fish[0].closed_dwell);
+    env->food[41] = (FishFood){.pos = {41.5f, 42.0f}, .active = true};   // slot 41: patch 1 (closed), ahead of fish 0
+    env->food_active = 17;
+    puf_step(env);
+    CHECK(env->fish[0].ate && env->violations == 0 && env->fish[0].mark == 0 && env->fish[0].comply_acts == 1,
+        "a closed-patch eat within the grace (dwell 10 <= 16) is compliant: no mark");
+    for (int t = 0; t < 10; t++) {
+        puf_step(env);
+    }
+    CHECK(env->fish[0].closed_dwell == 21, "dwell keeps counting inside: 21 (%d)", env->fish[0].closed_dwell);
+    env->food[43] = (FishFood){.pos = {41.5f, 42.0f}, .active = true};
+    env->food_active = 17;
+    puf_step(env);
+    CHECK(env->fish[0].ate && env->violations == 1 && env->violations_first == 1 && env->fish[0].mark == 64,
+        "the same eat after dwelling 21 > 16 steps is the violation: marked %d", env->fish[0].mark);
+    place_fish(env, 0, 25.0f, 42.0f, 0.0f);     // leave the disk: dwell decays one per step, floor 0
+    for (int t = 0; t < 12; t++) {
+        puf_step(env);
+    }
+    CHECK(env->fish[0].closed_dwell == 10, "12 steps outside: dwell 22 -> 10 (%d)", env->fish[0].closed_dwell);
+    for (int t = 0; t < 20; t++) {
+        puf_step(env);
+    }
+    CHECK(env->fish[0].closed_dwell == 0, "dwell floors at 0 (%d)", env->fish[0].closed_dwell);
+    place_fish(env, 0, 40.0f, 42.0f, 0.0f);
+    for (int t = 0; t < 40; t++) {
+        puf_step(env);
+    }
+    CHECK(env->fish[0].closed_dwell == 32, "dwell caps at 2 x grace = 32 (%d)", env->fish[0].closed_dwell);
+    // a switch resets every dwell: patch 0 down to theta K_p (16 of 32) with patch 1 at >= 0.6 K_p
+    for (int f = 1; f < 40; f += 2) {
+        env->food[f] = (FishFood){.pos = {2.0f + (float)f, 48.0f}, .active = true};
+    }
+    env->food_active = 36;
+    puf_step(env);
+    CHECK(env->inst_type == 1 && env->rotations == 1 && env->fish[0].closed_dwell == 0,
+        "the switch to patch 1 resets closed_dwell to 0 (%d); fish 0 now sits in the OPEN patch", env->fish[0].closed_dwell);
+    destroy(&h);
+    dict_clear(&kw);
+    // grace 0 = the U28 behaviour: a closed-patch eat is a violation at once
+    Dict kw0 = {0};
+    kw_base(&kw0, 4);
+    kw_inst_commons_rot(&kw0);
+    dict_set(&kw0, "inst_fixed_type", 0);
+    dict_set(&kw0, "regrow_allee", 0.9);
+    Harness h0 = make(&kw0, 4);
+    clear_objects(h0.env);
+    place_fish(h0.env, 0, 40.0f, 42.0f, 0.0f);
+    place_fish(h0.env, 1, 10.0f, 30.0f, 0.0f);
+    place_fish(h0.env, 2, 25.0f, 40.0f, 0.0f);
+    place_fish(h0.env, 3, 40.0f, 25.0f, 0.0f);
+    for (int i = 0; i < 4; i++) {
+        ah_still(&h0, i);
+    }
+    for (int f = 0; f < 32; f += 2) {
+        h0.env->food[f] = (FishFood){.pos = {2.0f + (float)f, 2.0f}, .active = true};
+    }
+    h0.env->food[41] = (FishFood){.pos = {41.5f, 42.0f}, .active = true};
+    h0.env->food_active = 17;
+    puf_step(h0.env);
+    CHECK(h0.env->fish[0].ate && h0.env->violations == 1 && h0.env->fish[0].closed_dwell == 0,
+        "grace 0: the first closed-patch eat is the violation and closed_dwell is not tracked");
+    destroy(&h0);
+    dict_clear(&kw0);
+}
+
 static void test_inst_duty(void) {
     printf("-- INST U29: duty to enforce (inst_duty_cm / inst_duty_steps)\n");
     Dict kw = {0};
@@ -2916,12 +3012,13 @@ static void test_inst(void) {
     test_inst_auto_freeze();
     test_per_patch();
     test_inst_rotating();
+    test_inst_grace();
     test_inst_duty();
     test_inst_freeze_scope();
 }
 #else
 static void test_inst(void) {
-    printf("-- INST U13-U30: skipped (needs the -DWEF_INST build)\n");
+    printf("-- INST U13-U31: skipped (needs the -DWEF_INST build)\n");
 }
 #endif
 

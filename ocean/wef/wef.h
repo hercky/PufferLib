@@ -215,6 +215,8 @@ typedef struct FishAgent {
     bool bot_responded;    // role 15: has been sanctioned bot_respond_zaps times and now complies
     int in_open_steps;     // inst_mode 4: fish-steps inside the open patch's disk this episode (harness per-slot output)
     int in_closed_steps;   // inst_mode 4: ... inside the closed patch's disk
+    int closed_dwell;      // inst_mode 4 (inst_grace_steps > 0): steps spent inside the closed patch's disk, +1 per step
+                           // inside, -1 per step outside (floor 0, cap 2 x grace), reset to 0 at every switch
     // duty to enforce (inst_duty_cm, plan 11.1 / D18b)
     int duty_target;       // the marked fish this fish must sanction, -1 none
     int duty_count;        // steps spent within inst_duty_cm of the target while able (not frozen)
@@ -744,6 +746,9 @@ struct Env {
     int inst_auto_freeze;       // learnability ablation: a violation freezes the violator on the spot for this many steps (0 = off)
     int auto_sanctions;         // per-episode counter of those direct sanctions
     int inst_auto_freeze_scope; // 0: every violation triggers inst_auto_freeze; 1: only second-order ones (wrongful bites, shirks)
+    int inst_grace_steps;       // mode 4: 0 = an eat of a closed-patch pellet is the violation (one-step grace after a switch);
+                                // G > 0 = it is a violation only once the fish has dwelt in the closed disk for more than G
+                                // steps (closed_dwell; crossing the closed patch, or leaving it after a switch, is not a violation)
     float inst_duty_cm;         // duty to enforce (D18b): a fish within this range of a marked fish must sanction it (0 = off)
     int inst_duty_steps;        // ... within this many able, in-range steps, or it is marked itself (class-2 violation)
     int shirks;                 // per-episode counters of the duty rule
@@ -2645,8 +2650,12 @@ void puf_step(Wef* env) {
                         // mode 4: per pellet, with a one-step grace after a switch (the read in step t
                         // precedes the update of step t, so a fish that follows the signal exactly still
                         // eats in the old patch at rotation_tick + 1)
+                        // inst_grace_steps > 0: the violation is to eat there while STAYING (closed_dwell above
+                        // the grace), so a fish crossing the closed patch or leaving it after a switch is not
+                        // marked for the pellets it eats on contact (eating is automatic in this env)
                         bool closed = env->inst_mode == 4
                             ? wef_inst_pellet_closed(env, f) && env->tick != env->rotation_tick + 1
+                                && (env->inst_grace_steps == 0 || agent->closed_dwell > env->inst_grace_steps)
                             : wef_inst_closed(env, i);
                         if (closed) {
                             env->eats_closed++;
@@ -3228,6 +3237,9 @@ void puf_step(Wef* env) {
                     env->inst_type = other;
                     env->rotations++;
                     env->rotation_tick = env->tick;
+                    for (int i = 0; i < env->num_agents; i++) {
+                        env->fish[i].closed_dwell = 0;  // the newly closed patch's occupants start their grace
+                    }
                 }
                 int k_open = wef_patch_k(env, env->inst_type);
                 env->stock_open_sum += k_open > 0
@@ -3240,6 +3252,11 @@ void puf_step(Wef* env) {
                     env->closed_patch_steps += in_closed;
                     env->fish[i].in_open_steps += in_open;
                     env->fish[i].in_closed_steps += in_closed;
+                    if (env->inst_grace_steps > 0) {
+                        int cap = 2 * env->inst_grace_steps;
+                        int d = env->fish[i].closed_dwell + (in_closed ? 1 : -1);
+                        env->fish[i].closed_dwell = d < 0 ? 0 : d > cap ? cap : d;
+                    }
                 }
             } else if (env->inst_mode == 3) {
                 if (random_uniform(env, 0.0f, 1.0f) < 1.0f / (float)env->inst_flip_steps) {
@@ -4211,7 +4228,7 @@ static const char* WEF_ENV_KEYS[] = {
     "inst_mark_steps", "mark_zap_reward", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
     "inst_obj_radius_cm", "inst_contrast", "inst_latch", "mark_freeze_steps",
     "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze",
-    "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps",
+    "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps", "inst_grace_steps",
 };
 
 static void wef_check_keys(Dict* kwargs) {
@@ -4359,6 +4376,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->bot_respond_zaps = wef_cfg(kwargs, "bot_respond_zaps", 1);
     env->inst_auto_freeze = wef_cfg(kwargs, "inst_auto_freeze", 0);
     env->inst_auto_freeze_scope = wef_cfg(kwargs, "inst_auto_freeze_scope", 0);
+    env->inst_grace_steps = wef_cfg(kwargs, "inst_grace_steps", 0);
     env->inst_duty_cm = wef_cfg(kwargs, "inst_duty_cm", 0.0);
     env->inst_duty_steps = wef_cfg(kwargs, "inst_duty_steps", 64);
     {
@@ -4399,6 +4417,8 @@ void puf_init(Env* env, Dict* kwargs) {
     assert(env->bot_respond_zaps >= 1);
     assert(env->inst_auto_freeze >= 0 && (env->inst_auto_freeze == 0 || env->inst_mode > 0)
         && "inst_auto_freeze needs inst_mode > 0");
+    assert(env->inst_grace_steps >= 0 && (env->inst_grace_steps == 0 || env->inst_mode == 4)
+        && "inst_grace_steps needs inst_mode 4");
     assert((env->inst_auto_freeze_scope == 0 || (env->inst_auto_freeze_scope == 1 && env->inst_auto_freeze > 0))
         && "inst_auto_freeze_scope: 0 every violation, 1 second-order only (needs inst_auto_freeze > 0)");
     assert(env->inst_duty_cm >= 0.0f && env->inst_duty_steps > 0
