@@ -198,6 +198,7 @@ typedef struct FishAgent {
     // both are 0.
     int mark;              // steps left of the violation mark (the public label)
     float inst_val;        // the rule as last read at the beacon: +1 / -1, 0 = never read (latched)
+    float bot_inst_val;    // scripted roles: the last value read, kept when inst_latch 0 clears inst_val out of range
     bool informed;         // has read the beacon this episode
     int first_visit_tick;  // first tick inside inst_read_cm, 0 = never
     int last_read_tick;    // last tick inside inst_read_cm (scripted compliers re-read the season)
@@ -381,7 +382,8 @@ struct Log {
     float inst_type_a;       // AH: fraction of episodes whose prescribed type at reset was A
     float comply_frac;       // rule-following acts / rule-governed acts (1 when there were none)
     float comply_informed;   // the same over fish that had read the beacon
-    float violations;        // rule-breaking acts per episode
+    float violations;        // rule-breaking acts per episode (every class)
+    float violations_first;  // ... of class 0 only (first-order: the rule-governed act); wrongful bites and shirks excluded
     float marked_frac;       // fish-steps marked / fish-steps
     float marked_exposure;   // (i, j) pairs within MORM_AGENT_RANGE_CM with j marked / all such pairs (the mark-blind null)
     float zaps_on_marked;    // fish bites whose victim was marked
@@ -755,12 +757,15 @@ struct Env {
     // institution episode state
     int inst_type;              // public rule: AH prescribed type 0 A / 1 B; Commons 1 closed / 0 open; mode 4: the open patch 0 / 1
     int rotations;              // mode 4: open-patch switches this episode
+    int rotation_tick;          // mode 4: tick of the last switch (-2 none); an eat of the just-closed patch at
+                                // rotation_tick + 1 is compliant (one-step grace: the read lags the switch by a step)
     int open_patch_steps;       // mode 4: fish-steps inside the open / closed patch's disk
     int closed_patch_steps;
     int inst_type_reset;        // AH: the prescribed type drawn at reset (inst_type_a)
     Vec2 inst_pos;
     Vec2 inst_moment;           // beacon induced dipole this step
     int violations;
+    int violations_first;       // ... of class 0 (first-order); violations also counts wrongful bites and shirks
     int zaps_on_marked;
     int marked_steps;
     int pair_steps;             // ordered fish pairs within MORM_AGENT_RANGE_CM, summed over steps
@@ -848,7 +853,10 @@ static inline void wef_inst_violation(Wef* env, int i, int cls) {
     FishAgent* fish = &env->fish[i];
     env->violations++;
     fish->violations++;
-    fish->trace_violated = cls + 1;
+    env->violations_first += cls == 0;
+    if (fish->trace_violated == 0 || cls + 1 < fish->trace_violated) {
+        fish->trace_violated = cls + 1;  // two classes in one step: the trace keeps the lowest (first-order wins)
+    }
     if (cls == 2) {
         env->shirks++;
         fish->shirks++;
@@ -1572,6 +1580,7 @@ void puf_reset(Wef* env) {
     }
     env->stock_open_sum = 0.0f;
     env->rotations = 0;
+    env->rotation_tick = -2;
     env->open_patch_steps = 0;
     env->closed_patch_steps = 0;
     env->open_steps = 0;
@@ -1609,6 +1618,7 @@ void puf_reset(Wef* env) {
     env->ripe_frac_sum = 0.0f;
     env->convention_tick = 0;
     env->violations = 0;
+    env->violations_first = 0;
     env->zaps_on_marked = 0;
     env->marked_steps = 0;
     env->pair_steps = 0;
@@ -2127,7 +2137,7 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     // when none is in reach (bots know the patch positions).
     int bot_open = -1;
     if (inst_role && role == 7 && env->inst_mode == 4) {
-        bot_open = fish->inst_val > 0.0f ? 0 : fish->inst_val < 0.0f ? 1 : -1;
+        bot_open = fish->bot_inst_val > 0.0f ? 0 : fish->bot_inst_val < 0.0f ? 1 : -1;  // the last read, latch or not
     }
     bool bot_wait = false;  // mode 4 complier heading for / holding at the open patch's centre
     bool restrain = role == 7 && env->inst_mode != 4
@@ -2156,13 +2166,26 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     bool ah_plant_target = false; // the target is a bush to plant (plant cone radius, bite in cone)
     bool ah_hunt = false;         // the target is a rival fish (bite cone radius)
     bool ah_bite_now = false;     // role 12: bite this step without a travel target
+    int hunt_j = -1;              // enforcer: the fish being hunted (exempt from its collision avoidance)
     if (enforcer && fish->informed && fish->bite_cooldown <= 0) {
-        // enforcer: the nearest marked, non-frozen fish within the hunt range (role 16: any fish).
+        // enforcer: its duty target first (inst_duty_cm; while that fish is marked and not frozen),
+        // else the nearest marked, non-frozen fish within the hunt range (role 16: any fish). The
+        // chase runs at full speed and the hunted fish is exempt from the collision-avoidance turn
+        // below (phase 4 review: the enforcer sat 2-3 cm from its target for whole duty windows,
+        // inside the bite radius but turned 90 degrees off it by the avoidance rule, never biting,
+        // and shirked 8 duties / episode in the mixed harness run).
         // Hunting outranks the beacon once the fish has read the rule: a Commons enforcer waiting
         // out the closed season at the beacon is exactly the fish that must leave it to sanction
         // (phase 3 fix; before, go_beacon took priority and enforcement stopped while closed).
         float hunt2 = env->bot_oracle ? INFINITY : MORM_AGENT_RANGE_CM * MORM_AGENT_RANGE_CM;
-        for (int j = 0; j < env->num_agents; j++) {
+        int dt = fish->duty_target;
+        if (dt >= 0 && dt != i && env->fish[dt].mark > 0 && env->fish[dt].freeze <= 0) {
+            target = env->fish[dt].pos;
+            found = true;
+            ah_hunt = true;
+            hunt_j = dt;
+        }
+        for (int j = 0; j < env->num_agents && !found; j++) {
             if (j == i || env->fish[j].freeze > 0 || (env->fish[j].mark <= 0 && !hunt_any)) {
                 continue;
             }
@@ -2174,6 +2197,7 @@ void wef_bot_action(Wef* env, int i, float* raw) {
                 target = env->fish[j].pos;
                 found = true;
                 ah_hunt = true;
+                hunt_j = j;
             }
         }
     }
@@ -2317,8 +2341,15 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     }
     if (!found && inst_role) {
         // nothing to eat / plant / zap: back to the beacon (re-read the rule); the mode 4 complier
-        // goes to the centre of the patch it believes open instead (and waits there)
-        target = bot_open >= 0 ? env->patch_center[bot_open] : env->inst_pos;
+        // goes to the patch it believes open instead and waits there, at its own point 2.5 cm from
+        // the centre (slots spread around it: several fish holding at one point sit body to body and
+        // shield one another from an enforcer, phase 4 review)
+        if (bot_open >= 0) {
+            float ang = 2.0f * PI_F * (float)i / (float)env->num_agents;
+            target = (Vec2){env->patch_center[bot_open].x + 2.5f * cosf(ang), env->patch_center[bot_open].y + 2.5f * sinf(ang)};
+        } else {
+            target = env->inst_pos;
+        }
         bot_wait = bot_open >= 0;
         found = true;
     }
@@ -2358,8 +2389,13 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     float err = wrap_angle(atan2f(target.y - fish->pos.y, target.x - fish->pos.x) - fish->orientation);
     // Collision avoidance: a fish within 3 cm and roughly ahead -> turn away from it
     // (a reverted move keeps the new heading, so pure pursuit would lock head-on).
+    // An enforcer closes on its quarry instead of turning away from it, and inside the turn-in-place
+    // zone (2 x the bite radius, below) it ignores the rule altogether: it is standing still, and a
+    // third fish parked within 3 cm (two compliers at one patch centre) otherwise re-fires the 90-degree
+    // turn after every step of the pursuit turn, so the target never enters the bite cone.
+    bool no_avoid = enforcer && ah_hunt && dist < 2.0f * BITING_RADIUS_CM;
     for (int j = 0; j < env->num_agents; j++) {
-        if (j == i) {
+        if (j == i || no_avoid || (enforcer && j == hunt_j)) {
             continue;
         }
         float dx = env->fish[j].pos.x - fish->pos.x;
@@ -2387,7 +2423,7 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     if (found && (dist < radius || (dist < 2.0f * radius && !aligned))) {
         raw[0] = -8.0f;                          // sigmoid -> 3e-4: no motion
     } else {
-        raw[0] = fabsf(err) < 0.6f ? 2.2f : -0.85f;  // 0.9 when aligned, 0.3 while turning
+        raw[0] = fabsf(err) < 0.6f ? (ah_hunt && enforcer ? 8.0f : 2.2f) : -0.85f;  // 0.9 when aligned (enforcer's chase 1.0), 0.3 while turning
     }
     // Eaters never bite (biting suppresses eating that step); cleaners bite on waste.
     raw[3] = (role == 1 && in_cone) ? 1.0f : -1.0f;
@@ -2606,7 +2642,12 @@ void puf_step(Wef* env) {
                         // the rule "do not eat while the season is closed", judged before this
                         // eat changes the stock
                         agent->rule_acts++;
-                        bool closed = env->inst_mode == 4 ? wef_inst_pellet_closed(env, f) : wef_inst_closed(env, i);
+                        // mode 4: per pellet, with a one-step grace after a switch (the read in step t
+                        // precedes the update of step t, so a fish that follows the signal exactly still
+                        // eats in the old patch at rotation_tick + 1)
+                        bool closed = env->inst_mode == 4
+                            ? wef_inst_pellet_closed(env, f) && env->tick != env->rotation_tick + 1
+                            : wef_inst_closed(env, i);
                         if (closed) {
                             env->eats_closed++;
                             wef_inst_violation(env, i, 0);
@@ -2695,6 +2736,7 @@ void puf_step(Wef* env) {
                 }
                 if (env->inst_mode > 0) {
                     agent->inst_val = wef_inst_signal(env, i);
+                    agent->bot_inst_val = agent->inst_val;
                 }
             }
         }
@@ -3185,6 +3227,7 @@ void puf_step(Wef* env) {
                 if (rotate) {
                     env->inst_type = other;
                     env->rotations++;
+                    env->rotation_tick = env->tick;
                 }
                 int k_open = wef_patch_k(env, env->inst_type);
                 env->stock_open_sum += k_open > 0
@@ -3225,17 +3268,24 @@ void puf_step(Wef* env) {
             // Duty to enforce (plan 11.1, D18b), after this step's bites and marks: a fish with no
             // duty takes the nearest OTHER marked fish within inst_duty_cm as its target; a fish
             // with a duty is discharged once the target is unmarked (any sanction, its own or
-            // another's), and otherwise counts the steps it spends in range and able (not frozen);
+            // another's), and otherwise counts the steps it spends in range and able (neither it nor
+            // the target frozen: a frozen fish is immune to bites, so the duty cannot be discharged);
             // at inst_duty_steps it has shirked (a class-2 violation: marked, counted in shirks)
             // and the duty is cleared (a new one may start next step). Marked fish have duties too.
+            // Marks are snapshotted first: a mark set by a shirk in this loop becomes a target next
+            // step for every fish alike (not this step for the higher-indexed ones only).
             float r2 = env->inst_duty_cm * env->inst_duty_cm;
+            bool marked[MAX_AGENTS];
+            for (int j = 0; j < env->num_agents; j++) {
+                marked[j] = env->fish[j].mark > 0;
+            }
             for (int i = 0; i < env->num_agents; i++) {
                 FishAgent* fish = &env->fish[i];
                 if (fish->duty_target < 0) {
                     int target = -1;
                     float best = INFINITY;
                     for (int j = 0; j < env->num_agents; j++) {
-                        if (j == i || env->fish[j].mark <= 0) {
+                        if (j == i || !marked[j]) {
                             continue;
                         }
                         float dx = env->fish[j].pos.x - fish->pos.x;
@@ -3264,7 +3314,7 @@ void puf_step(Wef* env) {
                 }
                 float dx = target->pos.x - fish->pos.x;
                 float dy = target->pos.y - fish->pos.y;
-                if (dx * dx + dy * dy <= r2 && fish->freeze <= 0) {
+                if (dx * dx + dy * dy <= r2 && fish->freeze <= 0 && target->freeze <= 0) {
                     fish->duty_count++;
                     if (fish->duty_count >= env->inst_duty_steps) {
                         wef_inst_violation(env, i, 2);
@@ -3489,6 +3539,7 @@ void puf_step(Wef* env) {
             env->log.comply_frac += acts > 0 ? (float)comply / (float)acts : 1.0f;
             env->log.comply_informed += acts_inf > 0 ? (float)comply_inf / (float)acts_inf : 1.0f;
             env->log.violations += (float)env->violations;
+            env->log.violations_first += (float)env->violations_first;
             env->log.marked_frac += (float)env->marked_steps / fish_steps;
             env->log.marked_exposure += env->pair_steps > 0
                 ? (float)env->pair_marked_steps / (float)env->pair_steps : 0.0f;
@@ -4343,8 +4394,8 @@ void puf_init(Env* env, Dict* kwargs) {
     assert(env->inst_fixed_type >= -1 && env->inst_fixed_type <= 1);
     assert(env->inst_theta > 0.0f && env->inst_theta < 1.0f && env->inst_hyst >= 0.0f && env->inst_theta + env->inst_hyst <= 1.0f);
     assert((env->inst_mode != 3 || env->inst_flip_steps > 0) && "inst_mode 3 needs inst_flip_steps > 0");
-    assert((!env->inst_mark_until_zap && !env->inst_mark_wrongful) || (env->inst_mode > 0 && env->inst_mark_steps > 0)
-        && "inst_mark_until_zap / inst_mark_wrongful need inst_mode > 0 and inst_mark_steps > 0 (the mark value)");
+    assert(env->inst_mode == 0 || (!env->inst_mark_until_zap && !env->inst_mark_wrongful) || env->inst_mark_steps > 0
+        && "inst_mark_until_zap / inst_mark_wrongful need inst_mark_steps > 0 (the mark value) under a rule; inert with inst_mode 0 (a preset's control arm)");
     assert(env->bot_respond_zaps >= 1);
     assert(env->inst_auto_freeze >= 0 && (env->inst_auto_freeze == 0 || env->inst_mode > 0)
         && "inst_auto_freeze needs inst_mode > 0");
@@ -4547,6 +4598,7 @@ static void wef_log_inst_tail(Log* log, Dict* out) {
     dict_set(out, "zaps_wrongful", log->zaps_wrongful);
     dict_set(out, "sanctions_per_viol", log->sanctions_per_viol);
     dict_set(out, "auto_sanctions", log->auto_sanctions);
+    dict_set(out, "violations_first", log->violations_first);
     // phase 4 duty rule (zero unless inst_duty_cm > 0)
     dict_set(out, "shirks", log->shirks);
     dict_set(out, "duties", log->duties);

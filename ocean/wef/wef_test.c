@@ -2493,6 +2493,14 @@ static void test_per_patch(void) {
         puf_step(env);
     }
     CHECK(env->food_active == 8 && env->regrown == s0 - 16, "no regrowth after the collapse");
+    while (env->episode == 0) {
+        puf_step(env);
+    }
+    CHECK(env->log.n == 1.0f && env->log.patches_collapsed == 2.0f && env->log.collapsed == 1.0f
+        && env->log.rotations == 0.0f && env->log.open_patch_frac == 0.0f && env->log.closed_patch_frac == 0.0f
+        && env->log.stock_open_mean == 0.0f,
+        "Log at the episode end: patches_collapsed %.0f, collapsed %.0f; the four mode-4 keys stay 0 without the rule",
+        env->log.patches_collapsed, env->log.collapsed);
     destroy(&h);
     // key off: one global stock, regrowth draws a patch per pellet, no per-patch flags
     dict_set(&kw, "regrow_per_patch", 0);
@@ -2558,17 +2566,33 @@ static void test_inst_rotating(void) {
     CHECK(env->fish[0].informed && env->fish[0].inst_val == 1.0f, "the broadcast beacon reads +1 (patch 0 open)");
     env->food[37] = (FishFood){.pos = {39.0f, 48.0f}, .active = true};
     env->food[39] = (FishFood){.pos = {41.0f, 48.0f}, .active = true};
-    env->food_active = 36;                      // patch 1 at 20 >= 19.2
+    env->food[32] = (FishFood){.pos = {34.0f, 2.0f}, .active = true};    // patch 0 at 17 > 16 = theta K_p
+    env->food_active = 37;                      // patch 1 at 20 >= 19.2
     puf_step(env);
-    CHECK(env->inst_type == 1 && env->rotations == 1 && env->fish[0].inst_val == 1.0f,
-        "S_other 20 >= 19.2: the open patch switches to 1 (rotations 1); reads precede the update within a step");
-    // eating a patch-0 pellet (closed) is a violation; a patch-1 pellet (open) a compliant act
+    CHECK(env->inst_type == 0 && env->rotations == 0,
+        "S_other 20 >= 19.2 but S_open 17 > 16: no switch (the open patch has to be depleted as well)");
+    env->food[32].active = false;
+    env->food_active = 36;                      // patch 0 back at 16
+    puf_step(env);
+    CHECK(env->inst_type == 1 && env->rotations == 1 && env->rotation_tick == env->tick && env->fish[0].inst_val == 1.0f,
+        "S_open 16 <= 16 and S_other 20 >= 19.2: the open patch switches to 1 (rotations 1, rotation_tick %d); reads precede the update within a step",
+        env->rotation_tick);
+    // the step after the switch: the read a fish acts on predates the switch, so a patch-0 eat is still
+    // compliant (one-step grace); from the next step on it is the violation
     env->food[40] = (FishFood){.pos = {11.5f, 30.0f}, .active = true};   // slot 40: patch 0, ahead of fish 0
     env->food_active = 37;
     puf_step(env);
-    CHECK(env->fish[0].ate && env->eats_closed == 1 && env->violations == 1 && env->fish[0].mark == 64
-        && env->fish[0].rule_acts == 1 && env->fish[0].comply_acts == 0 && env->fish[0].inst_val == -1.0f,
-        "eating a pellet of the closed patch: eats_closed 1, violation, mark %d (persistent); the beacon now reads -1", env->fish[0].mark);
+    CHECK(env->fish[0].ate && env->eats_closed == 0 && env->violations == 0 && env->fish[0].mark == 0
+        && env->fish[0].rule_acts == 1 && env->fish[0].comply_acts == 1 && env->fish[0].inst_val == -1.0f,
+        "at rotation_tick + 1 a patch-0 eat is within the grace: compliant, no mark; the beacon now reads -1");
+    env->food[42] = (FishFood){.pos = {26.5f, 40.0f}, .active = true};   // slot 42: patch 0, ahead of fish 2
+    env->food_active = 37;
+    puf_step(env);
+    CHECK(env->fish[2].ate && env->eats_closed == 1 && env->violations == 1 && env->violations_first == 1
+        && env->fish[2].mark == 64 && env->fish[2].trace_violated == 1
+        && env->fish[2].rule_acts == 1 && env->fish[2].comply_acts == 0,
+        "at rotation_tick + 2 eating a pellet of the closed patch is the violation: eats_closed 1, violations 1 (first-order 1), mark %d (persistent)",
+        env->fish[2].mark);
     env->food[41] = (FishFood){.pos = {31.5f, 10.0f}, .active = true};   // slot 41: patch 1, ahead of fish 1
     env->food_active = 37;
     puf_step(env);
@@ -2596,13 +2620,40 @@ static void test_inst_rotating(void) {
     env->food_active = 36;                      // patch 0: 16 + 4 = 20, patch 1: 20 - 4 = 16
     puf_step(env);
     CHECK(env->inst_type == 0 && env->rotations == 2, "patch 1 down to 16, patch 0 up to 20: back to patch 0 (rotations 2)");
+    // the Log at the episode end: nothing moves or regrows from here (allee 0.9), fish 3 sits in patch 0's
+    // disk and fish 2 in patch 1's, so every remaining step adds one open and one closed fish-step
+    int T = env->cur_episode_length;
+    int left = T - env->tick;
+    int open_end = env->open_patch_steps + left;
+    int closed_end = env->closed_patch_steps + left;
+    float stock_end = env->stock_open_sum + (float)left * 20.0f / 32.0f;
+    while (env->episode == 0) {
+        puf_step(env);
+    }
+    CHECK(env->log.n == 1.0f && env->log.rotations == 2.0f
+        && fabsf(env->log.open_patch_frac - (float)open_end / (float)(T * 4)) < 1e-6f
+        && fabsf(env->log.closed_patch_frac - (float)closed_end / (float)(T * 4)) < 1e-6f
+        && fabsf(env->log.stock_open_mean - stock_end / (float)T) < 1e-4f
+        && env->log.patches_collapsed == 2.0f && env->log.closed_frac == 0.0f
+        && env->log.violations == 1.0f && env->log.violations_first == 1.0f && env->log.eats_closed == 1.0f,
+        "Log: rotations %.0f, open_patch_frac %.4f (= %d / %d), closed_patch_frac %.4f, stock_open_mean %.4f, patches_collapsed %.0f (both below allee 0.9), closed_frac 0",
+        env->log.rotations, env->log.open_patch_frac, open_end, T * 4, env->log.closed_patch_frac, env->log.stock_open_mean,
+        env->log.patches_collapsed);
     destroy(&h);
-    // spurious rotation: inst_flip_steps 8 switches w.p. 1/8 per step
+    // spurious rotation: inst_flip_steps 8 switches w.p. 1/8 per step, whatever the stocks say (here the
+    // stock rule would fire once: S_open 16 <= 16 with S_other 20 >= 19.2, then never again)
     dict_set(&kw, "inst_flip_steps", 8);
     Harness h2 = make(&kw, 4);
     env = h2.env;
     clear_objects(env);
     ah_park(&h2, 0);
+    for (int f = 0; f < 32; f += 2) {
+        env->food[f] = (FishFood){.pos = {2.0f + (float)f, 2.0f}, .active = true};
+    }
+    for (int f = 1; f < 40; f += 2) {
+        env->food[f] = (FishFood){.pos = {2.0f + (float)f, 48.0f}, .active = true};
+    }
+    env->food_active = 36;
     int toggles = 0;
     int prev = env->inst_type;
     for (int t = 0; t < 800; t++) {
@@ -2611,7 +2662,7 @@ static void test_inst_rotating(void) {
         prev = env->inst_type;
     }
     CHECK(toggles > 60 && toggles < 140 && env->rotations == toggles,
-        "inst_flip_steps 8: %d switches in 800 steps (expect ~100), rotations counts them", toggles);
+        "inst_flip_steps 8: %d switches in 800 steps (expect ~100, not 1 as the stock rule and not 800), rotations counts them", toggles);
     destroy(&h2);
     // the open patch is drawn per episode unless pinned
     dict_set(&kw, "inst_flip_steps", 0);
@@ -2662,6 +2713,18 @@ static void test_inst_rotating(void) {
         && env->food[0].active,
         "and ate the open patch's pellet (1 compliant act, 0 violations; the closed one is still there)");
     destroy(&h4);
+    // the preset's control arm: inst_mode 0 with the preset's mark keys left on initialises (they are inert without a rule)
+    puf_ini_set(&kw, "roles", "0,0,0,0");
+    dict_set(&kw, "inst_mode", 0);
+    Harness h5 = make(&kw, 4);
+    env = h5.env;
+    for (int t = 0; t < 5; t++) {
+        puf_step(env);
+    }
+    CHECK(env->inst_mode == 0 && env->inst_mark_until_zap == 1 && env->inst_mark_wrongful == 1 && env->regrow_per_patch
+        && env->violations == 0 && env->rotations == 0,
+        "control arm: inst_mode 0 on top of the preset (inst_mark_until_zap / inst_mark_wrongful 1) runs");
+    destroy(&h5);
     dict_clear(&kw);
 }
 
@@ -2712,14 +2775,22 @@ static void test_inst_duty(void) {
     }
     CHECK(f0->duty_target == b && f0->duty_count == 4 && f0->freeze == 0 && env->shirks == 0,
         "3 frozen steps in range: count still %d", f0->duty_count);
+    fb->freeze = 3;                               // the TARGET frozen: immune to bites, so these steps do not count either
+    for (int t = 0; t < 3; t++) {
+        puf_step(env);
+    }
+    CHECK(f0->duty_target == b && f0->duty_count == 4 && fb->freeze == 0 && env->shirks == 0,
+        "3 steps with the target frozen: count still %d (a frozen fish cannot be sanctioned)", f0->duty_count);
     puf_step(env);
     CHECK(env->shirks == 1 && f0->shirks == 1 && f0->mark == 64 && f0->trace_violated == 3 && f0->violations == 1
         && env->violations == 2 && f0->duty_target == -1 && f0->duty_count == 0 && f0->freeze == 0,
         "the 5th able step is a shirk: fish 0 marked (class 2 -> trace 3), duty cleared, no auto-freeze (violations %d)",
         env->violations);
-    CHECK(fb->duty_target == 0 && env->duties == 2, "the marked fish b now has a duty of its own on fish 0 (marked fish have duties too)");
+    CHECK(fb->duty_target == -1 && env->duties == 1,
+        "b takes no duty on fish 0 in the shirk's own step (marks are snapshotted before the duty pass, whatever the slot order)");
     puf_step(env);
-    CHECK(f0->duty_target == b && f0->duty_count == 0 && env->duties == 3, "a new duty on the still-marked b starts the next step");
+    CHECK(f0->duty_target == b && f0->duty_count == 0 && fb->duty_target == 0 && env->duties == 3,
+        "next step: a new duty on the still-marked b for fish 0, and the marked b has a duty of its own on fish 0 (duties %d)", env->duties);
     // fish 0 sanctions b itself: the duty is discharged
     place_fish(env, 0, 7.5f, 20.0f, 0.0f);
     set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
@@ -2748,7 +2819,8 @@ static void test_inst_duty(void) {
         puf_step(env);
     }
     CHECK(env->log.n == 1.0f && env->log.shirks == 1.0f && env->log.duties == 5.0f
-        && fabsf(env->log.duties_discharged_frac - 2.0f / 3.0f) < 1e-6f && env->log.violations == 2.0f,
+        && fabsf(env->log.duties_discharged_frac - 2.0f / 3.0f) < 1e-6f && env->log.violations == 2.0f
+        && env->log.violations_first == 1.0f,
         "Log: shirks %.0f, duties %.0f, duties_discharged_frac %.3f (2 of 3 ended duties; 2 still open)",
         env->log.shirks, env->log.duties, env->log.duties_discharged_frac);
     destroy(&h);
@@ -2979,6 +3051,7 @@ static int run_calibration(int argc, char** argv) {
     double inst_agree = 0.0;
     double inst_closed = 0.0;
     double inst_eats_closed = 0.0;
+    double inst_viol_first = 0.0;         // phase 4: first-order violations (env counter; `violations` counts every class)
     double rot_rotations = 0.0;        // phase 4: rotating patch / per-patch counters
     double rot_open_frac = 0.0;
     double rot_closed_frac = 0.0;
@@ -3068,6 +3141,7 @@ static int run_calibration(int argc, char** argv) {
                     inst_agree += env->allelo ? (double)env->n_type[env->inst_type] / env->num_food : 0.0;
                     inst_closed += (double)env->closed_steps / env->cur_episode_length;
                     inst_eats_closed += env->eats_closed;
+                    inst_viol_first += env->violations_first;
                     inst_wrongful += env->zaps_wrongful;
                     inst_sanctioned += env->violations > 0 ? (double)env->zaps_on_marked / env->violations : 0.0;
                     inst_shirks += env->shirks;
@@ -3114,12 +3188,12 @@ static int run_calibration(int argc, char** argv) {
             vsum += viol[i];
             zsum += zap_mk[i];
         }
-        printf("  inst_mode %d   comply %.3f   informed %.3f   first_visit %.3f   violations %.1f   marked_frac %.3f   exposure %.3f   zaps_on_marked %.1f   agree_final %.3f   closed_frac %.3f   eats_closed %.1f   zaps_wrongful %.1f   sanctions_per_viol %.3f   shirks %.1f   duties %.1f   discharged %.3f\n",
+        printf("  inst_mode %d   comply %.3f   informed %.3f   first_visit %.3f   violations %.1f   marked_frac %.3f   exposure %.3f   zaps_on_marked %.1f   agree_final %.3f   closed_frac %.3f   eats_closed %.1f   zaps_wrongful %.1f   sanctions_per_viol %.3f   shirks %.1f   duties %.1f   discharged %.3f   violations_first %.1f\n",
             env->inst_mode, inst_comply / episodes, inst_informed / episodes, inst_first_visit / episodes,
             vsum / episodes, inst_marked / episodes, inst_exposure / episodes, zsum / episodes,
             inst_agree / episodes, inst_closed / episodes, inst_eats_closed / episodes,
             inst_wrongful / episodes, inst_sanctioned / episodes, inst_shirks / episodes, inst_duties / episodes,
-            inst_discharged / episodes);
+            inst_discharged / episodes, inst_viol_first / episodes);
     }
     if (env->inst_mode == 4 || env->regrow_per_patch) {
         printf("  rot: rotations %.1f   open_patch_frac %.3f   closed_patch_frac %.3f   stock_open_mean %.3f   patches_collapsed %.2f   in_open per slot:",
