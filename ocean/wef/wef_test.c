@@ -2827,6 +2827,81 @@ static void test_inst_grace(void) {
     dict_clear(&kw0);
 }
 
+// U32 (plan 11, D21): witness duty (inst_duty_mode 1): the fish within inst_duty_cm of the violator AT the violation
+// take the duty; a fish that comes within range later does not; the count runs wherever the violator goes;
+// anyone's sanction discharges it; a shirk recruits no witnesses.
+static void test_inst_duty_witness(void) {
+    printf("-- INST U32: witness duty (inst_duty_mode 1)\n");
+    Dict kw = {0};
+    kw_inst_test(&kw, AH_FISH, 0);
+    dict_set(&kw, "inst_mark_until_zap", 1);
+    dict_set(&kw, "inst_duty_cm", 10);
+    dict_set(&kw, "inst_duty_steps", 5);
+    dict_set(&kw, "inst_duty_mode", 1);
+    Harness h = make(&kw, AH_FISH);
+    Env* env = h.env;
+    clear_objects(env);
+    ah_park(&h, 0);
+    int b = AH_FISH / 2;
+    ah_bush(env, 0, 12.0f, 20.0f, 0, false);      // unripe A ahead of the B fish: it plants B (first-order violation)
+    ah_recount(env);
+    place_fish(env, b, 10.0f, 20.0f, 0.0f);
+    place_fish(env, 0, 15.0f, 20.0f, 0.0f);       // witness: 5 cm from the planter, still, never bites
+    place_fish(env, 1, 25.0f, 20.0f, 0.0f);       // 15 cm: not a witness
+    ah_still(&h, 0);
+    ah_still(&h, 1);
+    set_action(&h, b, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    puf_step(env);
+    ah_still(&h, b);
+    FishAgent* f0 = &env->fish[0];
+    FishAgent* f1 = &env->fish[1];
+    FishAgent* fb = &env->fish[b];
+    CHECK(fb->mark == 64 && env->violations == 1, "the planting marks fish b");
+    CHECK(f0->duty_target == b && f0->duty_count == 0 && f0->duties == 1 && env->duties == 1 && f1->duty_target == -1,
+        "the fish 5 cm from the violator is a witness (duty on b), the fish 15 cm away is not (duties %d)", env->duties);
+    place_fish(env, 1, 15.0f, 24.0f, 0.0f);       // fish 1 now 6.4 cm from the marked b: in proximity mode it would take a duty
+    place_fish(env, b, 40.0f, 20.0f, 0.0f);       // the violator swims off, 25 cm from its witness
+    puf_step(env);
+    puf_step(env);
+    CHECK(f1->duty_target == -1 && env->duties == 1, "a fish that comes within range later takes no duty (witness mode)");
+    CHECK(f0->duty_target == b && f0->duty_count == 2, "the witness's count runs although the violator is 25 cm away (count %d)", f0->duty_count);
+    f0->freeze = 2;
+    puf_step(env);
+    puf_step(env);
+    CHECK(f0->duty_count == 2, "frozen steps do not count (count %d)", f0->duty_count);
+    for (int t = 0; t < 3; t++) {
+        puf_step(env);
+    }
+    CHECK(env->shirks == 1 && f0->shirks == 1 && f0->mark == 64 && f0->trace_violated == 3 && f0->duty_target == -1,
+        "the 5th able step is a shirk: the witness is marked, its duty cleared");
+    CHECK(fb->duty_target == -1 && f1->duty_target == -1 && env->duties == 1,
+        "a shirk recruits no witnesses (fish 1 is 4 cm from fish 0, still no duty; duties %d)", env->duties);
+    // a second violation with three witnesses; another fish's sanction discharges them all
+    int c = b == 2 ? 3 : 2;                       // the biter: a slot that is not the violator (4-fish build: b == 2)
+    ah_bush(env, 1, 42.0f, 20.0f, 0, false);
+    ah_recount(env);
+    place_fish(env, 0, 45.0f, 20.0f, 0.0f);       // marked witness-to-be, 5 cm
+    place_fish(env, 1, 40.0f, 27.0f, 0.0f);       // 7 cm
+    place_fish(env, c, 37.5f, 20.0f, 0.0f);       // 2.5 cm behind b, will bite it
+    ah_still(&h, 0);
+    ah_still(&h, 1);
+    ah_still(&h, c);
+    set_action(&h, b, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    puf_step(env);
+    ah_still(&h, b);
+    CHECK(env->violations == 3 && f0->duty_target == b && f1->duty_target == b && env->fish[c].duty_target == b && env->duties == 4,
+        "second violation: three witnesses, a marked fish among them (duties %d)", env->duties);
+    set_action(&h, c, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    puf_step(env);
+    ah_still(&h, c);
+    CHECK(env->fish[c].bite_victim == b && fb->mark == 0, "fish c zaps b (mark cleared)");
+    puf_step(env);
+    CHECK(f0->duty_target == -1 && f1->duty_target == -1 && env->fish[c].duty_target == -1 && env->duties_discharged == 3,
+        "the sanction discharges all three duties (discharged %d)", env->duties_discharged);
+    destroy(&h);
+    dict_clear(&kw);
+}
+
 static void test_inst_duty(void) {
     printf("-- INST U29: duty to enforce (inst_duty_cm / inst_duty_steps)\n");
     Dict kw = {0};
@@ -3014,11 +3089,12 @@ static void test_inst(void) {
     test_inst_rotating();
     test_inst_grace();
     test_inst_duty();
+    test_inst_duty_witness();
     test_inst_freeze_scope();
 }
 #else
 static void test_inst(void) {
-    printf("-- INST U13-U31: skipped (needs the -DWEF_INST build)\n");
+    printf("-- INST U13-U32: skipped (needs the -DWEF_INST build)\n");
 }
 #endif
 

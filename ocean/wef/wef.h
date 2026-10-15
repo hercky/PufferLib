@@ -220,6 +220,7 @@ typedef struct FishAgent {
     // duty to enforce (inst_duty_cm, plan 11.1 / D18b)
     int duty_target;       // the marked fish this fish must sanction, -1 none
     int duty_count;        // steps spent within inst_duty_cm of the target while able (not frozen)
+    bool duty_fresh;       // witness duty taken this step: the duty pass of this step does not count it
     int duties;            // duties taken this episode
     int duties_discharged; // duties ended by the target losing its mark (any sanction, own or another's)
     int shirks;            // class-2 violations: duties that ran to inst_duty_steps
@@ -751,6 +752,9 @@ struct Env {
                                 // steps (closed_dwell; crossing the closed patch, or leaving it after a switch, is not a violation)
     float inst_duty_cm;         // duty to enforce (D18b): a fish within this range of a marked fish must sanction it (0 = off)
     int inst_duty_steps;        // ... within this many able, in-range steps, or it is marked itself (class-2 violation)
+    int inst_duty_mode;         // D21: 0 proximity (the duty falls on whoever is within inst_duty_cm of a marked fish, counted
+                                // while in range); 1 witness (it falls on the fish within inst_duty_cm of the violator AT the
+                                // violation, counted wherever the violator goes; nobody else ever takes it)
     int shirks;                 // per-episode counters of the duty rule
     int duties;
     int duties_discharged;
@@ -868,6 +872,27 @@ static inline void wef_inst_violation(Wef* env, int i, int cls) {
     }
     if (env->inst_mark_steps > 0) {
         fish->mark = env->inst_mark_steps;
+    }
+    if (env->inst_duty_mode == 1 && env->inst_duty_cm > 0.0f && cls < 2) {
+        // witness duty (D21): every other fish within inst_duty_cm of the violator at this moment, and
+        // with no duty open, now owes the sanction (a shirk itself recruits no witnesses: no cascade
+        // from the second order). The chaser arriving later never takes one.
+        float r2 = env->inst_duty_cm * env->inst_duty_cm;
+        for (int j = 0; j < env->num_agents; j++) {
+            FishAgent* w = &env->fish[j];
+            if (j == i || w->duty_target >= 0) {
+                continue;
+            }
+            float dx = w->pos.x - fish->pos.x;
+            float dy = w->pos.y - fish->pos.y;
+            if (dx * dx + dy * dy <= r2) {
+                w->duty_target = i;
+                w->duty_count = 0;
+                w->duty_fresh = true;
+                w->duties++;
+                env->duties++;
+            }
+        }
     }
     if (env->inst_auto_freeze > 0 && (env->inst_auto_freeze_scope == 0 || cls > 0)) {
         // learnability ablation (docs/institutions-plan.md 9.6): the institution sanctions directly, certainly
@@ -3299,6 +3324,9 @@ void puf_step(Wef* env) {
             for (int i = 0; i < env->num_agents; i++) {
                 FishAgent* fish = &env->fish[i];
                 if (fish->duty_target < 0) {
+                    if (env->inst_duty_mode == 1) {
+                        continue;  // witness mode: duties are taken at the violation (wef_inst_violation), never here
+                    }
                     int target = -1;
                     float best = INFINITY;
                     for (int j = 0; j < env->num_agents; j++) {
@@ -3321,6 +3349,10 @@ void puf_step(Wef* env) {
                     }
                     continue;
                 }
+                if (fish->duty_fresh) {
+                    fish->duty_fresh = false;  // taken this step (witness mode): counting starts next step
+                    continue;
+                }
                 const FishAgent* target = &env->fish[fish->duty_target];
                 if (target->mark <= 0) {
                     fish->duties_discharged++;
@@ -3331,7 +3363,8 @@ void puf_step(Wef* env) {
                 }
                 float dx = target->pos.x - fish->pos.x;
                 float dy = target->pos.y - fish->pos.y;
-                if (dx * dx + dy * dy <= r2 && fish->freeze <= 0 && target->freeze <= 0) {
+                bool in_range = env->inst_duty_mode == 1 || dx * dx + dy * dy <= r2;  // a witness owes it wherever the violator goes
+                if (in_range && fish->freeze <= 0 && target->freeze <= 0) {
                     fish->duty_count++;
                     if (fish->duty_count >= env->inst_duty_steps) {
                         wef_inst_violation(env, i, 2);
@@ -4228,7 +4261,7 @@ static const char* WEF_ENV_KEYS[] = {
     "inst_mark_steps", "mark_zap_reward", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
     "inst_obj_radius_cm", "inst_contrast", "inst_latch", "mark_freeze_steps",
     "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze",
-    "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps", "inst_grace_steps",
+    "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps", "inst_grace_steps", "inst_duty_mode",
 };
 
 static void wef_check_keys(Dict* kwargs) {
@@ -4379,6 +4412,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->inst_grace_steps = wef_cfg(kwargs, "inst_grace_steps", 0);
     env->inst_duty_cm = wef_cfg(kwargs, "inst_duty_cm", 0.0);
     env->inst_duty_steps = wef_cfg(kwargs, "inst_duty_steps", 64);
+    env->inst_duty_mode = wef_cfg(kwargs, "inst_duty_mode", 0);
     {
         // roles = r0,r1,r2,r3 (comma list; a scalar applies to slot 0 only)
         DictItem* item = dict_find(kwargs, "roles");
@@ -4423,6 +4457,7 @@ void puf_init(Env* env, Dict* kwargs) {
     assert(env->inst_duty_cm >= 0.0f && env->inst_duty_steps > 0
         && (env->inst_duty_cm == 0.0f || (env->inst_mode > 0 && env->inst_mark_steps > 0 && env->inst_mark_until_zap))
         && "inst_duty_cm > 0 needs inst_mode > 0, inst_mark_steps > 0 and inst_mark_until_zap 1 (a persistent mark)");
+    assert((env->inst_duty_mode == 0 || env->inst_duty_mode == 1) && "inst_duty_mode: 0 proximity, 1 witness");
     assert(env->inst_mark_steps >= 0 && env->mark_zap_cooldown >= -1 && env->mark_freeze_steps >= -1
         && env->inst_read_cm > 0.0f && env->inst_obj_radius_cm > 0.0f);
     assert((env->inst_pos_random == 0 || env->inst_pos_random == 1) && (env->inst_latch == 0 || env->inst_latch == 1));
