@@ -1257,9 +1257,13 @@ void compute_observations(Wef* env) {
         env->inst_moment = (Vec2){f.x * inst_scale, f.y * inst_scale};
     }
     // Steerable mark (D23, inst_mark_contrast != 0): a marked fish carries an induced conductor at its own
-    // position, computed exactly like the beacon (same object radius, this contrast, waste class ranges,
-    // induced by every EOD pole in range, the owner's own included, so the signature is on even for a lone
-    // fish). No wef_any_fish_within cull: the owner's own poles are always in range. The sources join the
+    // position, computed like the beacon (same object radius, this contrast, waste class ranges) from the
+    // OTHER fish's EOD poles only (eod[2a], eod[2a + 1] are the owner's; D23 review fix: with them included the
+    // owner's own poles, 0.5 cm from the source, made the mark ~250x the beacon's loudness and let the marked
+    // fish dim it to near nothing by switching its EOD off). So the mark is a neighbour-induced conductor the
+    // owner cannot suppress, exactly as loud as the beacon would be at its position, 0 for a lone fish, and
+    // read by the sensing fish through its own EOD as every other object is (no wef_any_fish_within cull: the
+    // owner itself would always pass it; a lone fish's two calls find no pole in range). The sources join the
     // waste class below and are skipped from the owner's own measurement (the mark is public, not a self-cue).
     int n_marks = 0;
     if (env->inst_mark_contrast != 0.0f) {
@@ -1271,7 +1275,9 @@ void compute_observations(Wef* env) {
             if (fa->mark <= 0) {
                 continue;
             }
-            Vec2 f = wef_mono_field(fa->pos, eod, n_eod, mono_range);
+            Vec2 before = wef_mono_field(fa->pos, eod, 2 * a, mono_range);
+            Vec2 after = wef_mono_field(fa->pos, eod + 2 * a + 2, n_eod - 2 * a - 2, mono_range);
+            Vec2 f = {before.x + after.x, before.y + after.y};
             fa->mark_moment = (Vec2){f.x * mark_scale, f.y * mark_scale};
             n_marks++;
         }
@@ -2495,7 +2501,7 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     // turn after every step of the pursuit turn, so the target never enters the bite cone.
     // D23: on a MARKED quarry the reach is the mark radius / cone (defaults = the base bite cone), so the
     // CPU gate measures the new reach; role 11's rival hunt and an unmarked quarry keep the base cone.
-    bool hunt_marked = ah_hunt && hunt_j >= 0 && env->fish[hunt_j].mark > 0;
+    bool hunt_marked = ah_hunt && hunt_j >= 0 && env->inst_mode > 0 && env->fish[hunt_j].mark > 0;
     float bite_r = hunt_marked ? env->mark_bite_radius_cm : BITING_RADIUS_CM;
     float bite_cone = hunt_marked ? env->mark_bite_cone : EATING_ANGLE;
     bool no_avoid = enforcer && ah_hunt && dist < 2.0f * bite_r;
@@ -4579,8 +4585,8 @@ void puf_init(Env* env, Dict* kwargs) {
     env->inst_mark_contrast = wef_cfg(kwargs, "inst_mark_contrast", 0.0);
     env->mark_bite_radius_cm = wef_cfg(kwargs, "mark_bite_radius_cm", -1.0);
     env->mark_bite_angle_deg = wef_cfg(kwargs, "mark_bite_angle_deg", -1.0);
-    assert((env->inst_mark_contrast == 0.0f || (env->inst_mode > 0 && env->inst_mark_steps > 0))
-        && "inst_mark_contrast needs inst_mode > 0 and inst_mark_steps > 0 (a mark to carry)");
+    assert((env->inst_mark_contrast == 0.0f || env->inst_mode == 0 || env->inst_mark_steps > 0)
+        && "inst_mark_contrast needs inst_mark_steps > 0 (a mark to carry) under a rule; inert with inst_mode 0 (a preset's control arm)");
     assert((env->mark_bite_radius_cm == -1.0f || env->mark_bite_radius_cm > 0.0f)
         && "mark_bite_radius_cm: -1 (= BITING_RADIUS_CM, 3 cm) or a radius > 0 cm");
     assert((env->mark_bite_angle_deg == -1.0f || (env->mark_bite_angle_deg > 0.0f && env->mark_bite_angle_deg <= 180.0f))

@@ -3244,11 +3244,12 @@ static void test_inst_free_riding(void) {
 // half-plane) a bite lands on a MARKED fish 5 cm away at 60 degrees off-axis and misses an unmarked fish at the same
 // place; with the defaults (3 cm, 22.5 degrees) both are missed; a marked fish 2 cm straight ahead is bitten in both
 // settings. Scene 3 is the scripted enforcer (role 14, informed by hand) with the marked fish off-axis: it bites in the
-// same step only with the wide reach (the hunt uses the mark cone), so the CPU gate measures the new reach.
+// same step only with the wide reach (the hunt uses the mark cone), so the CPU gate measures the new reach. Scene 4 is the
+// role-16 enforcer (hunts any fish) on an UNMARKED fish at the same place: the hunt keeps the base cone, so it is missed in both.
 static void test_inst_reach(void) {
     printf("-- INST U35: conditional bite reach on marked fish (mark_bite_radius_cm, mark_bite_angle_deg)\n");
     for (int wide = 0; wide <= 1; wide++) {
-        for (int scene = 0; scene < 4; scene++) {   // 0 marked off-axis, 1 unmarked off-axis, 2 marked 2 cm ahead, 3 enforcer
+        for (int scene = 0; scene < 5; scene++) {   // 0 marked off-axis, 1 unmarked off-axis, 2 marked 2 cm ahead, 3 enforcer, 4 role 16 / unmarked
             Dict kw = {0};
             kw_inst_test(&kw, AH_FISH, 0);
             dict_set(&kw, "inst_mark_until_zap", 1);  // the mark stays until the sanction (fish 0 may bite over 2 steps)
@@ -3259,6 +3260,9 @@ static void test_inst_reach(void) {
             if (scene == 3) {
                 dict_set(&kw, "bot_oracle", 1);
                 puf_ini_set(&kw, "roles", AH_FISH >= 8 ? "14,13,13,13,13,13,13,13" : "14,13,13,13");
+            } else if (scene == 4) {
+                dict_set(&kw, "bot_oracle", 1);
+                puf_ini_set(&kw, "roles", AH_FISH >= 8 ? "16,13,13,13,13,13,13,13" : "16,13,13,13");
             }
             Harness h = make(&kw, AH_FISH);
             Env* env = h.env;
@@ -3278,8 +3282,8 @@ static void test_inst_reach(void) {
             } else {
                 place_fish(env, b, 10.0f + 5.0f * cosf(1.0472f), 20.0f + 5.0f * sinf(1.0472f), 0.0f);  // 5 cm, 60 deg left
             }
-            env->fish[b].mark = scene == 1 ? 0 : 40;
-            if (scene == 3) {
+            env->fish[b].mark = (scene == 1 || scene == 4) ? 0 : 40;
+            if (scene == 3 || scene == 4) {
                 env->fish[0].informed = true;   // the enforcer has read the rule: it hunts marked fish within 10 cm
                 env->fish[0].inst_val = 1.0f;
             } else {
@@ -3289,7 +3293,9 @@ static void test_inst_reach(void) {
             bool want = scene == 2 || (wide && (scene == 0 || scene == 3));
             const char* what = scene == 0 ? "marked fish 5 cm away, 60 deg off-axis"
                 : scene == 1 ? "UNMARKED fish 5 cm away, 60 deg off-axis"
-                : scene == 2 ? "marked fish 2 cm straight ahead" : "enforcer (role 14) vs marked fish 5 cm away, 60 deg off-axis";
+                : scene == 2 ? "marked fish 2 cm straight ahead"
+                : scene == 3 ? "enforcer (role 14) vs marked fish 5 cm away, 60 deg off-axis"
+                : "enforcer (role 16, hunts any fish) vs UNMARKED fish 5 cm away, 60 deg off-axis (base cone)";
             CHECK((env->fish[0].bite_victim == b) == want,
                 "%s: %s -> %s (victim %d)", wide ? "radius 6 / half-angle 90" : "defaults 3 cm / 22.5 deg", what,
                 want ? "bitten" : "missed", env->fish[0].bite_victim);
@@ -3301,9 +3307,13 @@ static void test_inst_reach(void) {
 
 // U36 (D23): steerable mark signature. With inst_mark_contrast 1 the mormyromast readings of a fish 4 cm from a marked
 // fish differ from those with the mark cleared (the ampullary ones do not: the source is induced only, like the beacon);
-// the marked fish's own sensor slots do not change when its mark is set; with the key at 0 the neighbour's sensor slots
-// are identical whether or not the fish is marked; and the sensor-noise RNG stream is unchanged (two Commons envs,
-// same seed, key 0 / 1, one fish persistently marked: equal rng state and pellet positions after regrowth steps).
+// the marked fish's own sensor slots do not change when its mark is set; the mark is induced by the OTHER fish only
+// (review fix: the owner's mark_moment is identical whether it emits or is silent, and 0 when the only neighbour is
+// silent); a neighbour 12 cm away (past the waste-class cull) sees no change; the source follows the owner (the
+// neighbour's mark-induced delta changes, and grows, when the marked fish moves from 4 to 2.5 cm); with the key at 0 the
+// neighbour's sensor slots are identical whether or not the fish is marked; and the sensor-noise RNG stream is unchanged
+// (two Commons envs, same seed, key 0 / 1, one fish persistently marked: equal rng state and pellet positions after
+// regrowth steps).
 static void test_inst_mark_signature(void) {
     printf("-- INST U36: steerable mark signature (inst_mark_contrast)\n");
     enum { NS = NUM_MORMYROMASTS + NUM_AMPULLARY };
@@ -3340,6 +3350,60 @@ static void test_inst_mark_signature(void) {
                 "inst_mark_contrast 1: the neighbour's mormyromast row changes with the mark (%d of %d slots; ampullary %d: induced only)",
                 morm_diff, NUM_MORMYROMASTS, amp_diff);
             CHECK(own_diff == 0, "the marked fish's own sensor slots do not change when its mark is set (%d differ)", own_diff);
+            // neighbour-induced only: the owner's EOD state does not enter its mark; a silent sole neighbour induces nothing
+            Vec2 m_emit = env->fish[1].mark_moment;
+            float m_emit_abs = sqrtf(m_emit.x * m_emit.x + m_emit.y * m_emit.y);
+            env->fish[1].emits_eod = false;
+            compute_observations(env);
+            Vec2 m_silent = env->fish[1].mark_moment;
+            env->fish[1].emits_eod = true;
+            env->fish[0].emits_eod = false;
+            compute_observations(env);
+            Vec2 m_alone = env->fish[1].mark_moment;
+            env->fish[0].emits_eod = true;
+            CHECK(m_silent.x == m_emit.x && m_silent.y == m_emit.y && m_alone.x == 0.0f && m_alone.y == 0.0f,
+                "the mark is induced by the OTHER fish only: owner silent -> same moment (|m| %.3e C.m = %.4fx the owner's own EOD dipole),"
+                " sole neighbour silent -> 0 (%.3e)", m_emit_abs,
+                m_emit_abs / (EOD_CHARGE_C * 2.0f * EOD_POLE_OFFSET_CM * CM_TO_M), sqrtf(m_alone.x * m_alone.x + m_alone.y * m_alone.y));
+            // the source follows the owner: the neighbour's mark-induced delta changes, and grows, at 2.5 cm
+            float delta4[NUM_MORMYROMASTS];
+            float max4 = 0.0f;
+            for (int s = 0; s < NUM_MORMYROMASTS; s++) {
+                delta4[s] = row0[1][s] - row0[0][s];
+                max4 = fmaxf(max4, fabsf(delta4[s]));
+            }
+            place_fish(env, 1, 12.5f, 20.0f, 1.5708f);
+            obs_t row_near[2][NS];
+            for (int m = 0; m < 2; m++) {
+                env->fish[1].mark = m ? 40 : 0;
+                env->rng = 12345u;
+                compute_observations(env);
+                memcpy(row_near[m], env->agents[0].observations, NS * sizeof(obs_t));
+            }
+            int moved = 0;
+            float max25 = 0.0f;
+            for (int s = 0; s < NUM_MORMYROMASTS; s++) {
+                float d = row_near[1][s] - row_near[0][s];
+                moved += d != delta4[s];
+                max25 = fmaxf(max25, fabsf(d));
+            }
+            CHECK(moved > 0 && max25 > max4,
+                "the source follows the owner: at 2.5 cm the mark-induced delta differs in %d slots and peaks at %.3f (4 cm: %.3f)",
+                moved, max25, max4);
+            // waste-class cull: a neighbour 12 cm away (> waste_sense_range_cm 10 + the sensor ring) sees no change
+            place_fish(env, 1, 22.0f, 20.0f, 1.5708f);
+            obs_t row_far[2][NS];
+            for (int m = 0; m < 2; m++) {
+                env->fish[1].mark = m ? 40 : 0;
+                env->rng = 12345u;
+                compute_observations(env);
+                memcpy(row_far[m], env->agents[0].observations, NS * sizeof(obs_t));
+            }
+            int far_diff = 0;
+            for (int s = 0; s < NS; s++) {
+                far_diff += row_far[0][s] != row_far[1][s];
+            }
+            CHECK(far_diff == 0, "a neighbour 12 cm away (past the waste-class cull) sees no change with the mark (%d slots differ)", far_diff);
         } else {
             CHECK(morm_diff == 0 && amp_diff == 0 && own_diff == 0,
                 "inst_mark_contrast 0: both rows identical whether or not the fish is marked (%d / %d / %d differ)", morm_diff, amp_diff, own_diff);
