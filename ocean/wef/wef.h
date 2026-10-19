@@ -57,10 +57,11 @@ typedef float obs_t;
 // 110 at MAX_AGENTS 4 (upstream), 162 at 8.
 #define OBS_BASE_SIZE (NUM_MORMYROMASTS + NUM_AMPULLARY + (NUM_KNOLLEN + 1) * (MAX_AGENTS - 1) + ACTION_SIZE + 7)
 // Institution build (-DWEF_INST, docs/institutions-plan.md section 4): the row grows by one rule
-// slot, one own-mark slot and one mark slot per other fish (115 at 4 fish, 171 at 8). The default
-// and the 8-fish AH builds add nothing, so their rows and checkpoints are untouched.
+// slot, one own-mark slot, one mark slot per other fish and (phase 4, D22) one danger slot at the end
+// (116 at 4 fish, 172 at 8). The default and the 8-fish AH builds add nothing, so their rows and
+// checkpoints are untouched.
 #ifdef WEF_INST
-#define INST_OBS_EXTRA (2 + (MAX_AGENTS - 1))
+#define INST_OBS_EXTRA (3 + (MAX_AGENTS - 1))
 #else
 #define INST_OBS_EXTRA 0
 #endif
@@ -200,6 +201,7 @@ typedef struct FishAgent {
     int mark;              // steps left of the violation mark (the public label)
     float inst_val;        // the rule as last read at the beacon: +1 / -1, 0 = never read (latched)
     float bot_inst_val;    // scripted roles: the last value read, kept when inst_latch 0 clears inst_val out of range
+    float inst_danger;     // D22 (inst_danger_obs): the danger level as last read at the beacon = marked fish / N (latched like inst_val)
     bool informed;         // has read the beacon this episode
     int first_visit_tick;  // first tick inside inst_read_cm, 0 = never
     int last_read_tick;    // last tick inside inst_read_cm (scripted compliers re-read the season)
@@ -430,6 +432,7 @@ struct Log {
     float enf_free_riders;   // exposed fish with no zap on a marked fish per episode
     float enf_premium_n;     // 1 if the episode had both exposed sanctioners and exposed non-sanctioners (enf_premium defined)
     float enf_gini_n;        // 1 if the episode had a zap on a marked fish (enf_gini defined)
+    float danger_mean;       // D22: time-mean of marked fish / N (the public danger level), zero unless inst_mode > 0
     float n;
 };
 
@@ -779,6 +782,9 @@ struct Env {
     float inst_obj_radius_cm;   // the beacon's electrical signature: a waste-like conductor
     float inst_contrast;
     int inst_latch;             // 1: the obs slot keeps the last value read; 0: in range only
+    int inst_danger_obs;        // D22: 1 = the beacon also broadcasts the danger level (marked fish / N, i.e. unsanctioned
+                                // violations outstanding under persistent marks) into the last institution slot; 0 = slot 0
+    float danger_sum;           // per-episode sum over steps of marked fish / N (Log danger_mean)
     // institution episode state
     int inst_type;              // public rule: AH prescribed type 0 A / 1 B; Commons 1 closed / 0 open; mode 4: the open patch 0 / 1
     int rotations;              // mode 4: open-patch switches this episode
@@ -1518,6 +1524,8 @@ void compute_observations(Wef* env) {
                 }
                 obs[obs_idx++] = m;
             }
+            // D22: the danger level as last read (0 unless inst_danger_obs; the slot is always written)
+            obs[obs_idx++] = env->inst_obs && env->inst_danger_obs ? agent->inst_danger : 0.0f;
         }
 #else
         (void)det;
@@ -1667,6 +1675,7 @@ void puf_reset(Wef* env) {
     env->violations_first = 0;
     env->zaps_on_marked = 0;
     env->marked_steps = 0;
+    env->danger_sum = 0.0f;
     env->pair_steps = 0;
     env->pair_marked_steps = 0;
     env->informed_steps = 0;
@@ -2816,6 +2825,7 @@ void puf_step(Wef* env) {
             // is written to the slot only when there is one (inst_mode > 0).
             if (!env->inst_latch) {
                 agent->inst_val = 0.0f;
+                agent->inst_danger = 0.0f;
             }
             if (wef_at_beacon(env, agent)) {
                 agent->visits++;
@@ -2827,6 +2837,14 @@ void puf_step(Wef* env) {
                 if (env->inst_mode > 0) {
                     agent->inst_val = wef_inst_signal(env, i);
                     agent->bot_inst_val = agent->inst_val;
+                    if (env->inst_danger_obs) {
+                        // D22: the danger level = fish currently marked / N (marks as of this step's start)
+                        int marked = 0;
+                        for (int j = 0; j < env->num_agents; j++) {
+                            marked += env->fish[j].mark > 0;
+                        }
+                        agent->inst_danger = (float)marked / (float)env->num_agents;
+                    }
                 }
             }
         }
@@ -3444,6 +3462,7 @@ void puf_step(Wef* env) {
         }
         for (int i = 0; i < env->num_agents; i++) {
             env->marked_steps += env->fish[i].mark > 0;
+            env->danger_sum += env->fish[i].mark > 0 ? 1.0f / (float)env->num_agents : 0.0f;
             env->informed_steps += env->fish[i].informed;
             for (int j = 0; j < env->num_agents; j++) {
                 if (j == i) {
@@ -3660,6 +3679,7 @@ void puf_step(Wef* env) {
             env->log.violations += (float)env->violations;
             env->log.violations_first += (float)env->violations_first;
             env->log.marked_frac += (float)env->marked_steps / fish_steps;
+            env->log.danger_mean += env->danger_sum / (float)env->episode_length;
             env->log.marked_exposure += env->pair_steps > 0
                 ? (float)env->pair_marked_steps / (float)env->pair_steps : 0.0f;
             env->log.zaps_on_marked += (float)env->zaps_on_marked;
@@ -4239,6 +4259,9 @@ void puf_render(Wef* env) {
         if (env->inst_duty_cm > 0.0f) {
             line = TextFormat("%s   shirks %d", line, env->shirks);
         }
+        if (env->inst_danger_obs) {
+            line = TextFormat("%s   danger %d/%d", line, marked, env->num_agents);
+        }
         DrawText(line, 20, 44, 18, WEF_COLOR_INST);
         DrawText("body = taste (green A / magenta B) | white square = marked | X = frozen | yellow core = hold | tail square = rule read | crown = Queen",
             20, 66, 13, WEF_COLOR_MIDGRAY);
@@ -4338,7 +4361,7 @@ static const char* WEF_ENV_KEYS[] = {
     // Institutions (docs/institutions-plan.md section 4)
     "inst_mode", "inst_obs", "inst_fixed_type", "inst_theta", "inst_hyst", "inst_flip_steps",
     "inst_mark_steps", "mark_zap_reward", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
-    "inst_obj_radius_cm", "inst_contrast", "inst_latch", "mark_freeze_steps",
+    "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "mark_freeze_steps",
     "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze",
     "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps", "inst_grace_steps", "inst_duty_mode",
 };
@@ -4483,6 +4506,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->inst_obj_radius_cm = wef_cfg(kwargs, "inst_obj_radius_cm", 0.5);
     env->inst_contrast = wef_cfg(kwargs, "inst_contrast", 1.0);
     env->inst_latch = wef_cfg(kwargs, "inst_latch", 1);
+    env->inst_danger_obs = wef_cfg(kwargs, "inst_danger_obs", 0);
     env->inst_mark_until_zap = wef_cfg(kwargs, "inst_mark_until_zap", 0);
     env->inst_mark_wrongful = wef_cfg(kwargs, "inst_mark_wrongful", 0);
     env->bot_respond_zaps = wef_cfg(kwargs, "bot_respond_zaps", 1);
@@ -4540,6 +4564,8 @@ void puf_init(Env* env, Dict* kwargs) {
     assert(env->inst_mark_steps >= 0 && env->mark_zap_cooldown >= -1 && env->mark_freeze_steps >= -1
         && env->inst_read_cm > 0.0f && env->inst_obj_radius_cm > 0.0f);
     assert((env->inst_pos_random == 0 || env->inst_pos_random == 1) && (env->inst_latch == 0 || env->inst_latch == 1));
+    assert((env->inst_danger_obs == 0 || (env->inst_danger_obs == 1 && env->inst_obs && env->inst_mode > 0))
+        && "inst_danger_obs needs inst_obs 1 and inst_mode > 0 (the danger level is the institution's)");
     if (env->allelo) {
         assert(env->cleanup == 0 && env->regrow_mode == 0 && env->regrow_p_max == 0.0f
             && env->waste_max == 0 && env->food_start == -1
@@ -4750,6 +4776,7 @@ static void wef_log_inst_tail(Log* log, Dict* out) {
     dict_set(out, "enf_free_riders", log->enf_free_riders);
     dict_set(out, "enf_premium_n", log->enf_premium_n);
     dict_set(out, "enf_gini_n", log->enf_gini_n);
+    dict_set(out, "danger_mean", log->danger_mean);
 }
 
 // The rest of the AH keys (off the 30-key live dashboard in the AH build, in the [metrics] series).

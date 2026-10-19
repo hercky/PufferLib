@@ -1764,8 +1764,8 @@ static void kw_inst_test(Dict* kw, int num_fish, int fixed_type) {
 // U13: layout, sentinel fill, slots at inst_obs 0 / 1.
 static void test_inst_layout(void) {
     printf("-- INST U13: institution slots (OBS_SIZE %d = %d + %d)\n", OBS_SIZE, OBS_BASE_SIZE, INST_OBS_EXTRA);
-    CHECK(INST_OBS_EXTRA == 2 + (MAX_AGENTS - 1) && OBS_SIZE == OBS_BASE_SIZE + INST_OBS_EXTRA,
-        "the institution build appends 2 + (MAX_AGENTS - 1) = %d slots", INST_OBS_EXTRA);
+    CHECK(INST_OBS_EXTRA == 3 + (MAX_AGENTS - 1) && OBS_SIZE == OBS_BASE_SIZE + INST_OBS_EXTRA,
+        "the institution build appends 3 + (MAX_AGENTS - 1) = %d slots (rule, own mark, others' marks, danger)", INST_OBS_EXTRA);
     Dict kw = {0};
     kw_inst_test(&kw, AH_FISH, 0);
     const int stride = OBS_SIZE + 8;
@@ -2902,6 +2902,73 @@ static void test_inst_duty_witness(void) {
     dict_clear(&kw);
 }
 
+// U34 (plan 11, D22): inst_danger_obs: the last institution slot carries marked fish / N as read at the beacon
+// (latched), 0 for a fish that never read, 0 everywhere when the key is off; Log danger_mean = time mean.
+static void test_inst_danger(void) {
+    printf("-- INST U34: danger level slot (inst_danger_obs)\n");
+    const int SLOT = OBS_SIZE - 1;
+    Dict kw = {0};
+    kw_inst_test(&kw, AH_FISH, 0);
+    dict_set(&kw, "inst_mark_until_zap", 1);
+    dict_set(&kw, "inst_danger_obs", 1);
+    Harness h = make(&kw, AH_FISH);
+    Env* env = h.env;
+    clear_objects(env);
+    ah_park(&h, 0);
+    for (int i = 0; i < AH_FISH; i++) {
+        ah_still(&h, i);
+    }
+    // two fish marked by hand, fish 0 at the beacon (30, 20), fish 1 far away and never there
+    env->fish[2].mark = 64;
+    env->fish[3].mark = 64;
+    place_fish(env, 0, 30.0f, 20.0f, 0.0f);
+    place_fish(env, 1, 5.0f, 36.0f, 0.0f);
+    puf_step(env);
+    float want = 2.0f / (float)AH_FISH;
+    CHECK(env->fish[0].informed && fabsf(env->fish[0].inst_danger - want) < 1e-6f && fabsf(h.obs[0 * OBS_SIZE + SLOT] - want) < 1e-6f,
+        "the fish at the beacon reads danger %d/%d = %.3f into slot %d (got %.3f)", 2, AH_FISH, want, SLOT, h.obs[0 * OBS_SIZE + SLOT]);
+    CHECK(!env->fish[1].informed && h.obs[1 * OBS_SIZE + SLOT] == 0.0f, "a fish that never read the beacon has 0 in the slot");
+    // one mark cleared: the latched value stays until the next read, then drops
+    env->fish[3].mark = 0;
+    place_fish(env, 0, 5.0f, 4.0f, 0.0f);         // away from the beacon
+    puf_step(env);
+    CHECK(fabsf(h.obs[0 * OBS_SIZE + SLOT] - want) < 1e-6f, "away from the beacon the slot keeps the last read (%.3f)", h.obs[0 * OBS_SIZE + SLOT]);
+    place_fish(env, 0, 30.0f, 20.0f, 0.0f);
+    puf_step(env);
+    float want1 = 1.0f / (float)AH_FISH;
+    CHECK(fabsf(h.obs[0 * OBS_SIZE + SLOT] - want1) < 1e-6f, "back at the beacon it reads %d/%d = %.3f (got %.3f)", 1, AH_FISH, want1, h.obs[0 * OBS_SIZE + SLOT]);
+    // Log: danger_mean is the time mean of marked / N over the episode
+    float expect = 0.0f;
+    expect += 2.0f / (float)AH_FISH * 2.0f;       // steps 1-2: two marked (the mark was cleared before step 3)
+    int t = env->tick;
+    while (env->episode == 0) {
+        puf_step(env);
+    }
+    expect += 1.0f / (float)AH_FISH * (float)(env->episode_length - t);
+    expect /= (float)env->episode_length;
+    CHECK(env->log.n == 1.0f && fabsf(env->log.danger_mean - expect) < 1e-4f,
+        "Log danger_mean %.4f = time mean of marked / N (expected %.4f)", env->log.danger_mean, expect);
+    destroy(&h);
+    dict_clear(&kw);
+    // key off: the slot is written and 0 even with marked fish and a reader at the beacon
+    Dict kw0 = {0};
+    kw_inst_test(&kw0, AH_FISH, 0);
+    dict_set(&kw0, "inst_mark_until_zap", 1);
+    Harness h0 = make(&kw0, AH_FISH);
+    clear_objects(h0.env);
+    ah_park(&h0, 0);
+    for (int i = 0; i < AH_FISH; i++) {
+        ah_still(&h0, i);
+    }
+    h0.env->fish[2].mark = 64;
+    place_fish(h0.env, 0, 30.0f, 20.0f, 0.0f);
+    puf_step(h0.env);
+    CHECK(h0.env->fish[0].informed && h0.obs[0 * OBS_SIZE + SLOT] == 0.0f && h0.env->fish[0].inst_danger == 0.0f,
+        "inst_danger_obs 0: the slot stays 0 (%.3f)", h0.obs[0 * OBS_SIZE + SLOT]);
+    destroy(&h0);
+    dict_clear(&kw0);
+}
+
 static void test_inst_duty(void) {
     printf("-- INST U29: duty to enforce (inst_duty_cm / inst_duty_steps)\n");
     Dict kw = {0};
@@ -3194,10 +3261,11 @@ static void test_inst(void) {
     test_inst_duty_witness();
     test_inst_freeze_scope();
     test_inst_free_riding();
+    test_inst_danger();
 }
 #else
 static void test_inst(void) {
-    printf("-- INST U13-U33: skipped (needs the -DWEF_INST build)\n");
+    printf("-- INST U13-U34: skipped (needs the -DWEF_INST build)\n");
 }
 #endif
 
