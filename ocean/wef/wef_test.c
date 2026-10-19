@@ -611,6 +611,51 @@ static void test_seasonal(void) {
     dict_clear(&kw);
 }
 
+// U40 (D26): act_slow_steps / act_slow_gain: a fish that just ate moves gain x for N steps (the eating step included), then
+// normally; a fish that did not eat moves normally; default = identical.
+static void test_act_slow(void) {
+    printf("-- U40: post-act slowdown (act_slow_steps / act_slow_gain)\n");
+    float d[2][3];
+    for (int on = 0; on < 2; on++) {
+        Dict kw = {0};
+        kw_base(&kw, 2);
+        kw_harvest(&kw);
+        if (on) {
+            dict_set(&kw, "act_slow_steps", 6);          // longer than the 3-step eat cooldown, which already stops the fish
+            dict_set(&kw, "act_slow_gain", 0.5);
+        }
+        Harness h = make(&kw, 2);
+        Env* env = h.env;
+        clear_objects(env);
+        place_fish(env, 0, 10.0f, 20.0f, 0.0f);
+        place_fish(env, 1, 10.0f, 40.0f, 0.0f);
+        env->food[0] = (FishFood){.pos = {11.5f, 20.0f}, .active = true};   // ahead of fish 0
+        env->food_active = 1;
+        set_action(&h, 0, 2.0f, 0.0f, 1.0f, -1.0f);
+        set_action(&h, 1, 2.0f, 0.0f, 1.0f, -1.0f);
+        float x0 = env->fish[0].pos.x, x1 = env->fish[1].pos.x;
+        puf_step(env);                                  // tick 1: fish 0 eats (the eat cooldown stops it this step and the next 3)
+        CHECK(env->fish[0].ate, "fish 0 ate (run %d)", on);
+        d[on][2] = env->fish[1].pos.x - x1;             // the other fish, unaffected
+        (void)x0;
+        for (int t = 0; t < 3; t++) {                   // ticks 2-4: eat cooldown, no movement either way
+            puf_step(env);
+        }
+        float xa = env->fish[0].pos.x;
+        puf_step(env);                                  // tick 5: 4 steps after the eat < act_slow_steps 6: slowed
+        d[on][0] = env->fish[0].pos.x - xa;
+        puf_step(env);                                  // tick 6: 5 < 6: still slowed
+        float xb = env->fish[0].pos.x;
+        puf_step(env);                                  // tick 7: 6 steps after the eat: normal speed again
+        d[on][1] = env->fish[0].pos.x - xb;
+        destroy(&h);
+        dict_clear(&kw);
+    }
+    CHECK(d[0][0] > 0.0f && fabsf(d[1][0] - 0.5f * d[0][0]) < 1e-4f, "after the eat cooldown the fish moves 0.5x within act_slow_steps (%.4f vs %.4f)", d[1][0], d[0][0]);
+    CHECK(fabsf(d[1][1] - d[0][1]) < 1e-5f && d[0][1] > 0.0f, "after act_slow_steps the fish moves normally again (%.4f vs %.4f)", d[1][1], d[0][1]);
+    CHECK(fabsf(d[1][2] - d[0][2]) < 1e-6f, "a fish that did not eat is unaffected (%.4f vs %.4f)", d[1][2], d[0][2]);
+}
+
 static void test_patchy_commons(void) {
     printf("-- commons regrowth inside the episode's patches\n");
     Dict kw = {0};
@@ -4140,6 +4185,7 @@ int main(int argc, char** argv) {
     test_commons();
     test_seasonal();
     test_patchy_commons();
+    test_act_slow();
     test_baseline();
     // Allelopathic Harvest (design 7.1 U1-U10, the Log and the trace); U11 / U12 in run_test.sh
     test_ah_layout();

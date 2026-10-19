@@ -792,6 +792,9 @@ struct Env {
     float mark_bite_angle_deg;  // ... and the HALF-angle of the bite cone on a marked victim, degrees (-1 = EATING_ANGLE / 2 = 22.5)
     float mark_bite_cone;       // the resolved full cone in radians for in_forward_cone (2 x the half-angle; EATING_ANGLE by default)
     int inst_latch;             // 1: the obs slot keeps the last value read; 0: in range only
+    int act_slow_steps;         // post-act slowdown (D26, 2026-10-20): for this many steps after a pellet eat or a planting conversion the
+                                // fish moves act_slow_gain x its normal distance per step (0 = off); applies to every fish, not a sanction
+    float act_slow_gain;        // ... the factor (1 = off)
     float mark_pursuit_gain;    // pursuit bonus (2026-10-20): an UNMARKED, unfrozen fish with a marked fish within MORM_AGENT_RANGE_CM moves
                                 // this many times its normal distance per step (1 = off); the marked fish is unchanged (enforcer-side, not a sanction)
     int pursuit_steps;          // per-episode fish-steps with the bonus active (Log pursuit_frac)
@@ -2841,6 +2844,14 @@ void puf_step(Wef* env) {
         if (agent->eat_cooldown <= 0 && agent->freeze <= 0) {
             lin = move * agent->max_linear_velocity;
             ang = turn * agent->max_angular_velocity;
+            if (env->act_slow_steps > 0) {
+                // post-act slowdown (D26): a fish that ate a pellet or converted a bush within the last act_slow_steps steps
+                // (the eat of this very step included) moves slower; a catchable violator without a sanction
+                int last = agent->eat_mark > agent->plant_mark ? agent->eat_mark : agent->plant_mark;
+                if (last > 0 && env->tick - last < env->act_slow_steps) {
+                    lin *= env->act_slow_gain;
+                }
+            }
             if (env->mark_pursuit_gain != 1.0f && env->inst_mode > 0 && agent->mark <= 0) {
                 // pursuit bonus: an unmarked fish with a marked fish within MORM_AGENT_RANGE_CM moves faster this step
                 bool near_marked = false;
@@ -4451,7 +4462,7 @@ static const char* WEF_ENV_KEYS[] = {
     // Institutions (docs/institutions-plan.md section 4)
     "inst_mode", "inst_obs", "inst_fixed_type", "inst_theta", "inst_hyst", "inst_flip_steps",
     "inst_mark_steps", "mark_zap_reward", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
-    "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_frozen_biteable", "mark_pursuit_gain", "mark_freeze_steps",
+    "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_frozen_biteable", "mark_pursuit_gain", "act_slow_steps", "act_slow_gain", "mark_freeze_steps",
     "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze",
     "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps", "inst_grace_steps", "inst_duty_mode",
     "inst_mark_contrast", "mark_bite_radius_cm", "mark_bite_angle_deg",   // D23
@@ -4601,6 +4612,8 @@ void puf_init(Env* env, Dict* kwargs) {
     env->inst_mask_marks = wef_cfg(kwargs, "inst_mask_marks", 0);
     env->mark_frozen_biteable = wef_cfg(kwargs, "mark_frozen_biteable", 0);
     env->mark_pursuit_gain = wef_cfg(kwargs, "mark_pursuit_gain", 1.0);
+    env->act_slow_steps = wef_cfg(kwargs, "act_slow_steps", 0);
+    env->act_slow_gain = wef_cfg(kwargs, "act_slow_gain", 1.0);
     env->mark_bitten_reward = wef_cfg(kwargs, "mark_bitten_reward", 0.0);
     env->inst_mark_until_zap = wef_cfg(kwargs, "inst_mark_until_zap", 0);
     env->inst_mark_wrongful = wef_cfg(kwargs, "inst_mark_wrongful", 0);
@@ -4677,6 +4690,7 @@ void puf_init(Env* env, Dict* kwargs) {
     assert((env->inst_pos_random == 0 || env->inst_pos_random == 1) && (env->inst_latch == 0 || env->inst_latch == 1));
     assert((env->inst_mask_marks == 0 || env->inst_mask_marks == 1) && "inst_mask_marks: 0 / 1");
     assert((env->mark_frozen_biteable == 0 || (env->mark_frozen_biteable == 1 && env->inst_mode > 0)) && "mark_frozen_biteable: 0 / 1, needs inst_mode > 0");
+    assert(env->act_slow_steps >= 0 && env->act_slow_gain > 0.0f && env->act_slow_gain <= 1.0f && "act_slow_steps >= 0, act_slow_gain in (0, 1]");
     assert(env->mark_pursuit_gain >= 1.0f && env->mark_pursuit_gain <= 3.0f && (env->mark_pursuit_gain == 1.0f || env->inst_mode > 0)
         && "mark_pursuit_gain in [1, 3], != 1 needs inst_mode > 0");
     assert((env->mark_bitten_reward == 0.0f || env->inst_mode > 0) && "mark_bitten_reward needs inst_mode > 0 (a marked victim)");
