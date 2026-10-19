@@ -18,9 +18,10 @@
  *      min(8, MAX_AGENTS) fish; the slot numbers in the messages are derived from OBS_SIZE.
  *      U11 (default bench hash) and U12 (projection identity, `bench project=4`) are run
  *      by run_test.sh.
- *   6. Institutions (docs/institutions-plan.md section 4), checks U13-U33 (slot layout, beacon read
+ *   6. Institutions (docs/institutions-plan.md section 4), checks U13-U36 (slot layout, beacon read
  *      and latch, rule draws, violations and marks, zap cost, Commons season, beacon sensing, the
- *      Log, the V4 trace, the complier / enforcer roles). They need the -DWEF_INST build
+ *      Log, the V4 trace, the complier / enforcer roles, the D23 conditional reach and steerable
+ *      mark). They need the -DWEF_INST build
  *      (build/wef_test8i via CFLAGS="-DMAX_AGENTS=8 -DWEF_INST") and are skipped elsewhere;
  *      run_test.sh adds U13' (base-slot projection identity of the institution build).
  */
@@ -3239,6 +3240,152 @@ static void test_inst_free_riding(void) {
     dict_clear(&kw0);
 }
 
+// U35 (D23): conditional reach. With mark_bite_radius_cm 6 and mark_bite_angle_deg 90 (a HALF-angle: the whole front
+// half-plane) a bite lands on a MARKED fish 5 cm away at 60 degrees off-axis and misses an unmarked fish at the same
+// place; with the defaults (3 cm, 22.5 degrees) both are missed; a marked fish 2 cm straight ahead is bitten in both
+// settings. Scene 3 is the scripted enforcer (role 14, informed by hand) with the marked fish off-axis: it bites in the
+// same step only with the wide reach (the hunt uses the mark cone), so the CPU gate measures the new reach.
+static void test_inst_reach(void) {
+    printf("-- INST U35: conditional bite reach on marked fish (mark_bite_radius_cm, mark_bite_angle_deg)\n");
+    for (int wide = 0; wide <= 1; wide++) {
+        for (int scene = 0; scene < 4; scene++) {   // 0 marked off-axis, 1 unmarked off-axis, 2 marked 2 cm ahead, 3 enforcer
+            Dict kw = {0};
+            kw_inst_test(&kw, AH_FISH, 0);
+            dict_set(&kw, "inst_mark_until_zap", 1);  // the mark stays until the sanction (fish 0 may bite over 2 steps)
+            if (wide) {
+                dict_set(&kw, "mark_bite_radius_cm", 6);
+                dict_set(&kw, "mark_bite_angle_deg", 90);
+            }
+            if (scene == 3) {
+                dict_set(&kw, "bot_oracle", 1);
+                puf_ini_set(&kw, "roles", AH_FISH >= 8 ? "14,13,13,13,13,13,13,13" : "14,13,13,13");
+            }
+            Harness h = make(&kw, AH_FISH);
+            Env* env = h.env;
+            if (scene == 0 && !wide) {
+                CHECK(env->mark_bite_radius_cm == BITING_RADIUS_CM && env->mark_bite_cone == EATING_ANGLE,
+                    "defaults resolve to the base cone: radius %.1f cm, full cone %.4f rad", env->mark_bite_radius_cm, env->mark_bite_cone);
+            } else if (scene == 0) {
+                CHECK(env->mark_bite_radius_cm == 6.0f && fabsf(env->mark_bite_cone - PI_F) < 1e-6f,
+                    "radius 6 / half-angle 90 resolve to 6 cm and a full cone of pi (%.4f)", env->mark_bite_cone);
+            }
+            clear_objects(env);
+            ah_park(&h, 0);
+            int b = AH_FISH / 2;   // the first B fish (taste != rule A, so a plant_mode 2 bite is a zap in either case)
+            place_fish(env, 0, 10.0f, 20.0f, 0.0f);
+            if (scene == 2) {
+                place_fish(env, b, 12.0f, 20.0f, 0.0f);                                   // 2 cm straight ahead
+            } else {
+                place_fish(env, b, 10.0f + 5.0f * cosf(1.0472f), 20.0f + 5.0f * sinf(1.0472f), 0.0f);  // 5 cm, 60 deg left
+            }
+            env->fish[b].mark = scene == 1 ? 0 : 40;
+            if (scene == 3) {
+                env->fish[0].informed = true;   // the enforcer has read the rule: it hunts marked fish within 10 cm
+                env->fish[0].inst_val = 1.0f;
+            } else {
+                set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+            }
+            puf_step(env);
+            bool want = scene == 2 || (wide && (scene == 0 || scene == 3));
+            const char* what = scene == 0 ? "marked fish 5 cm away, 60 deg off-axis"
+                : scene == 1 ? "UNMARKED fish 5 cm away, 60 deg off-axis"
+                : scene == 2 ? "marked fish 2 cm straight ahead" : "enforcer (role 14) vs marked fish 5 cm away, 60 deg off-axis";
+            CHECK((env->fish[0].bite_victim == b) == want,
+                "%s: %s -> %s (victim %d)", wide ? "radius 6 / half-angle 90" : "defaults 3 cm / 22.5 deg", what,
+                want ? "bitten" : "missed", env->fish[0].bite_victim);
+            destroy(&h);
+            dict_clear(&kw);
+        }
+    }
+}
+
+// U36 (D23): steerable mark signature. With inst_mark_contrast 1 the mormyromast readings of a fish 4 cm from a marked
+// fish differ from those with the mark cleared (the ampullary ones do not: the source is induced only, like the beacon);
+// the marked fish's own sensor slots do not change when its mark is set; with the key at 0 the neighbour's sensor slots
+// are identical whether or not the fish is marked; and the sensor-noise RNG stream is unchanged (two Commons envs,
+// same seed, key 0 / 1, one fish persistently marked: equal rng state and pellet positions after regrowth steps).
+static void test_inst_mark_signature(void) {
+    printf("-- INST U36: steerable mark signature (inst_mark_contrast)\n");
+    enum { NS = NUM_MORMYROMASTS + NUM_AMPULLARY };
+    for (int on = 1; on >= 0; on--) {
+        Dict kw = {0};
+        kw_inst_test(&kw, AH_FISH, 0);
+        dict_set(&kw, "inst_mark_contrast", on ? 1.0 : 0.0);
+        Harness h = make(&kw, AH_FISH);
+        Env* env = h.env;
+        clear_objects(env);
+        ah_park(&h, 0);
+        place_fish(env, 0, 10.0f, 20.0f, 0.0f);     // the observer, heading +x
+        place_fish(env, 1, 14.0f, 20.0f, 1.5708f);  // the (to be) marked fish 4 cm ahead, heading +y
+        obs_t row0[2][NS];
+        obs_t row1[2][NS];
+        for (int m = 0; m < 2; m++) {
+            env->fish[1].mark = m ? 40 : 0;
+            env->rng = 12345u;                      // same sensor-noise draws in both passes
+            compute_observations(env);
+            memcpy(row0[m], env->agents[0].observations, NS * sizeof(obs_t));
+            memcpy(row1[m], env->agents[1].observations, NS * sizeof(obs_t));
+        }
+        int morm_diff = 0;
+        int amp_diff = 0;
+        int own_diff = 0;
+        for (int s = 0; s < NS; s++) {
+            int d0 = row0[0][s] != row0[1][s];
+            morm_diff += d0 && s < NUM_MORMYROMASTS;
+            amp_diff += d0 && s >= NUM_MORMYROMASTS;
+            own_diff += row1[0][s] != row1[1][s];
+        }
+        if (on) {
+            CHECK(morm_diff > 0 && amp_diff == 0 && env->fish[1].mark_moment.x != 0.0f,
+                "inst_mark_contrast 1: the neighbour's mormyromast row changes with the mark (%d of %d slots; ampullary %d: induced only)",
+                morm_diff, NUM_MORMYROMASTS, amp_diff);
+            CHECK(own_diff == 0, "the marked fish's own sensor slots do not change when its mark is set (%d differ)", own_diff);
+        } else {
+            CHECK(morm_diff == 0 && amp_diff == 0 && own_diff == 0,
+                "inst_mark_contrast 0: both rows identical whether or not the fish is marked (%d / %d / %d differ)", morm_diff, amp_diff, own_diff);
+        }
+        destroy(&h);
+        dict_clear(&kw);
+    }
+    // RNG stream: the rotating-patch Commons, one marked fish beside the others, 8 pellets removed so regrowth draws run
+    unsigned int rng_end[2];
+    int food_active[2];
+    Vec2 pos[2][MAX_FOOD];
+    bool act[2][MAX_FOOD];
+    for (int on = 0; on <= 1; on++) {
+        Dict kw = {0};
+        kw_base(&kw, 4);
+        kw_inst_commons_rot(&kw);
+        dict_set(&kw, "inst_mark_contrast", on ? 1.0 : 0.0);
+        Harness h = make(&kw, 4);
+        Env* env = h.env;
+        ah_park(&h, 0);
+        env->fish[1].mark = 64;                     // persistent (inst_mark_until_zap 1 in the preset)
+        for (int f = 0; f < 8; f++) {
+            env->food[f].active = false;
+        }
+        env->food_active -= 8;
+        for (int t = 0; t < 64; t++) {
+            puf_step(env);
+        }
+        rng_end[on] = env->rng;
+        food_active[on] = env->food_active;
+        for (int f = 0; f < env->num_food; f++) {
+            pos[on][f] = env->food[f].pos;
+            act[on][f] = env->food[f].active;
+        }
+        destroy(&h);
+        dict_clear(&kw);
+    }
+    int pos_diff = 0;
+    for (int f = 0; f < MAX_FOOD; f++) {
+        pos_diff += act[0][f] != act[1][f] || pos[0][f].x != pos[1][f].x || pos[0][f].y != pos[1][f].y;
+    }
+    CHECK(rng_end[0] == rng_end[1] && pos_diff == 0 && food_active[0] == food_active[1] && food_active[0] > 56,
+        "key 0 vs 1, same seed, 64 steps with a marked fish: rng state equal (%u), %d pellets differ, %d active after regrowth (from 56)",
+        rng_end[0], pos_diff, food_active[0]);
+}
+
 static void test_inst(void) {
     test_inst_layout();
     test_inst_read();
@@ -3262,10 +3409,12 @@ static void test_inst(void) {
     test_inst_freeze_scope();
     test_inst_free_riding();
     test_inst_danger();
+    test_inst_reach();
+    test_inst_mark_signature();
 }
 #else
 static void test_inst(void) {
-    printf("-- INST U13-U34: skipped (needs the -DWEF_INST build)\n");
+    printf("-- INST U13-U36: skipped (needs the -DWEF_INST build)\n");
 }
 #endif
 

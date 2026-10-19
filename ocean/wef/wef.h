@@ -199,6 +199,7 @@ typedef struct FishAgent {
     // --- Institutions (inst_mode / inst_obs, docs/institutions-plan.md 3.2-4). Zero / unread when
     // both are 0.
     int mark;              // steps left of the violation mark (the public label)
+    Vec2 mark_moment;      // D23 (inst_mark_contrast != 0): the steerable mark's induced dipole this step (0 unless marked)
     float inst_val;        // the rule as last read at the beacon: +1 / -1, 0 = never read (latched)
     float bot_inst_val;    // scripted roles: the last value read, kept when inst_latch 0 clears inst_val out of range
     float inst_danger;     // D22 (inst_danger_obs): the danger level as last read at the beacon = marked fish / N (latched like inst_val)
@@ -311,8 +312,10 @@ float conductor_scale_c(float radius_cm, float contrast) {
     return 3.0f * EPSILON_0 * contrast * (4.0f / 3.0f) * PI_F * r * r * r;
 }
 
-// Caps: 2 EOD poles/agent; agent+food+waste dipoles.
-enum { WEF_MAX_MONO = 2 * MAX_AGENTS, WEF_MAX_DIP = MAX_AGENTS + MAX_FOOD + MAX_WASTE + 1 };  // + 1 beacon
+// Caps: 2 EOD poles/agent; agent+food+waste dipoles, + 1 beacon, + MAX_AGENTS steerable marks (D23,
+// inst_mark_contrast: a marked fish carries an induced conductor). Array capacity only: nothing is
+// staged in the extra slots unless the key is on, so the default path is unchanged.
+enum { WEF_MAX_MONO = 2 * MAX_AGENTS, WEF_MAX_DIP = MAX_AGENTS + MAX_FOOD + MAX_WASTE + 1 + MAX_AGENTS };
 
 // Electric sources for measure_field: position in meters, moments/charges SI.
 typedef struct { Vec2 p; float q; } Mono;
@@ -781,6 +784,12 @@ struct Env {
     float inst_read_cm;         // a fish inside this radius reads the rule
     float inst_obj_radius_cm;   // the beacon's electrical signature: a waste-like conductor
     float inst_contrast;
+    float inst_mark_contrast;   // D23 steerable mark: != 0 -> every MARKED fish carries an induced conductor at its position
+                                // (radius inst_obj_radius_cm, this contrast), sensed like the beacon by the OTHER fish (waste
+                                // class ranges), never by itself; 0 = the mark is a label slot only (no sensory content)
+    float mark_bite_radius_cm;  // D23 conditional reach: the bite radius on a MARKED victim (-1 = BITING_RADIUS_CM; resolved at init)
+    float mark_bite_angle_deg;  // ... and the HALF-angle of the bite cone on a marked victim, degrees (-1 = EATING_ANGLE / 2 = 22.5)
+    float mark_bite_cone;       // the resolved full cone in radians for in_forward_cone (2 x the half-angle; EATING_ANGLE by default)
     int inst_latch;             // 1: the obs slot keeps the last value read; 0: in range only
     int inst_danger_obs;        // D22: 1 = the beacon also broadcasts the danger level (marked fish / N, i.e. unsanctioned
                                 // violations outstanding under persistent marks) into the last institution slot; 0 = slot 0
@@ -1247,7 +1256,27 @@ void compute_observations(Wef* env) {
         }
         env->inst_moment = (Vec2){f.x * inst_scale, f.y * inst_scale};
     }
-    // Induced + intrinsic dipoles as AoS for measure_field: [agents..., food..., waste...]
+    // Steerable mark (D23, inst_mark_contrast != 0): a marked fish carries an induced conductor at its own
+    // position, computed exactly like the beacon (same object radius, this contrast, waste class ranges,
+    // induced by every EOD pole in range, the owner's own included, so the signature is on even for a lone
+    // fish). No wef_any_fish_within cull: the owner's own poles are always in range. The sources join the
+    // waste class below and are skipped from the owner's own measurement (the mark is public, not a self-cue).
+    int n_marks = 0;
+    if (env->inst_mark_contrast != 0.0f) {
+        float mark_scale = conductor_scale_c(env->inst_obj_radius_cm, env->inst_mark_contrast);
+        float mono_range = env->waste_sense_range_cm + BODY_RADIUS_CM + 2.0f * EOD_POLE_OFFSET_CM;
+        for (int a = 0; a < env->num_agents; a++) {
+            FishAgent* fa = &env->fish[a];
+            fa->mark_moment = (Vec2){0.0f, 0.0f};
+            if (fa->mark <= 0) {
+                continue;
+            }
+            Vec2 f = wef_mono_field(fa->pos, eod, n_eod, mono_range);
+            fa->mark_moment = (Vec2){f.x * mark_scale, f.y * mark_scale};
+            n_marks++;
+        }
+    }
+    // Induced + intrinsic dipoles as AoS for measure_field: [agents..., food..., waste..., beacon, marks...]
     Dipole induced[WEF_MAX_DIP];
     Dipole intrinsic[WEF_MAX_DIP];
     int n_induced = 0;
@@ -1289,6 +1318,19 @@ void compute_observations(Wef* env) {
         induced[n_induced++] = (Dipole){to_m(env->inst_pos), env->inst_moment};
         n_waste_staged++;
     }
+    // steerable marks (D23) join the waste class last; mark_owner[] lets the owner skip its own source.
+    // Default path: n_marks 0, mark_start == n_induced, so the owner test below never fires.
+    int mark_start = n_induced;
+    int mark_owner[MAX_AGENTS] = {0};
+    if (n_marks > 0) {
+        for (int a = 0; a < env->num_agents; a++) {
+            if (env->fish[a].mark > 0) {
+                mark_owner[n_induced - mark_start] = a;
+                induced[n_induced++] = (Dipole){to_m(env->fish[a].pos), env->fish[a].mark_moment};
+                n_waste_staged++;
+            }
+        }
+    }
     // Per-fish culling radii: every sensor sits on the BODY_RADIUS_CM ring around the fish
     // centre, so a source farther than (range + ring + margin) from the centre is out of
     // range for all 60 sensors and would be skipped by measure_field's own test. Culling once
@@ -1317,6 +1359,9 @@ void compute_observations(Wef* env) {
         int n_agent_c = 0;
         int n_food_c = 0;
         for (int k = 0; k < n_induced; k++) {
+            if (k >= mark_start && mark_owner[k - mark_start] == i) {
+                continue;  // D23: a fish does not sense its own mark source
+            }
             float dx = pm.x - induced[k].p.x;
             float dy = pm.y - induced[k].p.y;
             float d2 = dx * dx + dy * dy;
@@ -2448,7 +2493,12 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     // zone (2 x the bite radius, below) it ignores the rule altogether: it is standing still, and a
     // third fish parked within 3 cm (two compliers at one patch centre) otherwise re-fires the 90-degree
     // turn after every step of the pursuit turn, so the target never enters the bite cone.
-    bool no_avoid = enforcer && ah_hunt && dist < 2.0f * BITING_RADIUS_CM;
+    // D23: on a MARKED quarry the reach is the mark radius / cone (defaults = the base bite cone), so the
+    // CPU gate measures the new reach; role 11's rival hunt and an unmarked quarry keep the base cone.
+    bool hunt_marked = ah_hunt && hunt_j >= 0 && env->fish[hunt_j].mark > 0;
+    float bite_r = hunt_marked ? env->mark_bite_radius_cm : BITING_RADIUS_CM;
+    float bite_cone = hunt_marked ? env->mark_bite_cone : EATING_ANGLE;
+    bool no_avoid = enforcer && ah_hunt && dist < 2.0f * bite_r;
     for (int j = 0; j < env->num_agents; j++) {
         if (j == i || no_avoid || (enforcer && j == hunt_j)) {
             continue;
@@ -2469,12 +2519,13 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     raw[2] = 1.0f;
     float radius = role == 1 ? env->clean_radius_cm
         : ah_plant_target ? env->plant_radius_cm
-        : ah_hunt ? BITING_RADIUS_CM : EATING_RADIUS_CM;
-    bool in_cone = found && in_forward_cone(fish, target, radius, EATING_ANGLE);
+        : ah_hunt ? bite_r : EATING_RADIUS_CM;
+    float cone = ah_hunt ? bite_cone : EATING_ANGLE;
+    bool in_cone = found && in_forward_cone(fish, target, radius, cone);
     // Bite/eat are decided at the pre-move pose but a clean resolves after motion:
     // stop when the item is inside the action radius, and turn in place when it is
     // close but outside the cone (pure pursuit would orbit it).
-    bool aligned = fabsf(err) <= EATING_ANGLE * 0.5f;
+    bool aligned = fabsf(err) <= cone * 0.5f;
     if (found && (dist < radius || (dist < 2.0f * radius && !aligned))) {
         raw[0] = -8.0f;                          // sigmoid -> 3e-4: no motion
     } else {
@@ -2899,7 +2950,13 @@ void puf_step(Wef* env) {
             if (env->fish[j].freeze > 0) {
                 continue;  // immunity while frozen
             }
-            if (!in_forward_cone(attacker, env->fish[j].pos, BITING_RADIUS_CM, EATING_ANGLE)) {
+            // D23 conditional reach: a MARKED candidate is tested with the mark radius / cone (the defaults
+            // resolve to BITING_RADIUS_CM / EATING_ANGLE at init, so this is the base test unless the keys are
+            // set); unmarked candidates keep the base cone; the nearest eligible candidate is the victim.
+            bool marked_j = env->inst_mode > 0 && env->fish[j].mark > 0;
+            float reach_j = marked_j ? env->mark_bite_radius_cm : BITING_RADIUS_CM;
+            float cone_j = marked_j ? env->mark_bite_cone : EATING_ANGLE;
+            if (!in_forward_cone(attacker, env->fish[j].pos, reach_j, cone_j)) {
                 continue;
             }
             float dx = env->fish[j].pos.x - attacker->pos.x;
@@ -4364,6 +4421,7 @@ static const char* WEF_ENV_KEYS[] = {
     "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "mark_freeze_steps",
     "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze",
     "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps", "inst_grace_steps", "inst_duty_mode",
+    "inst_mark_contrast", "mark_bite_radius_cm", "mark_bite_angle_deg",   // D23
 };
 
 static void wef_check_keys(Dict* kwargs) {
@@ -4516,6 +4574,22 @@ void puf_init(Env* env, Dict* kwargs) {
     env->inst_duty_cm = wef_cfg(kwargs, "inst_duty_cm", 0.0);
     env->inst_duty_steps = wef_cfg(kwargs, "inst_duty_steps", 64);
     env->inst_duty_mode = wef_cfg(kwargs, "inst_duty_mode", 0);
+    // D23: steerable mark and conditional reach. -1 resolves to the base bite cone (3 cm, 22.5 degree
+    // half-angle) so a marked victim is tested with exactly BITING_RADIUS_CM / EATING_ANGLE by default.
+    env->inst_mark_contrast = wef_cfg(kwargs, "inst_mark_contrast", 0.0);
+    env->mark_bite_radius_cm = wef_cfg(kwargs, "mark_bite_radius_cm", -1.0);
+    env->mark_bite_angle_deg = wef_cfg(kwargs, "mark_bite_angle_deg", -1.0);
+    assert((env->inst_mark_contrast == 0.0f || (env->inst_mode > 0 && env->inst_mark_steps > 0))
+        && "inst_mark_contrast needs inst_mode > 0 and inst_mark_steps > 0 (a mark to carry)");
+    assert((env->mark_bite_radius_cm == -1.0f || env->mark_bite_radius_cm > 0.0f)
+        && "mark_bite_radius_cm: -1 (= BITING_RADIUS_CM, 3 cm) or a radius > 0 cm");
+    assert((env->mark_bite_angle_deg == -1.0f || (env->mark_bite_angle_deg > 0.0f && env->mark_bite_angle_deg <= 180.0f))
+        && "mark_bite_angle_deg: -1 (= the base half-angle 22.5) or a half-angle in (0, 180] degrees");
+    if (env->mark_bite_radius_cm < 0.0f) {
+        env->mark_bite_radius_cm = BITING_RADIUS_CM;
+    }
+    env->mark_bite_cone = env->mark_bite_angle_deg < 0.0f ? EATING_ANGLE
+        : 2.0f * env->mark_bite_angle_deg * (PI_F / 180.0f);
     {
         // roles = r0,r1,r2,r3 (comma list; a scalar applies to slot 0 only)
         DictItem* item = dict_find(kwargs, "roles");
