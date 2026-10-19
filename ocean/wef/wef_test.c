@@ -3038,6 +3038,51 @@ static void test_inst_probe_keys(void) {
     dict_clear(&kw0);
 }
 
+// U38 (positive control): mark_frozen_biteable: a frozen MARKED fish can be bitten (and the sanction clears its mark); a
+// frozen unmarked fish stays immune; default = both immune.
+static void test_inst_frozen_biteable(void) {
+    printf("-- INST U38: mark_frozen_biteable\n");
+    int b = AH_FISH / 2;
+    for (int on = 1; on >= 0; on--) {
+        Dict kw = {0};
+        kw_inst_test(&kw, AH_FISH, 0);
+        dict_set(&kw, "inst_mark_until_zap", 1);
+        dict_set(&kw, "mark_frozen_biteable", on);
+        Harness h = make(&kw, AH_FISH);
+        Env* env = h.env;
+        clear_objects(env);
+        ah_park(&h, 0);
+        for (int i = 0; i < AH_FISH; i++) {
+            ah_still(&h, i);
+        }
+        env->fish[b].mark = 64;
+        env->fish[b].freeze = 50;
+        place_fish(env, b, 10.0f, 20.0f, 0.0f);
+        env->fish[b].freeze = 50;                      // place_fish clears it
+        place_fish(env, 0, 7.5f, 20.0f, 0.0f);
+        set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+        puf_step(env);
+        ah_still(&h, 0);
+        if (on) {
+            CHECK(env->fish[0].bite_victim == b && env->zaps_on_marked == 1 && env->fish[b].mark == 0,
+                "key on: the frozen marked fish is bitten (victim %d) and its mark cleared (%d)", env->fish[0].bite_victim, env->fish[b].mark);
+            // a frozen UNMARKED fish stays immune
+            env->fish[0].bite_cooldown = 0;
+            env->fish[b].freeze = 50;
+            place_fish(env, 0, 7.5f, 20.0f, 0.0f);
+            set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+            puf_step(env);
+            ah_still(&h, 0);
+            CHECK(env->fish[0].bite_victim != b, "key on: a frozen unmarked fish is still immune (victim %d)", env->fish[0].bite_victim);
+        } else {
+            CHECK(env->fish[0].bite_victim != b && env->zaps_on_marked == 0 && env->fish[b].mark == 64,
+                "default: the frozen marked fish is immune (victim %d, mark %d)", env->fish[0].bite_victim, env->fish[b].mark);
+        }
+        destroy(&h);
+        dict_clear(&kw);
+    }
+}
+
 static void test_inst_duty(void) {
     printf("-- INST U29: duty to enforce (inst_duty_cm / inst_duty_steps)\n");
     Dict kw = {0};
@@ -3542,12 +3587,13 @@ static void test_inst(void) {
     test_inst_free_riding();
     test_inst_danger();
     test_inst_probe_keys();
+    test_inst_frozen_biteable();
     test_inst_reach();
     test_inst_mark_signature();
 }
 #else
 static void test_inst(void) {
-    printf("-- INST U13-U37: skipped (needs the -DWEF_INST build)\n");
+    printf("-- INST U13-U38: skipped (needs the -DWEF_INST build)\n");
 }
 #endif
 

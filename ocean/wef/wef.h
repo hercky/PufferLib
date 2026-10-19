@@ -791,6 +791,7 @@ struct Env {
     float mark_bite_angle_deg;  // ... and the HALF-angle of the bite cone on a marked victim, degrees (-1 = EATING_ANGLE / 2 = 22.5)
     float mark_bite_cone;       // the resolved full cone in radians for in_forward_cone (2 x the half-angle; EATING_ANGLE by default)
     int inst_latch;             // 1: the obs slot keeps the last value read; 0: in range only
+    int mark_frozen_biteable;   // positive control (2026-10-19): 1 = a frozen fish that is MARKED stays biteable (a stationary sanction target); unmarked frozen fish stay immune
     int inst_mask_marks;        // probe (2026-10-19): 1 = the own-mark and others'-mark slots read 0 (the marks still exist); eval-only perception test
     float mark_bitten_reward;   // probe: reward added to a MARKED victim when a bite lands on it (a felt sanction; D11-compatible); 0 = off
     int inst_danger_obs;        // D22: 1 = the beacon also broadcasts the danger level (marked fish / N, i.e. unsanctioned
@@ -2294,7 +2295,7 @@ void wef_bot_action(Wef* env, int i, float* raw) {
             hunt_j = dt;
         }
         for (int j = 0; j < env->num_agents && !found; j++) {
-            if (j == i || env->fish[j].freeze > 0 || (env->fish[j].mark <= 0 && !hunt_any)) {
+            if (j == i || (env->fish[j].freeze > 0 && !(env->mark_frozen_biteable && env->fish[j].mark > 0)) || (env->fish[j].mark <= 0 && !hunt_any)) {
                 continue;
             }
             float dx = env->fish[j].pos.x - fish->pos.x;
@@ -2955,8 +2956,8 @@ void puf_step(Wef* env) {
             if (i == j) {
                 continue;
             }
-            if (env->fish[j].freeze > 0) {
-                continue;  // immunity while frozen
+            if (env->fish[j].freeze > 0 && !(env->mark_frozen_biteable && env->fish[j].mark > 0)) {
+                continue;  // immunity while frozen (a marked frozen fish stays biteable under mark_frozen_biteable)
             }
             // D23 conditional reach: a MARKED candidate is tested with the mark radius / cone (the defaults
             // resolve to BITING_RADIUS_CM / EATING_ANGLE at init, so this is the base test unless the keys are
@@ -4427,7 +4428,7 @@ static const char* WEF_ENV_KEYS[] = {
     // Institutions (docs/institutions-plan.md section 4)
     "inst_mode", "inst_obs", "inst_fixed_type", "inst_theta", "inst_hyst", "inst_flip_steps",
     "inst_mark_steps", "mark_zap_reward", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
-    "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_freeze_steps",
+    "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_frozen_biteable", "mark_freeze_steps",
     "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze",
     "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps", "inst_grace_steps", "inst_duty_mode",
     "inst_mark_contrast", "mark_bite_radius_cm", "mark_bite_angle_deg",   // D23
@@ -4575,6 +4576,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->inst_latch = wef_cfg(kwargs, "inst_latch", 1);
     env->inst_danger_obs = wef_cfg(kwargs, "inst_danger_obs", 0);
     env->inst_mask_marks = wef_cfg(kwargs, "inst_mask_marks", 0);
+    env->mark_frozen_biteable = wef_cfg(kwargs, "mark_frozen_biteable", 0);
     env->mark_bitten_reward = wef_cfg(kwargs, "mark_bitten_reward", 0.0);
     env->inst_mark_until_zap = wef_cfg(kwargs, "inst_mark_until_zap", 0);
     env->inst_mark_wrongful = wef_cfg(kwargs, "inst_mark_wrongful", 0);
@@ -4650,6 +4652,7 @@ void puf_init(Env* env, Dict* kwargs) {
         && env->inst_read_cm > 0.0f && env->inst_obj_radius_cm > 0.0f);
     assert((env->inst_pos_random == 0 || env->inst_pos_random == 1) && (env->inst_latch == 0 || env->inst_latch == 1));
     assert((env->inst_mask_marks == 0 || env->inst_mask_marks == 1) && "inst_mask_marks: 0 / 1");
+    assert((env->mark_frozen_biteable == 0 || (env->mark_frozen_biteable == 1 && env->inst_mode > 0)) && "mark_frozen_biteable: 0 / 1, needs inst_mode > 0");
     assert((env->mark_bitten_reward == 0.0f || env->inst_mode > 0) && "mark_bitten_reward needs inst_mode > 0 (a marked victim)");
     assert((env->inst_danger_obs == 0 || (env->inst_danger_obs == 1 && env->inst_obs && env->inst_mode > 0))
         && "inst_danger_obs needs inst_obs 1 and inst_mode > 0 (the danger level is the institution's)");
