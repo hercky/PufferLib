@@ -3083,6 +3083,48 @@ static void test_inst_frozen_biteable(void) {
     }
 }
 
+// U39 (pursuit bonus): mark_pursuit_gain: an unmarked fish within 10 cm of a marked fish moves gain x farther per step; the
+// marked fish and a fish far away move normally; default 1 = identical.
+static void test_inst_pursuit(void) {
+    printf("-- INST U39: mark_pursuit_gain\n");
+    int b = AH_FISH / 2;
+    float moved[2][3];
+    for (int on = 0; on < 2; on++) {
+        Dict kw = {0};
+        kw_inst_test(&kw, AH_FISH, 0);
+        dict_set(&kw, "inst_mark_until_zap", 1);
+        dict_set(&kw, "mark_pursuit_gain", on ? 1.5 : 1.0);
+        Harness h = make(&kw, AH_FISH);
+        Env* env = h.env;
+        clear_objects(env);
+        ah_park(&h, 0);
+        for (int i = 0; i < AH_FISH; i++) {
+            ah_still(&h, i);
+        }
+        env->fish[b].mark = 64;
+        place_fish(env, b, 20.0f, 20.0f, 0.0f);     // marked, swims +x
+        place_fish(env, 0, 14.0f, 20.0f, 0.0f);     // 6 cm behind: within 10 cm
+        place_fish(env, 1, 50.0f, 36.0f, 0.0f);     // far away
+        float x0 = env->fish[0].pos.x, xb = env->fish[b].pos.x, x1 = env->fish[1].pos.x;
+        set_action(&h, 0, 2.0f, 0.0f, 1.0f, -1.0f);
+        set_action(&h, b, 2.0f, 0.0f, 1.0f, -1.0f);
+        set_action(&h, 1, 2.0f, 0.0f, 1.0f, -1.0f);
+        puf_step(env);
+        moved[on][0] = env->fish[0].pos.x - x0;
+        moved[on][1] = env->fish[b].pos.x - xb;
+        moved[on][2] = env->fish[1].pos.x - x1;
+        if (on) {
+            CHECK(env->log.n == 0.0f && env->pursuit_steps == 1, "the bonus counted one fish-step (%d)", env->pursuit_steps);
+        }
+        destroy(&h);
+        dict_clear(&kw);
+    }
+    CHECK(moved[0][0] > 0.0f && fabsf(moved[1][0] - 1.5f * moved[0][0]) < 1e-4f,
+        "the unmarked fish 6 cm from a marked fish moves 1.5x (%.4f vs %.4f)", moved[1][0], moved[0][0]);
+    CHECK(fabsf(moved[1][1] - moved[0][1]) < 1e-6f && fabsf(moved[1][2] - moved[0][2]) < 1e-6f,
+        "the marked fish (%.4f) and the far fish (%.4f) move as without the key", moved[1][1], moved[1][2]);
+}
+
 static void test_inst_duty(void) {
     printf("-- INST U29: duty to enforce (inst_duty_cm / inst_duty_steps)\n");
     Dict kw = {0};
@@ -3588,12 +3630,13 @@ static void test_inst(void) {
     test_inst_danger();
     test_inst_probe_keys();
     test_inst_frozen_biteable();
+    test_inst_pursuit();
     test_inst_reach();
     test_inst_mark_signature();
 }
 #else
 static void test_inst(void) {
-    printf("-- INST U13-U38: skipped (needs the -DWEF_INST build)\n");
+    printf("-- INST U13-U39: skipped (needs the -DWEF_INST build)\n");
 }
 #endif
 

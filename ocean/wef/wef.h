@@ -436,6 +436,7 @@ struct Log {
     float enf_premium_n;     // 1 if the episode had both exposed sanctioners and exposed non-sanctioners (enf_premium defined)
     float enf_gini_n;        // 1 if the episode had a zap on a marked fish (enf_gini defined)
     float danger_mean;       // D22: time-mean of marked fish / N (the public danger level), zero unless inst_mode > 0
+    float pursuit_frac;      // pursuit bonus: fish-steps with the speed bonus active / fish-steps (0 unless mark_pursuit_gain != 1)
     float n;
 };
 
@@ -791,6 +792,9 @@ struct Env {
     float mark_bite_angle_deg;  // ... and the HALF-angle of the bite cone on a marked victim, degrees (-1 = EATING_ANGLE / 2 = 22.5)
     float mark_bite_cone;       // the resolved full cone in radians for in_forward_cone (2 x the half-angle; EATING_ANGLE by default)
     int inst_latch;             // 1: the obs slot keeps the last value read; 0: in range only
+    float mark_pursuit_gain;    // pursuit bonus (2026-10-20): an UNMARKED, unfrozen fish with a marked fish within MORM_AGENT_RANGE_CM moves
+                                // this many times its normal distance per step (1 = off); the marked fish is unchanged (enforcer-side, not a sanction)
+    int pursuit_steps;          // per-episode fish-steps with the bonus active (Log pursuit_frac)
     int mark_frozen_biteable;   // positive control (2026-10-19): 1 = a frozen fish that is MARKED stays biteable (a stationary sanction target); unmarked frozen fish stay immune
     int inst_mask_marks;        // probe (2026-10-19): 1 = the own-mark and others'-mark slots read 0 (the marks still exist); eval-only perception test
     float mark_bitten_reward;   // probe: reward added to a MARKED victim when a bite lands on it (a felt sanction; D11-compatible); 0 = off
@@ -1730,6 +1734,7 @@ void puf_reset(Wef* env) {
     env->zaps_on_marked = 0;
     env->marked_steps = 0;
     env->danger_sum = 0.0f;
+    env->pursuit_steps = 0;
     env->pair_steps = 0;
     env->pair_marked_steps = 0;
     env->informed_steps = 0;
@@ -2836,6 +2841,23 @@ void puf_step(Wef* env) {
         if (agent->eat_cooldown <= 0 && agent->freeze <= 0) {
             lin = move * agent->max_linear_velocity;
             ang = turn * agent->max_angular_velocity;
+            if (env->mark_pursuit_gain != 1.0f && env->inst_mode > 0 && agent->mark <= 0) {
+                // pursuit bonus: an unmarked fish with a marked fish within MORM_AGENT_RANGE_CM moves faster this step
+                bool near_marked = false;
+                float r2 = MORM_AGENT_RANGE_CM * MORM_AGENT_RANGE_CM;
+                for (int j = 0; j < env->num_agents && !near_marked; j++) {
+                    if (j == i || env->fish[j].mark <= 0) {
+                        continue;
+                    }
+                    float dx = env->fish[j].pos.x - agent->pos.x;
+                    float dy = env->fish[j].pos.y - agent->pos.y;
+                    near_marked = dx * dx + dy * dy <= r2;
+                }
+                if (near_marked) {
+                    lin *= env->mark_pursuit_gain;
+                    env->pursuit_steps++;
+                }
+            }
         }
         agent->orientation = wrap_angle(agent->orientation + ang);
         agent->pos.x += cosf(agent->orientation) * lin;
@@ -3747,6 +3769,7 @@ void puf_step(Wef* env) {
             env->log.violations_first += (float)env->violations_first;
             env->log.marked_frac += (float)env->marked_steps / fish_steps;
             env->log.danger_mean += env->danger_sum / (float)env->episode_length;
+            env->log.pursuit_frac += (float)env->pursuit_steps / fish_steps;
             env->log.marked_exposure += env->pair_steps > 0
                 ? (float)env->pair_marked_steps / (float)env->pair_steps : 0.0f;
             env->log.zaps_on_marked += (float)env->zaps_on_marked;
@@ -4428,7 +4451,7 @@ static const char* WEF_ENV_KEYS[] = {
     // Institutions (docs/institutions-plan.md section 4)
     "inst_mode", "inst_obs", "inst_fixed_type", "inst_theta", "inst_hyst", "inst_flip_steps",
     "inst_mark_steps", "mark_zap_reward", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
-    "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_frozen_biteable", "mark_freeze_steps",
+    "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_frozen_biteable", "mark_pursuit_gain", "mark_freeze_steps",
     "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze",
     "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps", "inst_grace_steps", "inst_duty_mode",
     "inst_mark_contrast", "mark_bite_radius_cm", "mark_bite_angle_deg",   // D23
@@ -4577,6 +4600,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->inst_danger_obs = wef_cfg(kwargs, "inst_danger_obs", 0);
     env->inst_mask_marks = wef_cfg(kwargs, "inst_mask_marks", 0);
     env->mark_frozen_biteable = wef_cfg(kwargs, "mark_frozen_biteable", 0);
+    env->mark_pursuit_gain = wef_cfg(kwargs, "mark_pursuit_gain", 1.0);
     env->mark_bitten_reward = wef_cfg(kwargs, "mark_bitten_reward", 0.0);
     env->inst_mark_until_zap = wef_cfg(kwargs, "inst_mark_until_zap", 0);
     env->inst_mark_wrongful = wef_cfg(kwargs, "inst_mark_wrongful", 0);
@@ -4653,6 +4677,8 @@ void puf_init(Env* env, Dict* kwargs) {
     assert((env->inst_pos_random == 0 || env->inst_pos_random == 1) && (env->inst_latch == 0 || env->inst_latch == 1));
     assert((env->inst_mask_marks == 0 || env->inst_mask_marks == 1) && "inst_mask_marks: 0 / 1");
     assert((env->mark_frozen_biteable == 0 || (env->mark_frozen_biteable == 1 && env->inst_mode > 0)) && "mark_frozen_biteable: 0 / 1, needs inst_mode > 0");
+    assert(env->mark_pursuit_gain >= 1.0f && env->mark_pursuit_gain <= 3.0f && (env->mark_pursuit_gain == 1.0f || env->inst_mode > 0)
+        && "mark_pursuit_gain in [1, 3], != 1 needs inst_mode > 0");
     assert((env->mark_bitten_reward == 0.0f || env->inst_mode > 0) && "mark_bitten_reward needs inst_mode > 0 (a marked victim)");
     assert((env->inst_danger_obs == 0 || (env->inst_danger_obs == 1 && env->inst_obs && env->inst_mode > 0))
         && "inst_danger_obs needs inst_obs 1 and inst_mode > 0 (the danger level is the institution's)");
@@ -4867,6 +4893,7 @@ static void wef_log_inst_tail(Log* log, Dict* out) {
     dict_set(out, "enf_premium_n", log->enf_premium_n);
     dict_set(out, "enf_gini_n", log->enf_gini_n);
     dict_set(out, "danger_mean", log->danger_mean);
+    dict_set(out, "pursuit_frac", log->pursuit_frac);
 }
 
 // The rest of the AH keys (off the 30-key live dashboard in the AH build, in the [metrics] series).
