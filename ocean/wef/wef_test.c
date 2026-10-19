@@ -2970,6 +2970,74 @@ static void test_inst_danger(void) {
     dict_clear(&kw0);
 }
 
+// U37 (probe keys): inst_mask_marks zeroes the mark slots while the marks act; mark_bitten_reward reaches a marked victim only.
+static void test_inst_probe_keys(void) {
+    printf("-- INST U37: inst_mask_marks and mark_bitten_reward\n");
+    const int SLOT_OWN = OBS_BASE_SIZE + 1;
+    const int SLOT_OTHER0 = OBS_BASE_SIZE + 2;
+    Dict kw = {0};
+    kw_inst_test(&kw, AH_FISH, 0);
+    dict_set(&kw, "inst_mark_until_zap", 1);
+    dict_set(&kw, "inst_mask_marks", 1);
+    dict_set(&kw, "mark_bitten_reward", -2.0);
+    Harness h = make(&kw, AH_FISH);
+    Env* env = h.env;
+    clear_objects(env);
+    ah_park(&h, 0);
+    for (int i = 0; i < AH_FISH; i++) {
+        ah_still(&h, i);
+    }
+    int b = AH_FISH / 2;
+    env->fish[b].mark = 64;                        // b marked by hand
+    place_fish(env, b, 10.0f, 20.0f, 0.0f);
+    place_fish(env, 0, 7.5f, 20.0f, 0.0f);         // fish 0 right behind b, facing it
+    puf_step(env);
+    CHECK(env->fish[b].mark == 64 && h.obs[b * OBS_SIZE + SLOT_OWN] == 0.0f,
+        "masked: b is marked (%d) but its own-mark slot reads 0", env->fish[b].mark);
+    bool others_zero = true;
+    for (int k = 0; k < MAX_AGENTS - 1; k++) {
+        others_zero = others_zero && h.obs[0 * OBS_SIZE + SLOT_OTHER0 + k] == 0.0f;
+    }
+    CHECK(others_zero, "masked: fish 0 next to the marked b reads 0 in every other-mark slot");
+    float before = env->agents[b].rewards[0];
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    puf_step(env);
+    ah_still(&h, 0);
+    CHECK(env->fish[0].bite_victim == b && env->zaps_on_marked == 1, "fish 0 zaps the marked b");
+    CHECK(env->agents[b].rewards[0] <= before - 2.0f + 1e-6f + 1.0f,
+        "the marked victim received mark_bitten_reward -2 (step reward %.3f)", env->agents[b].rewards[0]);
+    // an unmarked victim gets nothing extra
+    env->fish[b].mark = 0;
+    env->fish[b].freeze = 0;                       // the first zap froze b (immune while frozen)
+    env->fish[0].bite_cooldown = 0;
+    place_fish(env, 0, 7.5f, 20.0f, 0.0f);
+    float r_before = env->agents[b].rewards[0];
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+    puf_step(env);
+    ah_still(&h, 0);
+    CHECK(env->fish[0].bite_victim == b && env->agents[b].rewards[0] > r_before - 2.0f + 0.5f,
+        "an unmarked victim is bitten without the felt sanction (step reward %.3f)", env->agents[b].rewards[0]);
+    destroy(&h);
+    dict_clear(&kw);
+    // defaults: slots filled, no extra reward
+    Dict kw0 = {0};
+    kw_inst_test(&kw0, AH_FISH, 0);
+    dict_set(&kw0, "inst_mark_until_zap", 1);
+    Harness h0 = make(&kw0, AH_FISH);
+    clear_objects(h0.env);
+    ah_park(&h0, 0);
+    for (int i = 0; i < AH_FISH; i++) {
+        ah_still(&h0, i);
+    }
+    h0.env->fish[b].mark = 64;
+    place_fish(h0.env, b, 10.0f, 20.0f, 0.0f);
+    place_fish(h0.env, 0, 7.5f, 20.0f, 0.0f);
+    puf_step(h0.env);
+    CHECK(h0.obs[b * OBS_SIZE + SLOT_OWN] == 1.0f, "default: the own-mark slot of a persistently marked fish reads 1 (%.2f)", h0.obs[b * OBS_SIZE + SLOT_OWN]);
+    destroy(&h0);
+    dict_clear(&kw0);
+}
+
 static void test_inst_duty(void) {
     printf("-- INST U29: duty to enforce (inst_duty_cm / inst_duty_steps)\n");
     Dict kw = {0};
@@ -3473,12 +3541,13 @@ static void test_inst(void) {
     test_inst_freeze_scope();
     test_inst_free_riding();
     test_inst_danger();
+    test_inst_probe_keys();
     test_inst_reach();
     test_inst_mark_signature();
 }
 #else
 static void test_inst(void) {
-    printf("-- INST U13-U36: skipped (needs the -DWEF_INST build)\n");
+    printf("-- INST U13-U37: skipped (needs the -DWEF_INST build)\n");
 }
 #endif
 
