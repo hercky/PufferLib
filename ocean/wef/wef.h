@@ -437,6 +437,7 @@ struct Log {
     float enf_gini_n;        // 1 if the episode had a zap on a marked fish (enf_gini defined)
     float danger_mean;       // D22: time-mean of marked fish / N (the public danger level), zero unless inst_mode > 0
     float pursuit_frac;      // pursuit bonus: fish-steps with the speed bonus active / fish-steps (0 unless mark_pursuit_gain != 1)
+    float near_frac;         // D27 proximity diagnostic: fish-steps with mark_near_reward paid / fish-steps (0 unless mark_near_reward != 0)
     float n;
 };
 
@@ -798,6 +799,13 @@ struct Env {
     float mark_pursuit_gain;    // pursuit bonus (2026-10-20): an UNMARKED, unfrozen fish with a marked fish within MORM_AGENT_RANGE_CM moves
                                 // this many times its normal distance per step (1 = off); the marked fish is unchanged (enforcer-side, not a sanction)
     int pursuit_steps;          // per-episode fish-steps with the bonus active (Log pursuit_frac)
+    int mark_fixed_n;           // D27 capability ladder (2026-10-20): the top n slots carry a PERMANENT mark: set to inst_mark_steps at reset
+                                // and after every step, never cleared by a zap (the zap still pays mark_zap_reward and freezes per mark_freeze_steps);
+                                // 0 = off. Needs inst_mode > 0 and inst_mark_steps > 0.
+    float mark_near_reward;     // D27 diagnostic (chase without the bite): reward per step to an UNMARKED, unfrozen fish with a marked fish
+                                // within mark_near_cm (0 = off; never a mechanism, a probe of whether approach is learnable)
+    float mark_near_cm;         // ... the radius in cm (default 5)
+    int near_steps;             // per-episode fish-steps with the proximity reward paid (Log near_frac)
     int mark_frozen_biteable;   // positive control (2026-10-19): 1 = a frozen fish that is MARKED stays biteable (a stationary sanction target); unmarked frozen fish stay immune
     int inst_mask_marks;        // probe (2026-10-19): 1 = the own-mark and others'-mark slots read 0 (the marks still exist); eval-only perception test
     float mark_bitten_reward;   // probe: reward added to a MARKED victim when a bite lands on it (a felt sanction; D11-compatible); 0 = off
@@ -1738,6 +1746,7 @@ void puf_reset(Wef* env) {
     env->marked_steps = 0;
     env->danger_sum = 0.0f;
     env->pursuit_steps = 0;
+    env->near_steps = 0;
     env->pair_steps = 0;
     env->pair_marked_steps = 0;
     env->informed_steps = 0;
@@ -2026,6 +2035,13 @@ void puf_reset(Wef* env) {
         fflush(env->obj_file);
     }
 
+    // D27: the permanently marked slots carry their mark from the first observation on
+    for (int i = 0; env->mark_fixed_n > 0 && i < env->num_agents; i++) {
+        if (i >= env->num_agents - env->mark_fixed_n) {
+            env->fish[i].mark = env->inst_mark_steps;
+        }
+    }
+
     compute_observations(env);
 }
 
@@ -2177,6 +2193,14 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     // bot_respond_zaps times, then it is a complier for the rest of the episode (the simplest model of
     // a learner that deterrence can reach). The wrongful biter is a complier that bites the nearest
     // fish in range, marked or not, whenever it can (the deviation inst_mark_wrongful classifies).
+    if (role == 17) {
+        // stationary fish (D27 capability ladder, the positive control): never moves or turns, emits every step, never bites
+        raw[0] = -30.0f;
+        raw[1] = 0.0f;
+        raw[2] = 1.0f;
+        raw[3] = -1.0f;
+        return;
+    }
     bool inst_role = env->inst_mode > 0 && role >= 13 && role <= 16;
     bool enforcer = inst_role && (role == 14 || role == 16);
     bool hunt_any = inst_role && role == 16;
@@ -3108,8 +3132,8 @@ void puf_step(Wef* env) {
                 env->agents[i].rewards[0] += env->mark_zap_reward;
                 env->bounty_sum += env->mark_zap_reward;
                 env->agents[victim].rewards[0] += env->mark_bitten_reward;  // the felt sanction (probe), 0 by default
-                if (env->inst_mark_until_zap) {
-                    env->fish[victim].mark = 0;  // the sanction clears the label (phase 3, D11)
+                if (env->inst_mark_until_zap && !(env->mark_fixed_n > 0 && victim >= env->num_agents - env->mark_fixed_n)) {
+                    env->fish[victim].mark = 0;  // the sanction clears the label (phase 3, D11); a D27 fixed mark stays
                 }
             } else if (env->inst_mode > 0 && env->inst_mark_wrongful) {
                 // phase 3 (D12): punishing against the classification is itself a violation; the
@@ -3585,10 +3609,30 @@ void puf_step(Wef* env) {
         env->frozen_steps += env->fish[i].freeze > 0;
     }
     for (int i = 0; i < env->num_agents; i++) {
+        if (env->mark_near_reward != 0.0f && env->inst_mode > 0 && env->fish[i].mark <= 0 && env->fish[i].freeze <= 0) {
+            // D27 proximity diagnostic: an unmarked, unfrozen fish with a marked fish within mark_near_cm earns the reward this step
+            bool near_marked = false;
+            float r2 = env->mark_near_cm * env->mark_near_cm;
+            for (int j = 0; j < env->num_agents && !near_marked; j++) {
+                if (j == i || env->fish[j].mark <= 0) {
+                    continue;
+                }
+                float dx = env->fish[j].pos.x - env->fish[i].pos.x;
+                float dy = env->fish[j].pos.y - env->fish[i].pos.y;
+                near_marked = dx * dx + dy * dy <= r2;
+            }
+            if (near_marked) {
+                env->agents[i].rewards[0] += env->mark_near_reward;
+                env->near_steps++;
+            }
+        }
         env->fish[i].eat_cooldown -= env->fish[i].eat_cooldown > 0;
         env->fish[i].bite_cooldown -= env->fish[i].bite_cooldown > 0;
         env->fish[i].freeze -= env->fish[i].freeze > 0;
         env->fish[i].mark -= env->fish[i].mark > 0 && !env->inst_mark_until_zap;
+        if (env->mark_fixed_n > 0 && i >= env->num_agents - env->mark_fixed_n) {
+            env->fish[i].mark = env->inst_mark_steps;  // D27: a permanent mark
+        }
         // Raw (pre-mixing, pre-shaping) per-fish return: what the metrics report.
         env->return_by[i] += env->agents[i].rewards[0];
         env->raw_return_sum += env->agents[i].rewards[0];
@@ -3781,6 +3825,7 @@ void puf_step(Wef* env) {
             env->log.marked_frac += (float)env->marked_steps / fish_steps;
             env->log.danger_mean += env->danger_sum / (float)env->episode_length;
             env->log.pursuit_frac += (float)env->pursuit_steps / fish_steps;
+            env->log.near_frac += (float)env->near_steps / fish_steps;
             env->log.marked_exposure += env->pair_steps > 0
                 ? (float)env->pair_marked_steps / (float)env->pair_steps : 0.0f;
             env->log.zaps_on_marked += (float)env->zaps_on_marked;
@@ -4463,6 +4508,7 @@ static const char* WEF_ENV_KEYS[] = {
     "inst_mode", "inst_obs", "inst_fixed_type", "inst_theta", "inst_hyst", "inst_flip_steps",
     "inst_mark_steps", "mark_zap_reward", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
     "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_frozen_biteable", "mark_pursuit_gain", "act_slow_steps", "act_slow_gain", "mark_freeze_steps",
+    "mark_fixed_n", "mark_near_reward", "mark_near_cm",   // D27
     "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze",
     "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps", "inst_grace_steps", "inst_duty_mode",
     "inst_mark_contrast", "mark_bite_radius_cm", "mark_bite_angle_deg",   // D23
@@ -4610,6 +4656,9 @@ void puf_init(Env* env, Dict* kwargs) {
     env->inst_latch = wef_cfg(kwargs, "inst_latch", 1);
     env->inst_danger_obs = wef_cfg(kwargs, "inst_danger_obs", 0);
     env->inst_mask_marks = wef_cfg(kwargs, "inst_mask_marks", 0);
+    env->mark_fixed_n = wef_cfg(kwargs, "mark_fixed_n", 0);
+    env->mark_near_reward = wef_cfg(kwargs, "mark_near_reward", 0.0);
+    env->mark_near_cm = wef_cfg(kwargs, "mark_near_cm", 5.0);
     env->mark_frozen_biteable = wef_cfg(kwargs, "mark_frozen_biteable", 0);
     env->mark_pursuit_gain = wef_cfg(kwargs, "mark_pursuit_gain", 1.0);
     env->act_slow_steps = wef_cfg(kwargs, "act_slow_steps", 0);
@@ -4656,11 +4705,15 @@ void puf_init(Env* env, Dict* kwargs) {
     }
     assert(env->bot_shift_steps >= MAX_AGENTS);
     for (int i = 0; i < MAX_AGENTS; i++) {
-        assert(env->roles[i] >= 0 && env->roles[i] <= 16
-            && "roles: 0 policy, 1 cleaner, 2 eater, 3 shift, 4 random, 5 sustainable eater, 6 dense-first eater, 7 stock-threshold eater, 8 planter-own, 9 planter-majority, 10 free-rider, 11 zapper-planter, 12 opportunistic planter, 13 complier, 14 enforcer, 15 responsive defector, 16 wrongful biter");
+        assert(env->roles[i] >= 0 && env->roles[i] <= 17
+            && "roles: 0 policy, 1 cleaner, 2 eater, 3 shift, 4 random, 5 sustainable eater, 6 dense-first eater, 7 stock-threshold eater, 8 planter-own, 9 planter-majority, 10 free-rider, 11 zapper-planter, 12 opportunistic planter, 13 complier, 14 enforcer, 15 responsive defector, 16 wrongful biter, 17 stationary");
         assert((env->allelo || env->roles[i] <= 7 || env->roles[i] >= 13) && "roles 8-12 need allelo = 1");
-        assert((env->inst_mode > 0 || env->roles[i] < 13) && "roles 13-16 need inst_mode > 0");
+        assert((env->inst_mode > 0 || env->roles[i] < 13 || env->roles[i] == 17) && "roles 13-16 need inst_mode > 0");
     }
+    assert((env->mark_fixed_n == 0 || (env->inst_mode > 0 && env->inst_mark_steps > 0 && env->mark_fixed_n < env->num_agents))
+        && "mark_fixed_n needs inst_mode > 0, inst_mark_steps > 0 and fewer fixed slots than fish");
+    assert((env->mark_near_reward == 0.0f || env->inst_mode > 0) && "mark_near_reward needs inst_mode > 0 (marks to be near)");
+    assert(env->mark_near_cm > 0.0f && "mark_near_cm must be positive");
     assert(env->inst_mode >= 0 && env->inst_mode <= 4 && "inst_mode: 0 none, 1 public beacon, 2 private signals, 3 spurious rule, 4 rotating patch");
     assert((env->inst_mode != 4 || (!env->allelo && env->regrow_per_patch && env->num_patches == 2))
         && "inst_mode 4 (rotating patch) needs a Commons with regrow_per_patch 1 and num_patches 2");
@@ -4908,6 +4961,7 @@ static void wef_log_inst_tail(Log* log, Dict* out) {
     dict_set(out, "enf_gini_n", log->enf_gini_n);
     dict_set(out, "danger_mean", log->danger_mean);
     dict_set(out, "pursuit_frac", log->pursuit_frac);
+    dict_set(out, "near_frac", log->near_frac);
 }
 
 // The rest of the AH keys (off the 30-key live dashboard in the AH build, in the [metrics] series).

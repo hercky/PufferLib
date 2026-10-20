@@ -3170,6 +3170,104 @@ static void test_inst_pursuit(void) {
         "the marked fish (%.4f) and the far fish (%.4f) move as without the key", moved[1][1], moved[1][2]);
 }
 
+// U41-U43 (D27 capability ladder): mark_fixed_n (the top slot is marked at reset and stays marked after a zap, which still pays the
+// bounty; the other slots are unmarked; default = no mark), mark_near_reward / mark_near_cm (an unmarked fish within the radius of a
+// marked fish earns the reward each step; the marked fish and a far fish earn nothing; default = identical rewards), role 17 (a
+// stationary fish does not move and emits every step).
+static void test_inst_capability(void) {
+    printf("-- INST U41-U43: mark_fixed_n, mark_near_reward / mark_near_cm, role 17 (stationary)\n");
+    int b = AH_FISH - 1;
+    for (int on = 0; on < 2; on++) {                    // U41
+        Dict kw = {0};
+        kw_inst_test(&kw, AH_FISH, 0);
+        dict_set(&kw, "inst_mark_until_zap", 1);
+        dict_set(&kw, "mark_zap_reward", 10);
+        dict_set(&kw, "mark_freeze_steps", 0);
+        if (on) {
+            dict_set(&kw, "mark_fixed_n", 1);
+        }
+        Harness h = make(&kw, AH_FISH);
+        Env* env = h.env;
+        int m = env->inst_mark_steps;
+        CHECK(env->fish[b].mark == (on ? m : 0) && env->fish[0].mark == 0,
+            "at reset the top slot's mark is %d (expected %d) and slot 0's is %d (run %d)", env->fish[b].mark, on ? m : 0, env->fish[0].mark, on);
+        clear_objects(env);
+        ah_park(&h, 0);
+        for (int i = 0; i < AH_FISH; i++) {
+            ah_still(&h, i);
+        }
+        place_fish(env, b, 20.0f, 20.0f, 0.0f);
+        place_fish(env, 0, 17.5f, 20.0f, 0.0f);     // 2.5 cm behind the top slot, facing it: in the bite cone
+        set_action(&h, 0, -30.0f, 0.0f, 1.0f, 1.0f);   // bite
+        puf_step(env);
+        if (on) {
+            CHECK(env->fish[b].zapped_marked == 1 && env->agents[0].rewards[0] > 9.0f,
+                "the zap on the fixed-mark slot landed as a sanction (%d) and paid the bounty (%.3f)", env->fish[b].zapped_marked, env->agents[0].rewards[0]);
+            CHECK(env->fish[b].mark == m && env->fish[b].freeze == 0,
+                "after the zap the fixed mark stays (%d) and mark_freeze_steps 0 leaves the target unfrozen (%d)", env->fish[b].mark, env->fish[b].freeze);
+            for (int t = 0; t < 3; t++) {
+                puf_step(env);
+            }
+            CHECK(env->fish[b].mark == m && env->fish[0].mark == 0 && env->fish[1].mark == 0,
+                "three steps later the fixed mark is still %d and the other slots are unmarked", env->fish[b].mark);
+        } else {
+            CHECK(env->fish[b].zapped_marked == 0 && env->fish[b].mark == 0, "without the key the top slot is an ordinary unmarked fish (zapped_marked %d, mark %d)", env->fish[b].zapped_marked, env->fish[b].mark);
+        }
+        destroy(&h);
+        dict_clear(&kw);
+    }
+    float rew[2][3];
+    for (int on = 0; on < 2; on++) {                    // U42
+        Dict kw = {0};
+        kw_inst_test(&kw, AH_FISH, 0);
+        dict_set(&kw, "inst_mark_until_zap", 1);
+        if (on) {
+            dict_set(&kw, "mark_near_reward", 0.5);
+            dict_set(&kw, "mark_near_cm", 5.0);
+        }
+        Harness h = make(&kw, AH_FISH);
+        Env* env = h.env;
+        clear_objects(env);
+        ah_park(&h, 0);
+        for (int i = 0; i < AH_FISH; i++) {
+            ah_still(&h, i);
+        }
+        env->fish[b].mark = 64;
+        place_fish(env, b, 20.0f, 20.0f, 0.0f);     // marked
+        place_fish(env, 0, 16.0f, 20.0f, 0.0f);     // 4 cm away: within mark_near_cm 5
+        place_fish(env, 1, 40.0f, 30.0f, 0.0f);     // far
+        puf_step(env);
+        rew[on][0] = env->agents[0].rewards[0];
+        rew[on][1] = env->agents[b].rewards[0];
+        rew[on][2] = env->agents[1].rewards[0];
+        if (on) {
+            CHECK(env->near_steps == 1, "the proximity reward counted one fish-step (%d)", env->near_steps);
+        }
+        destroy(&h);
+        dict_clear(&kw);
+    }
+    CHECK(fabsf((rew[1][0] - rew[0][0]) - 0.5f) < 1e-5f, "the unmarked fish 4 cm from a marked fish earns +0.5 (%.4f vs %.4f)", rew[1][0], rew[0][0]);
+    CHECK(fabsf(rew[1][1] - rew[0][1]) < 1e-6f && fabsf(rew[1][2] - rew[0][2]) < 1e-6f,
+        "the marked fish (%.4f) and the far fish (%.4f) earn as without the key", rew[1][1], rew[1][2]);
+    {                                                   // U43
+        Dict kw = {0};
+        kw_inst_test(&kw, AH_FISH, 0);
+        Harness h = make(&kw, AH_FISH);
+        Env* env = h.env;
+        clear_objects(env);
+        ah_park(&h, 0);
+        for (int i = 0; i < AH_FISH; i++) {
+            ah_still(&h, i);
+        }
+        float raw[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        env->roles[0] = 17;
+        wef_bot_action(env, 0, raw);
+        CHECK(raw[0] < -20.0f && raw[1] == 0.0f && raw[2] > 0.0f && raw[3] < 0.0f, "role 17 asks for no move, no turn, an EOD and no bite (%.1f %.1f %.1f %.1f)", raw[0], raw[1], raw[2], raw[3]);
+        destroy(&h);
+        dict_clear(&kw);
+    }
+}
+
 static void test_inst_duty(void) {
     printf("-- INST U29: duty to enforce (inst_duty_cm / inst_duty_steps)\n");
     Dict kw = {0};
@@ -3676,6 +3774,7 @@ static void test_inst(void) {
     test_inst_probe_keys();
     test_inst_frozen_biteable();
     test_inst_pursuit();
+    test_inst_capability();
     test_inst_reach();
     test_inst_mark_signature();
 }
