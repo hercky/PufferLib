@@ -309,6 +309,7 @@ typedef struct {
     float max_grad_norm;
     float clip_coef;
     float vf_clip_coef;
+    float reward_clip;   // per-step rewards are clamped to [-reward_clip, reward_clip] before the advantage (1.0 = upstream)
     float vf_coef;
     float ent_coef;
     float min_ent_coef_ratio;
@@ -1486,7 +1487,7 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
 
     clamp_precision_kernel<<<grid_size(
         numel(rollouts->rewards.shape)), BLOCK_SIZE, 0, stream>>>(
-        rollouts->rewards.data, -1.0f, 1.0f, numel(rollouts->rewards.shape));
+        rollouts->rewards.data, -hypers->reward_clip, hypers->reward_clip, numel(rollouts->rewards.shape));
 
     if (hypers->reset_every_horizon || src.initial_states.data == NULL) {
         cudaMemsetAsync(pufferl->train_state.data, 0,
@@ -1794,6 +1795,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         .max_grad_norm = puf_ini_get(ini, "train", "max_grad_norm"),
         .clip_coef = puf_ini_get(ini, "train", "clip_coef"),
         .vf_clip_coef = puf_ini_get(ini, "train", "vf_clip_coef"),
+        .reward_clip = puf_ini_get(ini, "train", "reward_clip"),
         .vf_coef = puf_ini_get(ini, "train", "vf_coef"),
         .ent_coef = puf_ini_get(ini, "train", "ent_coef"),
         .min_ent_coef_ratio = puf_ini_get(ini, "train", "min_ent_coef_ratio"),
