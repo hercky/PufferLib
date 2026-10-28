@@ -656,6 +656,35 @@ static void test_act_slow(void) {
     CHECK(fabsf(d[1][2] - d[0][2]) < 1e-6f, "a fish that did not eat is unaffected (%.4f vs %.4f)", d[1][2], d[0][2]);
 }
 
+// U44: bite_press_cost: a fish that presses bite loses the cost that step whether or not a bite lands (here nothing is in reach);
+// a fish that does not press loses nothing; default 0 = identical rewards.
+static void test_bite_press_cost(void) {
+    printf("-- U44: bite_press_cost\n");
+    float r[2][2];
+    for (int on = 0; on < 2; on++) {
+        Dict kw = {0};
+        kw_base(&kw, 2);
+        kw_harvest(&kw);
+        if (on) {
+            dict_set(&kw, "bite_press_cost", 0.05);
+        }
+        Harness h = make(&kw, 2);
+        Env* env = h.env;
+        clear_objects(env);
+        place_fish(env, 0, 10.0f, 10.0f, 0.0f);
+        place_fish(env, 1, 30.0f, 30.0f, 0.0f);     // far apart: no bite can land
+        set_action(&h, 0, -30.0f, 0.0f, 1.0f, 1.0f);   // presses bite
+        set_action(&h, 1, -30.0f, 0.0f, 1.0f, -1.0f);  // does not
+        puf_step(env);
+        r[on][0] = env->agents[0].rewards[0];
+        r[on][1] = env->agents[1].rewards[0];
+        destroy(&h);
+        dict_clear(&kw);
+    }
+    CHECK(fabsf((r[0][0] - r[1][0]) - 0.05f) < 1e-6f, "the pressing fish loses 0.05 with the key on (%.4f vs %.4f)", r[1][0], r[0][0]);
+    CHECK(fabsf(r[0][1] - r[1][1]) < 1e-7f, "the fish that does not press is unaffected (%.4f vs %.4f)", r[1][1], r[0][1]);
+}
+
 static void test_patchy_commons(void) {
     printf("-- commons regrowth inside the episode's patches\n");
     Dict kw = {0};
@@ -4285,6 +4314,7 @@ int main(int argc, char** argv) {
     test_seasonal();
     test_patchy_commons();
     test_act_slow();
+    test_bite_press_cost();
     test_baseline();
     // Allelopathic Harvest (design 7.1 U1-U10, the Log and the trace); U11 / U12 in run_test.sh
     test_ah_layout();

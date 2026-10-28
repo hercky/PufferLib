@@ -796,6 +796,8 @@ struct Env {
     int act_slow_steps;         // post-act slowdown (D26, 2026-10-20): for this many steps after a pellet eat or a planting conversion the
                                 // fish moves act_slow_gain x its normal distance per step (0 = off); applies to every fish, not a sanction
     float act_slow_gain;        // ... the factor (1 = off)
+    float bite_press_cost;      // (2026-10-28) reward taken from a fish on every step it presses bite (raw[3] > 0), landed or not, on cooldown
+                                // or not: makes the press deliberate (0 = off, upstream)
     float mark_pursuit_gain;    // pursuit bonus (2026-10-20): an UNMARKED, unfrozen fish with a marked fish within MORM_AGENT_RANGE_CM moves
                                 // this many times its normal distance per step (1 = off); the marked fish is unchanged (enforcer-side, not a sanction)
     int pursuit_steps;          // per-episode fish-steps with the bonus active (Log pursuit_frac)
@@ -2763,6 +2765,9 @@ void puf_step(Wef* env) {
         agent->emits_eod = raw_action[2] > 0.0f;
         agent->bite_action = raw_action[3] > 0.0f && agent->bite_cooldown <= 0
             && agent->freeze <= 0;
+        if (env->bite_press_cost != 0.0f && raw_action[3] > 0.0f) {
+            env->agents[i].rewards[0] -= env->bite_press_cost;  // the press itself costs, whether or not a bite lands
+        }
         if (agent->bite_action) {
             agent->bite_cooldown = BITE_COOLDOWN_STEPS;
         }
@@ -4509,6 +4514,7 @@ static const char* WEF_ENV_KEYS[] = {
     "inst_mark_steps", "mark_zap_reward", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
     "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_frozen_biteable", "mark_pursuit_gain", "act_slow_steps", "act_slow_gain", "mark_freeze_steps",
     "mark_fixed_n", "mark_near_reward", "mark_near_cm",   // D27
+    "bite_press_cost",
     "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze",
     "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps", "inst_grace_steps", "inst_duty_mode",
     "inst_mark_contrast", "mark_bite_radius_cm", "mark_bite_angle_deg",   // D23
@@ -4659,6 +4665,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->mark_fixed_n = wef_cfg(kwargs, "mark_fixed_n", 0);
     env->mark_near_reward = wef_cfg(kwargs, "mark_near_reward", 0.0);
     env->mark_near_cm = wef_cfg(kwargs, "mark_near_cm", 5.0);
+    env->bite_press_cost = wef_cfg(kwargs, "bite_press_cost", 0.0);
     env->mark_frozen_biteable = wef_cfg(kwargs, "mark_frozen_biteable", 0);
     env->mark_pursuit_gain = wef_cfg(kwargs, "mark_pursuit_gain", 1.0);
     env->act_slow_steps = wef_cfg(kwargs, "act_slow_steps", 0);
