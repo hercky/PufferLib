@@ -4274,8 +4274,10 @@ void puf_render(Wef* env) {
         float r = BODY_RADIUS_CM * scale;
         // a bite on a marked fish (a sanction) flashes blue, any other bite red
         Color bcol = env->client->bite_sanction[v] ? WEF_COLOR_SANCTION : WEF_COLOR_BITE;
-        DrawLineEx(bc, vc, 3.0f, ColorAlpha(bcol, a));
-        DrawRing(vc, r + 4.0f + 10.0f * (1.0f - a), r + 8.0f + 10.0f * (1.0f - a),
+        // the sanction ring sits outside the white mark square (radius + 7) so the two never overlap
+        float ring0 = env->client->bite_sanction[v] ? r + 12.0f : r + 4.0f;
+        DrawLineEx(bc, vc, env->client->bite_sanction[v] ? 5.0f : 3.0f, ColorAlpha(bcol, a));
+        DrawRing(vc, ring0 + 10.0f * (1.0f - a), ring0 + 5.0f + 10.0f * (1.0f - a),
             0.0f, 360.0f, 32, ColorAlpha(bcol, a));
     }
     for (int i = 0; i < env->num_agents; i++) {
