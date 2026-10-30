@@ -125,6 +125,7 @@ typedef float obs_t;
 #define WEF_COLOR_EOD_POS       ((Color){220, 60, 50, 255})
 #define WEF_COLOR_EOD_NEG       ((Color){60, 120, 255, 255})
 #define WEF_COLOR_BITE          ((Color){255, 70, 70, 255})
+#define WEF_COLOR_SANCTION      ((Color){80, 160, 255, 255})    // bite on a marked fish (blue flash)
 #define WEF_BITE_FLASH_FRAMES   30
 
 // Bite-selectivity metrics (Log): a fish is a "recent eater" for WEF_RECENT_STEPS after a
@@ -530,6 +531,7 @@ typedef struct Client {
     // Bite overlay: frames left of the victim's flash, who bit it, per-episode counts.
     int bite_flash[MAX_AGENTS];
     int bite_from[MAX_AGENTS];
+    int bite_sanction[MAX_AGENTS];   // 1 when the flashing bite landed on a MARKED fish (drawn blue, other bites red)
     int bites_given[MAX_AGENTS];
     int bites_taken[MAX_AGENTS];
     int bites_total;
@@ -4046,6 +4048,7 @@ void puf_render(Wef* env) {
         if (v >= 0) {
             c->bite_flash[v] = WEF_BITE_FLASH_FRAMES;
             c->bite_from[v] = i;
+            c->bite_sanction[v] = env->inst_mode > 0 && env->fish[v].mark > 0;
             c->bites_given[i]++;
             c->bites_taken[v]++;
             c->bites_total++;
@@ -4259,7 +4262,7 @@ void puf_render(Wef* env) {
         DrawCircleV(bp, br, rc);
         DrawText(label, (int)(bp.x + br + 8.0f), (int)(bp.y - 9.0f), 18, WEF_COLOR_TEXT);
     }
-    // Bites: red line biter -> victim and a fading red ring on the victim.
+    // Bites: a line biter -> victim and a fading ring on the victim; blue when the victim was marked (a sanction), red otherwise.
     for (int v = 0; v < env->num_agents; v++) {
         int f = env->client->bite_flash[v];
         if (f <= 0) {
@@ -4269,9 +4272,11 @@ void puf_render(Wef* env) {
         Vector2 vc = world_to_screen(env, env->fish[v].pos);
         Vector2 bc = world_to_screen(env, env->fish[env->client->bite_from[v]].pos);
         float r = BODY_RADIUS_CM * scale;
-        DrawLineEx(bc, vc, 3.0f, ColorAlpha(WEF_COLOR_BITE, a));
+        // a bite on a marked fish (a sanction) flashes blue, any other bite red
+        Color bcol = env->client->bite_sanction[v] ? WEF_COLOR_SANCTION : WEF_COLOR_BITE;
+        DrawLineEx(bc, vc, 3.0f, ColorAlpha(bcol, a));
         DrawRing(vc, r + 4.0f + 10.0f * (1.0f - a), r + 8.0f + 10.0f * (1.0f - a),
-            0.0f, 360.0f, 32, ColorAlpha(WEF_COLOR_BITE, a));
+            0.0f, 360.0f, 32, ColorAlpha(bcol, a));
     }
     for (int i = 0; i < env->num_agents; i++) {
         FishAgent* agent = &env->fish[i];
@@ -4414,7 +4419,7 @@ void puf_render(Wef* env) {
             line = TextFormat("%s   danger %d/%d", line, marked, env->num_agents);
         }
         DrawText(line, 20, 44, 18, WEF_COLOR_INST);
-        DrawText("body = taste (green A / magenta B) | white square = marked | X = frozen | yellow core = hold | tail square = rule read | crown = Queen",
+        DrawText("body = taste (green A / magenta B) | white square = marked | blue flash = bite on a marked fish, red = other bite | X = frozen | tail square = rule read | crown = Queen",
             20, 66, 13, WEF_COLOR_MIDGRAY);
     }
     if (env->allelo) {
