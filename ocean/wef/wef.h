@@ -53,6 +53,7 @@ typedef float obs_t;
 
 #define MAX_FOOD 64
 #define ACTION_SIZE 4
+#define WEF_FINES 8   // pending delayed charges per fish (inst_violation_cost_delay)
 // morm + amp + (knollen + metadata) per other fish + last action + 7 scalars:
 // 110 at MAX_AGENTS 4 (upstream), 162 at 8.
 #define OBS_BASE_SIZE (NUM_MORMYROMASTS + NUM_AMPULLARY + (NUM_KNOLLEN + 1) * (MAX_AGENTS - 1) + ACTION_SIZE + 7)
@@ -224,6 +225,7 @@ typedef struct FishAgent {
     int in_closed_steps;   // inst_mode 4: ... inside the closed patch's disk
     int closed_dwell;      // inst_mode 4 (inst_grace_steps > 0): steps spent inside the closed patch's disk, +1 per step
                            // inside, -1 per step outside (floor 0, cap 2 x grace), reset to 0 at every switch
+    int fine_due[WEF_FINES];  // inst_violation_cost_delay > 0: ticks at which a scheduled charge lands (0 = free slot)
     // duty to enforce (inst_duty_cm, plan 11.1 / D18b)
     int duty_target;       // the marked fish this fish must sanction, -1 none
     int duty_count;        // steps spent within inst_duty_cm of the target while able (not frozen)
@@ -773,6 +775,11 @@ struct Env {
     int inst_auto_freeze;       // learnability ablation: a violation freezes the violator on the spot for this many steps (0 = off)
     int auto_sanctions;         // per-episode counter of those direct sanctions
     int inst_auto_freeze_scope; // 0: every violation triggers inst_auto_freeze; 1: only second-order ones (wrongful bites, shirks)
+    float inst_violation_cost;  // (2026-11-01, compliance ladder C1/C2) reward taken from the violator for a first-order violation, by the
+                                // institution itself (no mark or biter needed); 0 = off
+    float inst_violation_cost_p;    // probability that a given violation is charged (1 = always)
+    int inst_violation_cost_delay;  // 0 = charged on the violating step; D > 0 = charged after a uniform random delay of 1..D steps
+    int fines;                  // per-episode counter of charges landed
     int inst_grace_steps;       // mode 4: 0 = an eat of a closed-patch pellet is the violation (one-step grace after a switch);
                                 // G > 0 = it is a violation only once the fish has dwelt in the closed disk for more than G
                                 // steps (closed_dwell; crossing the closed patch, or leaving it after a switch, is not a violation)
@@ -908,6 +915,8 @@ static inline bool wef_at_beacon(const Wef* env, const FishAgent* fish) {
     return dx * dx + dy * dy <= env->inst_read_cm * env->inst_read_cm;
 }
 
+float random_uniform(Wef* env, float low, float high);
+
 // A violation: mark the fish (public label) and count it. cls: 0 first-order (the rule-governed
 // act: a wrong planting, an eat while closed / in the closed patch), 1 a wrongful bite
 // (inst_mark_wrongful), 2 shirking a duty (inst_duty_cm). The trace carries cls + 1.
@@ -916,6 +925,26 @@ static inline void wef_inst_violation(Wef* env, int i, int cls) {
     env->violations++;
     fish->violations++;
     env->violations_first += cls == 0;
+    if (cls == 0 && env->inst_violation_cost != 0.0f
+            && (env->inst_violation_cost_p >= 1.0f || random_uniform(env, 0.0f, 1.0f) < env->inst_violation_cost_p)) {
+        // compliance ladder (docs/foundations-plan.md 4): the institution charges the violator itself, at once (C1) or after a
+        // random delay of 1..D steps (C2); the RNG is only touched when the key is on, so the default env is unchanged
+        if (env->inst_violation_cost_delay <= 0) {
+            env->agents[i].rewards[0] -= env->inst_violation_cost;
+            env->fines++;
+        } else {
+            int d = 1 + (int)random_uniform(env, 0.0f, (float)env->inst_violation_cost_delay);
+            if (d > env->inst_violation_cost_delay) {
+                d = env->inst_violation_cost_delay;
+            }
+            for (int s = 0; s < WEF_FINES; s++) {
+                if (fish->fine_due[s] == 0) {
+                    fish->fine_due[s] = env->tick + d;
+                    break;
+                }
+            }
+        }
+    }
     if (fish->trace_violated == 0 || cls + 1 < fish->trace_violated) {
         fish->trace_violated = cls + 1;  // two classes in one step: the trace keeps the lowest (first-order wins)
     }
@@ -1760,6 +1789,7 @@ void puf_reset(Wef* env) {
     env->bounty_sum = 0.0f;
     env->zaps_wrongful = 0;
     env->auto_sanctions = 0;
+    env->fines = 0;
     env->shirks = 0;
     env->duties = 0;
     env->duties_discharged = 0;
@@ -1781,6 +1811,9 @@ void puf_reset(Wef* env) {
         agent.last_eaten_slot = -1;
         agent.trace_planted_slot = -1;
         agent.duty_target = -1;
+        for (int s = 0; s < WEF_FINES; s++) {
+            agent.fine_due[s] = 0;
+        }
         // Size draw: exactly one random_uniform per fish in every mode, so the RNG stream of
         // the default path is unchanged. AH taste (0 = A, 1 = B) follows size: taste_n_a == -1
         // thresholds the free draw at taste_split; n >= 0 pins slots < n to band A and the rest
@@ -2767,6 +2800,15 @@ void puf_step(Wef* env) {
         agent->emits_eod = raw_action[2] > 0.0f;
         agent->bite_action = raw_action[3] > 0.0f && agent->bite_cooldown <= 0
             && agent->freeze <= 0;
+        if (env->inst_violation_cost_delay > 0) {
+            for (int s = 0; s < WEF_FINES; s++) {
+                if (agent->fine_due[s] != 0 && agent->fine_due[s] <= env->tick) {
+                    env->agents[i].rewards[0] -= env->inst_violation_cost;  // a delayed charge lands (C2)
+                    env->fines++;
+                    agent->fine_due[s] = 0;
+                }
+            }
+        }
         if (env->bite_press_cost != 0.0f && raw_action[3] > 0.0f) {
             env->agents[i].rewards[0] -= env->bite_press_cost;  // the press itself costs, whether or not a bite lands
         }
@@ -4521,7 +4563,7 @@ static const char* WEF_ENV_KEYS[] = {
     "inst_mark_steps", "mark_zap_reward", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
     "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_frozen_biteable", "mark_pursuit_gain", "act_slow_steps", "act_slow_gain", "mark_freeze_steps",
     "mark_fixed_n", "mark_near_reward", "mark_near_cm",   // D27
-    "bite_press_cost",
+    "bite_press_cost", "inst_violation_cost", "inst_violation_cost_p", "inst_violation_cost_delay",
     "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze",
     "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps", "inst_grace_steps", "inst_duty_mode",
     "inst_mark_contrast", "mark_bite_radius_cm", "mark_bite_angle_deg",   // D23
@@ -4683,6 +4725,9 @@ void puf_init(Env* env, Dict* kwargs) {
     env->bot_respond_zaps = wef_cfg(kwargs, "bot_respond_zaps", 1);
     env->inst_auto_freeze = wef_cfg(kwargs, "inst_auto_freeze", 0);
     env->inst_auto_freeze_scope = wef_cfg(kwargs, "inst_auto_freeze_scope", 0);
+    env->inst_violation_cost = wef_cfg(kwargs, "inst_violation_cost", 0.0);
+    env->inst_violation_cost_p = wef_cfg(kwargs, "inst_violation_cost_p", 1.0);
+    env->inst_violation_cost_delay = wef_cfg(kwargs, "inst_violation_cost_delay", 0);
     env->inst_grace_steps = wef_cfg(kwargs, "inst_grace_steps", 0);
     env->inst_duty_cm = wef_cfg(kwargs, "inst_duty_cm", 0.0);
     env->inst_duty_steps = wef_cfg(kwargs, "inst_duty_steps", 64);
@@ -4746,6 +4791,10 @@ void puf_init(Env* env, Dict* kwargs) {
     assert(env->inst_auto_freeze >= 0 && (env->inst_auto_freeze == 0 || env->inst_mode > 0)
         && "inst_auto_freeze needs inst_mode > 0");
     assert(env->inst_grace_steps >= 0 && "inst_grace_steps >= 0 (inert unless inst_mode 4, so a preset can carry it into the control arm)");
+    assert(env->inst_violation_cost >= 0.0f && (env->inst_violation_cost == 0.0f || env->inst_mode > 0)
+        && "inst_violation_cost needs inst_mode > 0");
+    assert(env->inst_violation_cost_p >= 0.0f && env->inst_violation_cost_p <= 1.0f && env->inst_violation_cost_delay >= 0
+        && "inst_violation_cost_p in [0, 1], inst_violation_cost_delay >= 0");
     assert((env->inst_auto_freeze_scope == 0 || (env->inst_auto_freeze_scope == 1 && env->inst_auto_freeze > 0))
         && "inst_auto_freeze_scope: 0 every violation, 1 second-order only (needs inst_auto_freeze > 0)");
     assert(env->inst_duty_cm >= 0.0f && env->inst_duty_steps > 0

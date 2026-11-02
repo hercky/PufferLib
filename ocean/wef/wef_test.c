@@ -685,6 +685,65 @@ static void test_bite_press_cost(void) {
     CHECK(fabsf(r[0][1] - r[1][1]) < 1e-7f, "the fish that does not press is unaffected (%.4f vs %.4f)", r[1][1], r[0][1]);
 }
 
+static void test_violation_cost(void) {
+    printf("-- U45: inst_violation_cost (compliance ladder C1 / C2)\n");
+    // C1: charged on the spot
+    {
+        Dict kw = {0};
+        kw_base(&kw, 4);
+        kw_inst_commons_rot(&kw);
+        dict_set(&kw, "inst_violation_cost", 5.0);
+        Harness h = make(&kw, 4);
+        Env* env = h.env;
+        env->agents[0].rewards[0] = 0.0f;
+        wef_inst_violation(env, 0, 0);
+        CHECK(fabsf(env->agents[0].rewards[0] + 5.0f) < 1e-6f, "an immediate charge of 5 lands on the violating step (%.3f)", env->agents[0].rewards[0]);
+        CHECK(env->fines == 1, "one fine counted (%d)", env->fines);
+        env->agents[0].rewards[0] = 0.0f;
+        wef_inst_violation(env, 0, 1);
+        CHECK(env->agents[0].rewards[0] == 0.0f, "a second-order violation (wrongful bite) is not charged (%.3f)", env->agents[0].rewards[0]);
+        destroy(&h);
+        dict_clear(&kw);
+    }
+    // C2: delayed by 1..3 steps with p 1, never with p 0 (no food, no bites: the fine is the only reward)
+    for (int on = 1; on >= 0; on--) {
+        Dict kw = {0};
+        kw_base(&kw, 4);
+        kw_inst_commons_rot(&kw);
+        dict_set(&kw, "inst_violation_cost", 5.0);
+        dict_set(&kw, "inst_violation_cost_p", on ? 1.0 : 0.0);
+        dict_set(&kw, "inst_violation_cost_delay", 3);
+        Harness h = make(&kw, 4);
+        Env* env = h.env;
+        clear_objects(env);
+        place_fish(env, 0, 10.0f, 25.0f, 0.0f);
+        place_fish(env, 1, 40.0f, 25.0f, 0.0f);
+        place_fish(env, 2, 25.0f, 10.0f, 0.0f);
+        place_fish(env, 3, 25.0f, 40.0f, 0.0f);
+        for (int k = 0; k < 4; k++) {
+            set_action(&h, k, -30.0f, 0.0f, 1.0f, -1.0f);
+        }
+        env->agents[0].rewards[0] = 0.0f;
+        wef_inst_violation(env, 0, 0);
+        CHECK(env->agents[0].rewards[0] == 0.0f, "p %d: nothing is charged on the violating step itself (%.3f)", on, env->agents[0].rewards[0]);
+        int landed = 0; float total = 0.0f;
+        for (int t = 0; t < 5; t++) {
+            puf_step(env);
+            if (env->agents[0].rewards[0] < -4.0f) {
+                landed++;
+            }
+            total += env->agents[0].rewards[0];
+        }
+        if (on) {
+            CHECK(landed == 1 && fabsf(total + 5.0f) < 1e-4f, "p 1: exactly one charge of 5 lands within the delay window (landed %d, total %.3f)", landed, total);
+        } else {
+            CHECK(landed == 0 && fabsf(total) < 1e-4f, "p 0: no charge ever lands (landed %d, total %.3f)", landed, total);
+        }
+        destroy(&h);
+        dict_clear(&kw);
+    }
+}
+
 static void test_patchy_commons(void) {
     printf("-- commons regrowth inside the episode's patches\n");
     Dict kw = {0};
@@ -4315,6 +4374,11 @@ int main(int argc, char** argv) {
     test_patchy_commons();
     test_act_slow();
     test_bite_press_cost();
+#ifdef WEF_INST
+    test_violation_cost();
+#else
+    printf("-- U45: skipped (needs the -DWEF_INST build)\n");
+#endif
     test_baseline();
     // Allelopathic Harvest (design 7.1 U1-U10, the Log and the trace); U11 / U12 in run_test.sh
     test_ah_layout();
