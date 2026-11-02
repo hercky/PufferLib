@@ -208,6 +208,29 @@ static void kw_inst_commons_rot(Dict* kw) {
     dict_set(kw, "bitten_freeze_steps", 25);
 }
 
+// preset=inst_commons_single: the single Commons (scripts/inst_commons_single.args, 2026-11-02): the frozen fish design
+// (docs/foundations-plan.md 1) on a 40 x 40 arena with ONE centred patch (patch_layout 2) of r 8.5 cm (the area of the
+// rotating preset's two r 6 patches), K 64 in one per-patch stock, regrow_p_max 0.02 / allee 0.2, no rule (inst_mode 0).
+static void kw_inst_commons_single(Dict* kw) {
+    kw_inst_commons_rot(kw);
+    dict_set(kw, "min_arena_width", 40);
+    dict_set(kw, "max_arena_width", 40);
+    dict_set(kw, "min_arena_height", 40);
+    dict_set(kw, "max_arena_height", 40);
+    dict_set(kw, "num_patches", 1);
+    dict_set(kw, "patch_radius", 8.5);
+    dict_set(kw, "patch_layout", 2);
+    dict_set(kw, "regrow_p_max", 0.02);
+    dict_set(kw, "inst_mode", 0);
+    dict_set(kw, "inst_grace_steps", 5);
+    dict_set(kw, "inst_mark_steps", 0);
+    dict_set(kw, "inst_mark_until_zap", 0);
+    dict_set(kw, "inst_mark_wrongful", 0);
+    dict_set(kw, "mark_freeze_steps", 0);
+    dict_set(kw, "bitten_freeze_steps", 0);
+    dict_set(kw, "bite_press_cost", 0.5);
+}
+
 // shape=conv: the AH-conv keys on top of kw_allelo (paper cubic F, hold 8, 2048 steps).
 static void kw_allelo_conv(Dict* kw) {
     dict_set(kw, "ripen_lin", 1.7e-3);
@@ -870,6 +893,83 @@ static void test_patchy_commons(void) {
         e3->patch_center[0].x, e3->patch_center[0].y, e3->patch_center[1].x, e3->patch_center[1].y,
         e3->arena_size_x, e3->arena_size_y, out3);
     dict_clear(&kw3);
+}
+
+// U48 (2026-11-02): the single Commons: patch_layout 2 puts the one patch at the arena centre, every pellet inside it,
+// and regrow_per_patch with ONE patch is the whole stock (K_p = K): logistic regrowth inside the disk, Allee collapse
+// of the patch = collapse of the episode.
+static void test_single_commons(void) {
+    printf("-- U48: single Commons (patch_layout 2, regrow_per_patch with one patch)\n");
+    Dict kw = {0};
+    kw_base(&kw, 1);
+    dict_set(&kw, "min_arena_width", 40);
+    dict_set(&kw, "max_arena_width", 40);
+    dict_set(&kw, "min_arena_height", 40);
+    dict_set(&kw, "max_arena_height", 40);
+    dict_set(&kw, "food_distribution", FOOD_PATCHY);
+    dict_set(&kw, "num_food", 64);
+    dict_set(&kw, "num_patches", 1);
+    dict_set(&kw, "patch_radius", 8.5);
+    dict_set(&kw, "patch_radius_std", 0);
+    dict_set(&kw, "patch_layout", 2);
+    dict_set(&kw, "regrow_mode", 2);
+    dict_set(&kw, "regrow_p_max", 0.02);
+    dict_set(&kw, "regrow_allee", 0.2);         // 12.8 of K 64
+    dict_set(&kw, "regrow_in_patches", 1);
+    dict_set(&kw, "regrow_per_patch", 1);
+    dict_set(&kw, "size_min", 0.5);
+    dict_set(&kw, "size_max", 0.5);
+    dict_set(&kw, "proximity_shaping", 0);
+    Harness h = make(&kw, 1);
+    Env* env = h.env;
+    bool centred = env->num_patches_ep == 1 && fabsf(env->patch_center[0].x - 20.0f) < 1e-4f
+        && fabsf(env->patch_center[0].y - 20.0f) < 1e-4f && fabsf(env->patch_radius_ep[0] - 8.5f) < 1e-4f;
+    bool inside = true;
+    for (int f = 0; f < env->num_food; f++) {
+        inside = inside && env->food_patch[f] == 0 && env->food[f].active && wef_in_patch(env, env->food[f].pos, 0);
+    }
+    CHECK(centred && inside && wef_patch_k(env, 0) == 64 && wef_patch_stock(env, 0) == 64,
+        "reset: one patch at (%.1f, %.1f) r %.1f in a 40 x 40 arena, all 64 pellets inside, K_p = S = 64",
+        env->patch_center[0].x, env->patch_center[0].y, env->patch_radius_ep[0]);
+    place_fish(env, 0, 3.0f, 3.0f, 0.0f);       // a corner, out of sensing range of the patch, still
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, -1.0f);
+    for (int f = 20; f < env->num_food; f++) {  // down to 20 > 12.8: the stock grows
+        env->food[f].active = false;
+    }
+    env->food_active = 20;
+    for (int t = 0; t < 100; t++) {
+        puf_step(env);
+    }
+    int s = wef_patch_stock(env, 0);
+    bool in_disk = true;
+    for (int f = 0; f < env->num_food; f++) {
+        in_disk = in_disk && (!env->food[f].active || wef_in_patch(env, env->food[f].pos, 0));
+    }
+    CHECK(s > 20 && in_disk && env->regrown == s - 20 && env->food_active == s && !env->patch_collapsed[0] && !env->collapsed,
+        "stock 20 -> %d in 100 steps, every regrown pellet inside the disk, no collapse", s);
+    int keep = 0;
+    for (int f = 0; f < env->num_food; f++) {   // down to 12 <= 12.8: the Allee threshold
+        if (env->food[f].active && keep < 12) {
+            keep++;
+        } else {
+            env->food[f].active = false;
+        }
+    }
+    env->food_active = 12;
+    puf_step(env);
+    CHECK(env->patch_collapsed[0] && env->collapsed && env->collapse_tick == env->tick,
+        "stock 12 <= 0.2 K: the patch and the episode collapse at tick %d", env->tick);
+    for (int t = 0; t < 50; t++) {
+        puf_step(env);
+    }
+    CHECK(env->food_active == 12 && env->regrown == s - 20, "no regrowth after the collapse");
+    while (env->episode == 0) {
+        puf_step(env);
+    }
+    CHECK(env->log.n == 1.0f && env->log.patches_collapsed == 1.0f && env->log.collapsed == 1.0f,
+        "Log: patches_collapsed %.0f, collapsed %.0f", env->log.patches_collapsed, env->log.collapsed);
+    destroy(&h);
+    dict_clear(&kw);
 }
 
 static void test_baseline(void) {
@@ -3917,7 +4017,7 @@ static void test_inst(void) {
 #endif
 
 // Calibration mode (E1): all fish scripted, so the whole thing runs on the CPU.
-//   wef_test roles=3,3,2,2 [episodes=100] [oracle=0] [preset=harvest|allelo] [shape=conv] [num_agents=N] [key=value ...]
+//   wef_test roles=3,3,2,2 [episodes=100] [oracle=0] [preset=harvest|allelo|inst_ah|inst_commons|inst_commons_rot|inst_commons_single] [shape=conv] [num_agents=N] [key=value ...]
 // Prints per-slot pellets / cleans / strip time per episode and episode-level
 // waste fraction and open fraction, in the scripts/cleanup.args preset.
 static int run_calibration(int argc, char** argv) {
@@ -3928,6 +4028,7 @@ static int run_calibration(int argc, char** argv) {
     bool inst_ah = false;
     bool inst_commons = false;
     bool inst_commons_rot = false;
+    bool inst_commons_single = false;
     bool conv = false;
     for (int a = 1; a < argc; a++) {
         if (strcmp(argv[a], "preset=harvest") == 0) {
@@ -3940,12 +4041,16 @@ static int run_calibration(int argc, char** argv) {
             inst_commons = true;
         } else if (strcmp(argv[a], "preset=inst_commons_rot") == 0) {
             inst_commons_rot = true;
+        } else if (strcmp(argv[a], "preset=inst_commons_single") == 0) {
+            inst_commons_single = true;
         } else if (strcmp(argv[a], "shape=conv") == 0) {
             conv = true;
         }
     }
     if (inst_ah) {
         kw_inst_ah(&kw);
+    } else if (inst_commons_single) {
+        kw_inst_commons_single(&kw);
     } else if (inst_commons_rot) {
         kw_inst_commons_rot(&kw);
     } else if (inst_commons) {
@@ -3965,7 +4070,8 @@ static int run_calibration(int argc, char** argv) {
     for (int a = 1; a < argc; a++) {
         if (strcmp(argv[a], "preset=harvest") == 0 || strcmp(argv[a], "preset=allelo") == 0
                 || strcmp(argv[a], "preset=inst_ah") == 0 || strcmp(argv[a], "preset=inst_commons") == 0
-                || strcmp(argv[a], "preset=inst_commons_rot") == 0 || strcmp(argv[a], "shape=conv") == 0) {
+                || strcmp(argv[a], "preset=inst_commons_rot") == 0 || strcmp(argv[a], "preset=inst_commons_single") == 0
+                || strcmp(argv[a], "shape=conv") == 0) {
             continue;
         }
         char key[64];
@@ -4418,6 +4524,7 @@ int main(int argc, char** argv) {
     test_patchy_commons();
     test_act_slow();
     test_bite_press_cost();
+    test_single_commons();
 #ifdef WEF_INST
     test_violation_cost();
     test_here_obs_and_bounty_anneal();

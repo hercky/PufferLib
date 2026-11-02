@@ -659,7 +659,7 @@ struct Env {
     float sustain_frac;         // metrics only: stock fraction at/below which eating counts as defecting
     int num_patches;            // patchy layout: patches per episode (0 = ceil(patch_density * area), upstream)
     int regrow_in_patches;      // commons (modes 2/3): regrown pellets land inside this episode's patches
-    int patch_layout;           // patchy layout: 0 centres drawn uniformly (upstream), 1 opposite corners (then the other two; the rest random)
+    int patch_layout;           // patchy layout: 0 centres drawn uniformly (upstream), 1 opposite corners (then the other two; the rest random), 2 the first patch at the arena centre (the rest random; single Commons)
     float bot_camp;             // scripted eaters: > 0 = with no pellet in range, circle the last eating spot at this radius (cm) instead of patrolling
     Vec2 patch_center[MAX_PATCHES];   // this episode's patches (patchy layout only)
     float patch_radius_ep[MAX_PATCHES];
@@ -1934,6 +1934,21 @@ void puf_reset(Wef* env) {
             1, MAX_PATCHES
         );
         for (int p = 0; p < num_patches; p++) {
+            if (env->patch_layout == 2 && p == 0) {
+                // patch_layout 2 (single Commons, 2026-11-02): the first patch sits at the arena
+                // centre (radius drawn first, as in layout 1); further patches are random.
+                radii[p] = clamp(
+                    env->patch_radius_cm + random_uniform(
+                        env, -env->patch_radius_std_cm, env->patch_radius_std_cm
+                    ),
+                    1.0f, max_radius
+                );
+                centers_x[p] = 0.5f * env->arena_size_x;
+                centers_y[p] = 0.5f * env->arena_size_y;
+                env->patch_center[p] = (Vec2){centers_x[p], centers_y[p]};
+                env->patch_radius_ep[p] = radii[p];
+                continue;
+            }
             if (env->patch_layout == 1 && p < 4) {
                 // patch_layout 1: the first two patches sit in opposite corners (bottom-left,
                 // top-right), the next two in the other corners, each inset by its radius plus
@@ -4906,11 +4921,11 @@ void puf_init(Env* env, Dict* kwargs) {
         && "regrow_mode 3 (seasonal) needs season_steps > 0 and cleanup = 0");
     env->regrows = env->regrow_p_max > 0.0f || env->regrow_mode == 3;
     assert(env->num_patches >= 0 && env->num_patches <= MAX_PATCHES);
-    assert(env->patch_layout == 0 || env->patch_layout == 1);
+    assert(env->patch_layout >= 0 && env->patch_layout <= 2);
     assert(env->regrow_per_patch == 0 || env->regrow_per_patch == 1);
     assert((!env->regrow_per_patch || (env->regrow_mode == 2 && env->food_distribution == FOOD_PATCHY
-            && env->regrow_in_patches && env->num_patches >= 2))
-        && "regrow_per_patch needs regrow_mode 2, food_distribution 1, regrow_in_patches 1 and num_patches >= 2");
+            && env->regrow_in_patches && env->num_patches >= 1))
+        && "regrow_per_patch needs regrow_mode 2, food_distribution 1, regrow_in_patches 1 and num_patches >= 1 (one patch = the single Commons)");
     assert((!env->regrow_in_patches || (env->regrow_mode >= 2 && env->food_distribution != FOOD_UNIFORM))
         && "regrow_in_patches needs a commons mode (2/3) and a patchy food layout");
     assert(env->regrow_radius_cm > 0.0f);
