@@ -766,6 +766,8 @@ struct Env {
     int inst_flip_steps;        // mode 3: AH flips the prescription every N steps; Commons toggles w.p. 1 / N per step
     int inst_mark_steps;        // violation mark duration (0 = no marks)
     float mark_zap_reward;      // bounty to the attacker for zapping a marked fish
+    float mark_zap_reward_anneal_steps;  // (2026-11-01, C3b scaffolding) env-steps per arena over which the bounty anneals linearly to 0 (0 = constant)
+    int inst_here_obs;          // (2026-11-01, C1b legibility) 1 = the danger slot instead reads +1 inside the CLOSED patch's disk, -1 inside the open one, 0 elsewhere (mode 4)
     int mark_zap_cooldown;      // attacker bite cooldown after zapping a marked fish (-1 = BITE_COOLDOWN_STEPS)
     int mark_freeze_steps;      // freeze of a MARKED victim (-1 = bitten_freeze_steps): the sanction the institution legitimates
     int inst_mark_until_zap;    // 1: a mark does not decay; it is cleared by the sanction (a bite on the marked fish)
@@ -1626,8 +1628,15 @@ void compute_observations(Wef* env) {
                 }
                 obs[obs_idx++] = m;
             }
-            // D22: the danger level as last read (0 unless inst_danger_obs; the slot is always written)
-            obs[obs_idx++] = env->inst_obs && env->inst_danger_obs ? agent->inst_danger : 0.0f;
+            // D22: the danger level as last read (0 unless inst_danger_obs; the slot is always written).
+            // C1b (inst_here_obs): the same slot carries where the fish stands relative to the rule: +1 inside the
+            // closed patch's disk, -1 inside the open one, 0 elsewhere (the cue the compliance ladder found missing)
+            float here = 0.0f;
+            if (env->inst_obs && env->inst_here_obs && env->inst_mode == 4 && env->num_patches_ep >= 2) {
+                here = wef_in_patch(env, agent->pos, 1 - env->inst_type) ? 1.0f
+                    : wef_in_patch(env, agent->pos, env->inst_type) ? -1.0f : 0.0f;
+            }
+            obs[obs_idx++] = env->inst_obs && env->inst_danger_obs ? agent->inst_danger : here;
         }
 #else
         (void)det;
@@ -2666,6 +2675,16 @@ float wef_clean_reward_eff(const Wef* env) {
     return env->clean_reward * frac;
 }
 
+// Institutions (C3b): the bounty for a bite on a marked fish, annealed like clean_reward (0 = constant).
+float wef_zap_reward_eff(const Wef* env) {
+    if (env->mark_zap_reward == 0.0f || env->mark_zap_reward_anneal_steps <= 0.0f) {
+        return env->mark_zap_reward;
+    }
+    float env_steps = (float)env->episode * (float)env->episode_length + (float)env->tick;
+    float frac = fmaxf(0.0f, 1.0f - env_steps / env->mark_zap_reward_anneal_steps);
+    return env->mark_zap_reward * frac;
+}
+
 // AH: private planting shaping (curriculum only), annealed like clean_reward.
 float wef_plant_reward_eff(const Wef* env) {
     if (env->plant_reward == 0.0f) {
@@ -3178,8 +3197,9 @@ void puf_step(Wef* env) {
                 attacker->zaps_marked++;
                 attacker->trace_zap_marked = true;
                 env->fish[victim].zapped_marked++;
-                env->agents[i].rewards[0] += env->mark_zap_reward;
-                env->bounty_sum += env->mark_zap_reward;
+                float bounty = wef_zap_reward_eff(env);
+                env->agents[i].rewards[0] += bounty;
+                env->bounty_sum += bounty;
                 env->agents[victim].rewards[0] += env->mark_bitten_reward;  // the felt sanction (probe), 0 by default
                 if (env->inst_mark_until_zap && !(env->mark_fixed_n > 0 && victim >= env->num_agents - env->mark_fixed_n)) {
                     env->fish[victim].mark = 0;  // the sanction clears the label (phase 3, D11); a D27 fixed mark stays
@@ -4560,7 +4580,7 @@ static const char* WEF_ENV_KEYS[] = {
     "bot_plant_theta", "bot_plant_max", "bot_plant_frac",
     // Institutions (docs/institutions-plan.md section 4)
     "inst_mode", "inst_obs", "inst_fixed_type", "inst_theta", "inst_hyst", "inst_flip_steps",
-    "inst_mark_steps", "mark_zap_reward", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
+    "inst_mark_steps", "mark_zap_reward", "mark_zap_reward_anneal_steps", "inst_here_obs", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
     "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_frozen_biteable", "mark_pursuit_gain", "act_slow_steps", "act_slow_gain", "mark_freeze_steps",
     "mark_fixed_n", "mark_near_reward", "mark_near_cm",   // D27
     "bite_press_cost", "inst_violation_cost", "inst_violation_cost_p", "inst_violation_cost_delay",
@@ -4702,6 +4722,8 @@ void puf_init(Env* env, Dict* kwargs) {
     env->inst_flip_steps = wef_cfg(kwargs, "inst_flip_steps", 0);
     env->inst_mark_steps = wef_cfg(kwargs, "inst_mark_steps", 0);
     env->mark_zap_reward = wef_cfg(kwargs, "mark_zap_reward", 0);
+    env->mark_zap_reward_anneal_steps = wef_cfg(kwargs, "mark_zap_reward_anneal_steps", 0);
+    env->inst_here_obs = wef_cfg(kwargs, "inst_here_obs", 0);
     env->mark_zap_cooldown = wef_cfg(kwargs, "mark_zap_cooldown", -1);
     env->mark_freeze_steps = wef_cfg(kwargs, "mark_freeze_steps", -1);
     env->inst_pos_random = wef_cfg(kwargs, "inst_pos_random", 0);
@@ -4795,6 +4817,9 @@ void puf_init(Env* env, Dict* kwargs) {
         && "inst_violation_cost needs inst_mode > 0");
     assert(env->inst_violation_cost_p >= 0.0f && env->inst_violation_cost_p <= 1.0f && env->inst_violation_cost_delay >= 0
         && "inst_violation_cost_p in [0, 1], inst_violation_cost_delay >= 0");
+    assert(env->mark_zap_reward_anneal_steps >= 0.0f && "mark_zap_reward_anneal_steps >= 0");
+    assert((env->inst_here_obs == 0 || (env->inst_here_obs == 1 && env->inst_mode == 4 && env->inst_obs && !env->inst_danger_obs))
+        && "inst_here_obs needs inst_mode 4, inst_obs 1 and inst_danger_obs 0 (it uses the danger slot)");
     assert((env->inst_auto_freeze_scope == 0 || (env->inst_auto_freeze_scope == 1 && env->inst_auto_freeze > 0))
         && "inst_auto_freeze_scope: 0 every violation, 1 second-order only (needs inst_auto_freeze > 0)");
     assert(env->inst_duty_cm >= 0.0f && env->inst_duty_steps > 0

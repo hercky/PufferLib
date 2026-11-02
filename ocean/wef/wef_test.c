@@ -744,6 +744,50 @@ static void test_violation_cost(void) {
     }
 }
 
+static void test_here_obs_and_bounty_anneal(void) {
+    printf("-- U46: inst_here_obs (where the fish stands relative to the rule) / U47: mark_zap_reward anneal\n");
+    {
+        Dict kw = {0};
+        kw_base(&kw, 4);
+        kw_inst_commons_rot(&kw);
+        dict_set(&kw, "inst_here_obs", 1);
+        Harness h = make(&kw, 4);
+        Env* env = h.env;
+        int closed = 1 - env->inst_type, open = env->inst_type;
+        place_fish(env, 0, env->patch_center[closed].x, env->patch_center[closed].y, 0.0f);
+        place_fish(env, 1, env->patch_center[open].x, env->patch_center[open].y, 0.0f);
+        place_fish(env, 2, 25.0f, 25.0f, 0.0f);
+        place_fish(env, 3, 25.0f, 30.0f, 0.0f);
+        for (int k = 0; k < 4; k++) {
+            set_action(&h, k, -30.0f, 0.0f, 1.0f, -1.0f);
+        }
+        puf_step(env);
+        int slot = OBS_SIZE - 1;
+        CHECK(env->agents[0].observations[slot] == 1.0f, "inside the closed patch the slot reads +1 (%.2f)", env->agents[0].observations[slot]);
+        CHECK(env->agents[1].observations[slot] == -1.0f, "inside the open patch it reads -1 (%.2f)", env->agents[1].observations[slot]);
+        CHECK(env->agents[2].observations[slot] == 0.0f, "outside both it reads 0 (%.2f)", env->agents[2].observations[slot]);
+        destroy(&h);
+        dict_clear(&kw);
+    }
+    {
+        Dict kw = {0};
+        kw_base(&kw, 4);
+        kw_inst_commons_rot(&kw);
+        dict_set(&kw, "mark_zap_reward", 10.0);
+        dict_set(&kw, "mark_zap_reward_anneal_steps", 2048);
+        Harness h = make(&kw, 4);
+        Env* env = h.env;
+        env->episode = 0; env->tick = 0;
+        CHECK(fabsf(wef_zap_reward_eff(env) - 10.0f) < 1e-6f, "bounty 10 at the start (%.3f)", wef_zap_reward_eff(env));
+        env->episode = 1; env->tick = 0;   // 1024 env-steps in
+        CHECK(fabsf(wef_zap_reward_eff(env) - 5.0f) < 1e-6f, "bounty 5 halfway through the anneal (%.3f)", wef_zap_reward_eff(env));
+        env->episode = 3;
+        CHECK(wef_zap_reward_eff(env) == 0.0f, "bounty 0 after the anneal (%.3f)", wef_zap_reward_eff(env));
+        destroy(&h);
+        dict_clear(&kw);
+    }
+}
+
 static void test_patchy_commons(void) {
     printf("-- commons regrowth inside the episode's patches\n");
     Dict kw = {0};
@@ -4376,6 +4420,7 @@ int main(int argc, char** argv) {
     test_bite_press_cost();
 #ifdef WEF_INST
     test_violation_cost();
+    test_here_obs_and_bounty_anneal();
 #else
     printf("-- U45: skipped (needs the -DWEF_INST build)\n");
 #endif
