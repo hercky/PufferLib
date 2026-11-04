@@ -768,6 +768,32 @@ static void test_violation_cost(void) {
     }
 }
 
+// U50 (2026-11-04): inst_auto_eat_ban: a violation bans the violator from eating on the spot (no freeze, no enforcer); default 0 = nothing.
+static void test_auto_eat_ban(void) {
+    printf("-- U50: inst_auto_eat_ban (the institution delivers the eating ban)\n");
+    for (int on = 0; on < 2; on++) {
+        Dict kw = {0};
+        kw_base(&kw, 4);
+        kw_inst_commons_single(&kw);
+        dict_set(&kw, "inst_mode", 1);
+        dict_set(&kw, "inst_auto_eat_ban", on ? 50 : 0);
+        Harness h = make(&kw, 4);
+        Env* env = h.env;
+        int before = env->auto_sanctions;
+        wef_inst_violation(env, 0, 0);
+        if (on) {
+            CHECK(env->fish[0].eat_ban == 50 && env->fish[0].freeze == 0 && env->auto_sanctions == before + 1,
+                "a violation bans the violator for 50 steps, no freeze, one automatic sanction (ban %d)", env->fish[0].eat_ban);
+            puf_step(env);
+            CHECK(env->fish[0].eat_ban == 49 && env->fish[1].eat_ban == 0, "the ban counts down; nobody else is banned");
+        } else {
+            CHECK(env->fish[0].eat_ban == 0 && env->auto_sanctions == before, "default: a violation sets no ban");
+        }
+        destroy(&h);
+        dict_clear(&kw);
+    }
+}
+
 static void test_here_obs_and_bounty_anneal(void) {
     printf("-- U46: inst_here_obs (where the fish stands relative to the rule) / U47: mark_zap_reward anneal\n");
     {
@@ -4617,6 +4643,7 @@ int main(int argc, char** argv) {
     test_eat_ban();
 #ifdef WEF_INST
     test_violation_cost();
+    test_auto_eat_ban();
     test_here_obs_and_bounty_anneal();
 #else
     printf("-- U45: skipped (needs the -DWEF_INST build)\n");
