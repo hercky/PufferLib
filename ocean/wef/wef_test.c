@@ -303,6 +303,7 @@ static void place_fish(Env* env, int i, float x, float y, float orientation) {
     env->fish[i].eat_cooldown = 0;
     env->fish[i].bite_cooldown = 0;
     env->fish[i].freeze = 0;
+    env->fish[i].eat_ban = 0;
 }
 
 static void clear_objects(Env* env) {
@@ -970,6 +971,94 @@ static void test_single_commons(void) {
         "Log: patches_collapsed %.0f, collapsed %.0f", env->log.patches_collapsed, env->log.collapsed);
     destroy(&h);
     dict_clear(&kw);
+}
+
+// U49 (2026-11-04): bitten_eat_ban_steps: a landed bite bans the victim from eating for N steps; it still moves, is not frozen,
+// can be bitten again (which restarts the ban), eats again once the ban is over; the Log's banned_frac counts the ban steps;
+// default 0 = no ban.
+static void test_eat_ban(void) {
+    printf("-- U49: eating ban after a bite (bitten_eat_ban_steps)\n");
+    Dict kw = {0};
+    kw_base(&kw, 4);
+    dict_set(&kw, "bitten_eat_ban_steps", 50);
+    Harness h = make(&kw, 4);
+    Env* env = h.env;
+    clear_objects(env);
+    env->food_active = 0;
+    place_fish(env, 2, 5.0f, 5.0f, 0.0f);
+    place_fish(env, 3, 35.0f, 35.0f, 0.0f);
+    place_fish(env, 0, 20.0f, 20.0f, 0.0f);
+    place_fish(env, 1, 22.0f, 20.0f, 0.0f);
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, 1.0f);     // fish 0 presses bite on fish 1, 2 cm ahead
+    set_action(&h, 1, -8.0f, 0.0f, 1.0f, -1.0f);
+    set_action(&h, 2, -8.0f, 0.0f, 1.0f, -1.0f);
+    set_action(&h, 3, -8.0f, 0.0f, 1.0f, -1.0f);
+    puf_step(env);
+    CHECK(env->bites == 1 && env->fish[0].bite_victim == 1 && env->fish[1].eat_ban == 49 && env->fish[1].freeze == 0,
+        "the bite lands: victim banned (50, counted down once at the end of the biting step like the freeze), not frozen (ban %d, freeze %d)",
+        env->fish[1].eat_ban, env->fish[1].freeze);
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, -1.0f);
+    env->food[0] = (FishFood){.pos = {23.5f, 20.0f}, .orientation = 0.0f, .active = true};   // 1.5 cm ahead of the victim
+    env->food_active = 1;
+    puf_step(env);
+    puf_step(env);
+    CHECK(env->food[0].active && !env->fish[1].ate && env->fish[1].eat_ban == 47,
+        "a pellet in its mouth stays uneaten while banned (ban now %d)", env->fish[1].eat_ban);
+    float x1 = env->fish[1].pos.x;
+    set_action(&h, 1, 8.0f, 0.0f, 1.0f, -1.0f);     // full thrust: a banned fish moves
+    puf_step(env);
+    CHECK(env->fish[1].pos.x > x1 + 0.5f, "a banned fish still moves (%.2f -> %.2f)", x1, env->fish[1].pos.x);
+    place_fish(env, 1, 22.0f, 20.0f, 0.0f);
+    env->fish[1].eat_ban = 47;
+    set_action(&h, 1, -8.0f, 0.0f, 1.0f, -1.0f);
+    for (int t = 0; t < 25; t++) {                  // the attacker's bite cooldown
+        puf_step(env);
+    }
+    place_fish(env, 0, 20.0f, 20.0f, 0.0f);
+    env->fish[1].pos = (Vec2){22.0f, 20.0f};
+    env->fish[1].orientation = 0.0f;
+    int ban_before = env->fish[1].eat_ban;
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, 1.0f);
+    puf_step(env);
+    set_action(&h, 0, -8.0f, 0.0f, 1.0f, -1.0f);
+    CHECK(env->bites == 2 && env->fish[1].eat_ban == 49 && ban_before > 0 && ban_before < 30,
+        "a second bite lands on the banned fish and restarts the ban (%d -> %d; bites %d)", ban_before, env->fish[1].eat_ban, env->bites);
+    env->food[0] = (FishFood){.pos = {23.5f, 20.0f}, .orientation = 0.0f, .active = true};
+    env->food_active = 1;
+    for (int t = 0; t < 48; t++) {
+        puf_step(env);
+    }
+    CHECK(env->food[0].active && env->fish[1].eat_ban == 1, "still banned with one step to go (%d)", env->fish[1].eat_ban);
+    puf_step(env);
+    CHECK(env->food[0].active && env->fish[1].eat_ban == 0, "the last banned step: 50 steps without eating in all");
+    puf_step(env);
+    CHECK(!env->food[0].active && env->fish[1].ate, "the ban is over and the pellet is eaten");
+    while (env->episode == 0) {
+        puf_step(env);
+    }
+    CHECK(env->log.n == 1.0f && env->log.banned_frac > 0.0f && env->log.frozen_frac == 0.0f,
+        "Log: banned_frac %.4f (> 0), frozen_frac 0", env->log.banned_frac);
+    destroy(&h);
+    dict_clear(&kw);
+    // default: no ban
+    Dict kw0 = {0};
+    kw_base(&kw0, 4);
+    Harness h0 = make(&kw0, 4);
+    env = h0.env;
+    clear_objects(env);
+    env->food_active = 0;
+    place_fish(env, 2, 5.0f, 5.0f, 0.0f);
+    place_fish(env, 3, 35.0f, 35.0f, 0.0f);
+    place_fish(env, 0, 20.0f, 20.0f, 0.0f);
+    place_fish(env, 1, 22.0f, 20.0f, 0.0f);
+    set_action(&h0, 0, -8.0f, 0.0f, 1.0f, 1.0f);
+    set_action(&h0, 1, -8.0f, 0.0f, 1.0f, -1.0f);
+    set_action(&h0, 2, -8.0f, 0.0f, 1.0f, -1.0f);
+    set_action(&h0, 3, -8.0f, 0.0f, 1.0f, -1.0f);
+    puf_step(env);
+    CHECK(env->bites == 1 && env->fish[1].eat_ban == 0, "default: a bite lands and no ban is set");
+    destroy(&h0);
+    dict_clear(&kw0);
 }
 
 static void test_baseline(void) {
@@ -4525,6 +4614,7 @@ int main(int argc, char** argv) {
     test_act_slow();
     test_bite_press_cost();
     test_single_commons();
+    test_eat_ban();
 #ifdef WEF_INST
     test_violation_cost();
     test_here_obs_and_bounty_anneal();

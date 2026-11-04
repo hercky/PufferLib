@@ -167,6 +167,7 @@ typedef struct FishAgent {
     bool collided;    // trace only: move reverted by a fish collision this step
     int bite_victim;  // trace and enf_* metrics: index of fish bitten this step, -1 if none
     int freeze;       // cleanup: steps left of the bitten timeout (0 unless bitten_freeze_steps > 0)
+    int eat_ban;      // steps left of an eating ban after being bitten (bitten_eat_ban_steps / mark_eat_ban_steps): it moves and can be bitten again
     bool can_clean;   // cleanup: false for enforced free-riders (no_clean_agents)
     int cleaned;      // trace only: waste items removed this step
     float trace_nearest_food;  // trace only: nearest active pellet this step, -1 if none
@@ -359,6 +360,7 @@ struct Log {
     float eater_frac;        // time-mean fraction of fish that are recent eaters
     float defector_frac;     // time-mean fraction of fish that are defectors
     float frozen_frac;       // fraction of fish-steps spent frozen (bitten_freeze_steps)
+    float banned_frac;       // fraction of fish-steps under an eating ban (bitten_eat_ban_steps / mark_eat_ban_steps)
     // Commons collapse (GovSim-style): regrowth modes 2 and 3.
     float collapsed;         // fraction of episodes in which the stock collapsed
     float survival_frac;     // collapse tick / episode length (1 if it never collapsed)
@@ -636,6 +638,7 @@ struct Env {
     float clean_reward;
     float clean_reward_anneal_steps;
     int bitten_freeze_steps;
+    int bitten_eat_ban_steps;   // a landed bite bans the victim from eating for this many steps (2026-11-04); it still moves and can be bitten again; a new bite restarts the ban
     float bitten_reward;
     float bite_reward;
     float eod_cost;
@@ -680,6 +683,7 @@ struct Env {
     int eater_steps;
     int defector_steps;
     int frozen_steps;
+    int banned_steps;           // fish-steps under an eating ban this episode
     Waste waste[MAX_WASTE];
     int waste_active;
     int food_active;
@@ -770,6 +774,7 @@ struct Env {
     int inst_here_obs;          // (2026-11-01, C1b legibility) 1 = the danger slot instead reads +1 inside the CLOSED patch's disk, -1 inside the open one, 0 elsewhere (mode 4)
     int mark_zap_cooldown;      // attacker bite cooldown after zapping a marked fish (-1 = BITE_COOLDOWN_STEPS)
     int mark_freeze_steps;      // freeze of a MARKED victim (-1 = bitten_freeze_steps): the sanction the institution legitimates
+    int mark_eat_ban_steps;     // eating ban of a MARKED victim (-1 = bitten_eat_ban_steps)
     int inst_mark_until_zap;    // 1: a mark does not decay; it is cleared by the sanction (a bite on the marked fish)
     int inst_mark_wrongful;     // 1: a bite on an UNMARKED fish is itself a violation (the biter is marked)
     int bot_respond_zaps;       // role 15: sanctions received while marked before the bot complies (default 1)
@@ -1606,7 +1611,7 @@ void compute_observations(Wef* env) {
                 eat_max = eat_max > env->plant_steps ? eat_max : env->plant_steps;
                 eat_max = eat_max > env->zap_steps ? eat_max : env->zap_steps;
             }
-            obs[obs_idx++] = agent->freeze > 0 ? 1.0f
+            obs[obs_idx++] = agent->freeze > 0 || agent->eat_ban > 0 ? 1.0f
                 : (float)agent->eat_cooldown / (float)eat_max;
         }
 #ifdef WEF_INST
@@ -1738,6 +1743,7 @@ void puf_reset(Wef* env) {
     env->eater_steps = 0;
     env->defector_steps = 0;
     env->frozen_steps = 0;
+    env->banned_steps = 0;
     env->collapsed = false;
     env->collapse_tick = 0;
     for (int p = 0; p < MAX_PATCHES; p++) {
@@ -2877,7 +2883,7 @@ void puf_step(Wef* env) {
 
         // Eat first active pellet in forward 45° cone within 2 cm (AH: first ripe bush; it
         // turns unripe in place and stays active, reward by taste)
-        if (!agent->bite_action && agent->eat_cooldown <= 0 && agent->freeze <= 0) {
+        if (!agent->bite_action && agent->eat_cooldown <= 0 && agent->freeze <= 0 && agent->eat_ban <= 0) {
             for (int f = 0; f < env->num_food; f++) {
                 if (!env->food[f].active) {
                     continue;
@@ -3201,6 +3207,13 @@ void puf_step(Wef* env) {
                     ? env->fish[victim].eat_cooldown : 0;
                 env->fish[victim].freeze = freeze_steps + hold;
                 env->freezes++;
+            }
+            // eating ban (2026-11-04): the victim keeps moving and stays biteable but cannot eat for
+            // ban_steps; a marked victim's ban is mark_eat_ban_steps when set; a new bite restarts it
+            int ban_steps = marked_victim && env->mark_eat_ban_steps >= 0
+                ? env->mark_eat_ban_steps : env->bitten_eat_ban_steps;
+            if (ban_steps > env->fish[victim].eat_ban) {
+                env->fish[victim].eat_ban = ban_steps;
             }
             if (env->cleanup && attacker->pos.x < env->strip_cm) {
                 env->bites_in_strip++;
@@ -3691,6 +3704,7 @@ void puf_step(Wef* env) {
         env->eater_steps += wef_recent(env, env->fish[i].eat_mark, WEF_RECENT_STEPS);
         env->defector_steps += wef_is_defector(env, &env->fish[i]);
         env->frozen_steps += env->fish[i].freeze > 0;
+        env->banned_steps += env->fish[i].eat_ban > 0;
     }
     for (int i = 0; i < env->num_agents; i++) {
         if (env->mark_near_reward != 0.0f && env->inst_mode > 0 && env->fish[i].mark <= 0 && env->fish[i].freeze <= 0) {
@@ -3713,6 +3727,7 @@ void puf_step(Wef* env) {
         env->fish[i].eat_cooldown -= env->fish[i].eat_cooldown > 0;
         env->fish[i].bite_cooldown -= env->fish[i].bite_cooldown > 0;
         env->fish[i].freeze -= env->fish[i].freeze > 0;
+        env->fish[i].eat_ban -= env->fish[i].eat_ban > 0;
         env->fish[i].mark -= env->fish[i].mark > 0 && !env->inst_mark_until_zap;
         if (env->mark_fixed_n > 0 && i >= env->num_agents - env->mark_fixed_n) {
             env->fish[i].mark = env->inst_mark_steps;  // D27: a permanent mark
@@ -3814,6 +3829,7 @@ void puf_step(Wef* env) {
             env->log.eater_frac += (float)env->eater_steps / fish_steps;
             env->log.defector_frac += (float)env->defector_steps / fish_steps;
             env->log.frozen_frac += (float)env->frozen_steps / fish_steps;
+            env->log.banned_frac += (float)env->banned_steps / fish_steps;
             env->log.collapsed += env->collapsed ? 1.0f : 0.0f;
             env->log.survival_frac += env->collapsed ? (float)env->collapse_tick / ticks : 1.0f;
             if (env->regrow_per_patch) {
@@ -4380,6 +4396,10 @@ void puf_render(Wef* env) {
             DrawLineEx((Vector2){center.x - d, center.y - d}, (Vector2){center.x + d, center.y + d}, 4.0f, (Color){30, 30, 30, 255});
             DrawLineEx((Vector2){center.x - d, center.y + d}, (Vector2){center.x + d, center.y - d}, 4.0f, (Color){30, 30, 30, 255});
         }
+        if (agent->eat_ban > 0) {
+            // banned from eating: an orange ring just outside the body
+            DrawRing(center, radius + 3.0f, radius + 5.5f, 0.0f, 360.0f, 48, ColorAlpha(WEF_COLOR_HOLD, 0.95f));
+        }
         if (agent->mark > 0) {
             float a = 0.5f + 0.5f * (float)agent->mark / (float)(env->inst_mark_steps > 0 ? env->inst_mark_steps : 1);
             float side = 2.0f * (radius + 7.0f);
@@ -4498,7 +4518,7 @@ void puf_render(Wef* env) {
             line = TextFormat("%s   danger %d/%d", line, marked, env->num_agents);
         }
         DrawText(line, 20, 44, 18, WEF_COLOR_INST);
-        DrawText("body = taste (green A / magenta B) | white square = marked | blue flash = bite on a marked fish, red = other bite | X = frozen | tail square = rule read | crown = Queen",
+        DrawText("body = taste (green A / magenta B) | white square = marked | blue flash = bite on a marked fish, red = other bite | X = frozen | orange ring = banned from eating | tail square = rule read | crown = Queen",
             20, 66, 13, WEF_COLOR_MIDGRAY);
     }
     if (env->allelo) {
@@ -4579,7 +4599,7 @@ static const char* WEF_ENV_KEYS[] = {
     "waste_sense_range_cm", "regrow_p_max", "regrow_mode", "regrow_allee", "season_steps",
     "season_growth", "regrow_radius_cm", "food_start", "clean_priority", "clean_radius_cm",
     "clean_max_items", "clean_cooldown_steps", "clean_reward", "clean_reward_anneal_steps",
-    "bitten_freeze_steps", "bitten_reward", "bite_reward", "eod_cost", "reward_share",
+    "bitten_freeze_steps", "bitten_eat_ban_steps", "bitten_reward", "bite_reward", "eod_cost", "reward_share",
     "proximity_shaping", "obs_extra", "size_min", "size_max", "desync_first_episode",
     "policy1_agents", "no_clean_agents", "roles", "bot_shift_steps", "bot_oracle", "bot_theta",
     "render_field", "render_field_alpha", "sustain_frac", "num_patches", "regrow_in_patches",
@@ -4596,7 +4616,7 @@ static const char* WEF_ENV_KEYS[] = {
     // Institutions (docs/institutions-plan.md section 4)
     "inst_mode", "inst_obs", "inst_fixed_type", "inst_theta", "inst_hyst", "inst_flip_steps",
     "inst_mark_steps", "mark_zap_reward", "mark_zap_reward_anneal_steps", "inst_here_obs", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
-    "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_frozen_biteable", "mark_pursuit_gain", "act_slow_steps", "act_slow_gain", "mark_freeze_steps",
+    "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_frozen_biteable", "mark_pursuit_gain", "act_slow_steps", "act_slow_gain", "mark_freeze_steps", "mark_eat_ban_steps",
     "mark_fixed_n", "mark_near_reward", "mark_near_cm",   // D27
     "bite_press_cost", "inst_violation_cost", "inst_violation_cost_p", "inst_violation_cost_delay",
     "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze",
@@ -4663,6 +4683,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->clean_reward = wef_cfg(kwargs, "clean_reward", 0);
     env->clean_reward_anneal_steps = wef_cfg(kwargs, "clean_reward_anneal_steps", 0);
     env->bitten_freeze_steps = wef_cfg(kwargs, "bitten_freeze_steps", 0);
+    env->bitten_eat_ban_steps = wef_cfg(kwargs, "bitten_eat_ban_steps", 0);
     env->bitten_reward = wef_cfg(kwargs, "bitten_reward", BITTEN_REWARD);
     env->bite_reward = wef_cfg(kwargs, "bite_reward", BITE_REWARD);
     env->eod_cost = wef_cfg(kwargs, "eod_cost", 0);
@@ -4741,6 +4762,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->inst_here_obs = wef_cfg(kwargs, "inst_here_obs", 0);
     env->mark_zap_cooldown = wef_cfg(kwargs, "mark_zap_cooldown", -1);
     env->mark_freeze_steps = wef_cfg(kwargs, "mark_freeze_steps", -1);
+    env->mark_eat_ban_steps = wef_cfg(kwargs, "mark_eat_ban_steps", -1);
     env->inst_pos_random = wef_cfg(kwargs, "inst_pos_random", 0);
     env->inst_read_cm = wef_cfg(kwargs, "inst_read_cm", 5.0);
     env->inst_obj_radius_cm = wef_cfg(kwargs, "inst_obj_radius_cm", 0.5);
@@ -4841,6 +4863,7 @@ void puf_init(Env* env, Dict* kwargs) {
         && (env->inst_duty_cm == 0.0f || (env->inst_mode > 0 && env->inst_mark_steps > 0 && env->inst_mark_until_zap))
         && "inst_duty_cm > 0 needs inst_mode > 0, inst_mark_steps > 0 and inst_mark_until_zap 1 (a persistent mark)");
     assert((env->inst_duty_mode == 0 || env->inst_duty_mode == 1) && "inst_duty_mode: 0 proximity, 1 witness");
+    assert(env->bitten_eat_ban_steps >= 0 && env->mark_eat_ban_steps >= -1 && "eating ban: bitten_eat_ban_steps >= 0, mark_eat_ban_steps -1 or >= 0");
     assert(env->inst_mark_steps >= 0 && env->mark_zap_cooldown >= -1 && env->mark_freeze_steps >= -1
         && env->inst_read_cm > 0.0f && env->inst_obj_radius_cm > 0.0f);
     assert((env->inst_pos_random == 0 || env->inst_pos_random == 1) && (env->inst_latch == 0 || env->inst_latch == 1));
@@ -5110,6 +5133,7 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "bites", log->bites);
     dict_set(out, "freezes", log->freezes);
     dict_set(out, "frozen_frac", log->frozen_frac);
+    dict_set(out, "banned_frac", log->banned_frac);
     dict_set(out, "equality", log->equality);
     dict_set(out, "collective_food", log->collective_food);
     dict_set(out, "eod_rate", log->eod_rate);
@@ -5123,6 +5147,7 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "bites", log->bites);
     dict_set(out, "freezes", log->freezes);
     dict_set(out, "frozen_frac", log->frozen_frac);
+    dict_set(out, "banned_frac", log->banned_frac);
     dict_set(out, "equality", log->equality);
     dict_set(out, "collective_food", log->collective_food);
     dict_set(out, "eod_rate", log->eod_rate);
@@ -5185,6 +5210,7 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "eater_frac", log->eater_frac);
     dict_set(out, "defector_frac", log->defector_frac);
     dict_set(out, "frozen_frac", log->frozen_frac);
+    dict_set(out, "banned_frac", log->banned_frac);
     dict_set(out, "collapsed", log->collapsed);
     dict_set(out, "survival_frac", log->survival_frac);
     dict_set(out, "policy_0_score", log->policy_0_score);
