@@ -116,6 +116,7 @@ typedef float obs_t;
 #define WEF_COLOR_TEXT          ((Color){240, 240, 240, 255})
 #define WEF_COLOR_FISH          ((Color){180, 150, 230, 255})
 #define WEF_COLOR_FISH_PULSE    ((Color){180, 150, 230, 140})
+#define WEF_COLOR_SELFISH       ((Color){235, 170, 60, 255})   // a selfish fish among sharing ones (reward_share_selfish_n)
 #define WEF_COLOR_SENSOR        ((Color){184, 164, 224, 200})
 #define WEF_COLOR_FOOD          ((Color){0x7A, 0xEF, 0x9A, 200})  // lighter green (AH: type A)
 #define WEF_COLOR_FOOD_B        ((Color){0xF0, 0x7A, 0xD0, 200})  // AH: type B bushes (magenta)
@@ -341,6 +342,7 @@ struct Log {
     float food_per_fish_area;
     // Cleanup-mode metrics (docs/wef-cleanup-v0-design.md section 9). Per-episode means.
     float collective_food;   // pellets eaten by all fish
+    float food_selfish_share; // share of the pellets eaten by the selfish slots (reward_share_selfish_n; 0 without them)
     float waste_frac;        // time-mean of waste_active / waste_max
     float frac_open;         // fraction of steps with regrowth probability > 0
     float cleans;            // waste items removed by fish (Hughes' public-good contribution)
@@ -643,6 +645,7 @@ struct Env {
     float bite_reward;
     float eod_cost;
     float reward_share;
+    int reward_share_selfish_n; // the last n slots keep their own reward under reward_share (a selfish minority among sharing fish)
     float proximity_shaping;
     int obs_extra;
     float size_min;
@@ -2733,6 +2736,12 @@ float wef_plant_reward_eff(const Wef* env) {
     return env->plant_reward * frac;
 }
 
+// reward_share_selfish_n (2026-11-05, heterogeneous fish): the last n slots are paid their own reward while
+// the others share at reward_share; a selfish fish is drawn in amber. 0 = every fish shares.
+static inline bool wef_is_selfish(const Wef* env, int i) {
+    return env->reward_share_selfish_n > 0 && i >= env->num_agents - env->reward_share_selfish_n;
+}
+
 // Gini coefficient of non-negative counts; 0 when the total is 0.
 float wef_gini(const int* x, int n) {
     float total = 0.0f;
@@ -3764,6 +3773,9 @@ void puf_step(Wef* env) {
         mean /= (float)env->num_agents;
         float w = env->reward_share;
         for (int i = 0; i < env->num_agents; i++) {
+            if (wef_is_selfish(env, i)) {
+                continue;  // reward_share_selfish_n (2026-11-05): the last n slots keep their own reward
+            }
             env->agents[i].rewards[0] = (1.0f - w) * env->agents[i].rewards[0] + w * mean;
         }
     }
@@ -3814,6 +3826,13 @@ void puf_step(Wef* env) {
         env->log.food_per_fish_area += env->food_per_fish_area;
         // Cleanup metrics (all zero-valued in baseline except equality)
         env->log.collective_food += (float)env->food_eaten;
+        if (env->reward_share_selfish_n > 0 && env->food_eaten > 0) {
+            int by_selfish = 0;
+            for (int i = 0; i < env->num_agents; i++) {
+                by_selfish += wef_is_selfish(env, i) ? env->food_by[i] : 0;
+            }
+            env->log.food_selfish_share += (float)by_selfish / (float)env->food_eaten;
+        }
         env->log.waste_frac += waste_frac;
         env->log.frac_open += env->cleanup ? (float)env->open_steps / ticks : 1.0f;
         env->log.cleans += (float)env->cleans;
@@ -4398,7 +4417,8 @@ void puf_render(Wef* env) {
         //   marked rule-breaker = a WHITE SQUARE frame around the fish
         //   rule read = a small square at the tail in the colour of the rule as read
         //   EOD = a thin faint pulsing circle (unchanged)
-        Color body = env->allelo ? (agent->taste == 0 ? WEF_COLOR_FOOD : WEF_COLOR_FOOD_B) : WEF_COLOR_FISH;
+        Color body = env->allelo ? (agent->taste == 0 ? WEF_COLOR_FOOD : WEF_COLOR_FOOD_B)
+            : wef_is_selfish(env, i) ? WEF_COLOR_SELFISH : WEF_COLOR_FISH;
         DrawCircleV(center, radius + 1.0f, (Color){8, 8, 8, 255});          // thin dark outline
         DrawCircleV(center, radius - 1.0f, ColorAlpha(body, 0.95f));
         if (env->allelo && agent->eat_cooldown > EAT_COOLDOWN_STEPS && agent->freeze <= 0) {
@@ -4532,7 +4552,7 @@ void puf_render(Wef* env) {
             line = TextFormat("%s   danger %d/%d", line, marked, env->num_agents);
         }
         DrawText(line, 20, 44, 18, WEF_COLOR_INST);
-        DrawText("body = taste (green A / magenta B) | white square = marked | blue flash = bite on a marked fish, red = other bite | X = frozen | orange ring = banned from eating | tail square = rule read | crown = Queen",
+        DrawText("body = taste (green A / magenta B), amber = selfish (own reward) | white square = marked | blue flash = bite on a marked fish, red = other bite | X = frozen | orange ring = banned from eating | tail square = rule read | crown = Queen",
             20, 66, 13, WEF_COLOR_MIDGRAY);
     }
     if (env->allelo) {
@@ -4613,7 +4633,7 @@ static const char* WEF_ENV_KEYS[] = {
     "waste_sense_range_cm", "regrow_p_max", "regrow_mode", "regrow_allee", "season_steps",
     "season_growth", "regrow_radius_cm", "food_start", "clean_priority", "clean_radius_cm",
     "clean_max_items", "clean_cooldown_steps", "clean_reward", "clean_reward_anneal_steps",
-    "bitten_freeze_steps", "bitten_eat_ban_steps", "bitten_reward", "bite_reward", "eod_cost", "reward_share",
+    "bitten_freeze_steps", "bitten_eat_ban_steps", "bitten_reward", "bite_reward", "eod_cost", "reward_share", "reward_share_selfish_n",
     "proximity_shaping", "obs_extra", "size_min", "size_max", "desync_first_episode",
     "policy1_agents", "no_clean_agents", "roles", "bot_shift_steps", "bot_oracle", "bot_theta",
     "render_field", "render_field_alpha", "sustain_frac", "num_patches", "regrow_in_patches",
@@ -4702,6 +4722,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->bite_reward = wef_cfg(kwargs, "bite_reward", BITE_REWARD);
     env->eod_cost = wef_cfg(kwargs, "eod_cost", 0);
     env->reward_share = wef_cfg(kwargs, "reward_share", 0);
+    env->reward_share_selfish_n = wef_cfg(kwargs, "reward_share_selfish_n", 0);
     env->proximity_shaping = wef_cfg(kwargs, "proximity_shaping", PROXIMITY_SHAPING_REWARD);
     env->obs_extra = wef_cfg(kwargs, "obs_extra", 0);
     env->size_min = wef_cfg(kwargs, "size_min", 0.0);
@@ -4941,6 +4962,8 @@ void puf_init(Env* env, Dict* kwargs) {
     }
     assert(env->waste_start >= 0 && env->waste_start <= env->waste_max);
     assert(env->reward_share >= 0.0f && env->reward_share <= 1.0f);
+    assert(env->reward_share_selfish_n >= 0 && env->reward_share_selfish_n < env->num_agents
+        && (env->reward_share_selfish_n == 0 || env->reward_share > 0.0f) && "reward_share_selfish_n: 0 .. num_agents - 1, needs reward_share > 0");
     assert(env->waste_theta > 0.0f);
     assert(env->clean_max_items >= 1);
     assert(env->policy1_agents >= 0 && env->no_clean_agents >= 0
@@ -5154,6 +5177,7 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "banned_frac", log->banned_frac);
     dict_set(out, "equality", log->equality);
     dict_set(out, "collective_food", log->collective_food);
+    dict_set(out, "food_selfish_share", log->food_selfish_share);
     dict_set(out, "eod_rate", log->eod_rate);
     dict_set(out, "plant_own_frac_a", log->plant_own_frac_a);
     dict_set(out, "plant_own_frac_b", log->plant_own_frac_b);
@@ -5168,6 +5192,7 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "banned_frac", log->banned_frac);
     dict_set(out, "equality", log->equality);
     dict_set(out, "collective_food", log->collective_food);
+    dict_set(out, "food_selfish_share", log->food_selfish_share);
     dict_set(out, "eod_rate", log->eod_rate);
     wef_log_inst(log, out);
     wef_log_inst_tail(log, out);
@@ -5208,6 +5233,7 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "bites", log->bites);
     dict_set(out, "food_per_fish_area", log->food_per_fish_area);
     dict_set(out, "collective_food", log->collective_food);
+    dict_set(out, "food_selfish_share", log->food_selfish_share);
 #ifdef WEF_INST
     wef_log_inst(log, out);  // 4-fish institution build (Commons arms): on the dashboard
 #endif

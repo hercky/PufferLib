@@ -951,6 +951,44 @@ static void test_patchy_commons(void) {
 // U48 (2026-11-02): the single Commons: patch_layout 2 puts the one patch at the arena centre, every pellet inside it,
 // and regrow_per_patch with ONE patch is the whole stock (K_p = K): logistic regrowth inside the disk, Allee collapse
 // of the patch = collapse of the episode.
+// U52 (2026-11-05): reward_share_selfish_n: under reward_share w the first num_agents - n fish get (1 - w) own + w mean, the last n keep
+// their own reward; the Log's food_selfish_share is the selfish slots' share of the pellets; default 0 = everyone mixed.
+static void test_selfish_minority(void) {
+    printf("-- U52: reward_share_selfish_n (a selfish minority among sharing fish)\n");
+    for (int n = 0; n < 2; n++) {
+        Dict kw = {0};
+        kw_base(&kw, 4);
+        dict_set(&kw, "reward_share", 0.5);
+        dict_set(&kw, "reward_share_selfish_n", n);
+        Harness h = make(&kw, 4);
+        Env* env = h.env;
+        clear_objects(env);
+        env->food_active = 0;
+        for (int i = 0; i < 4; i++) {
+            place_fish(env, i, 8.0f + 8.0f * (float)i, 8.0f, 0.0f);
+            set_action(&h, i, -8.0f, 0.0f, 1.0f, -1.0f);
+        }
+        env->food[0] = (FishFood){.pos = {9.5f, 8.0f}, .orientation = 0.0f, .active = true};   // only fish 0 eats
+        env->food_active = 1;
+        puf_step(env);
+        float r0 = h.rew[0], r3 = h.rew[3];
+        if (n == 0) {
+            CHECK(r0 > 0.6f && r0 < 0.7f && r3 > 0.1f && r3 < 0.2f, "all share at 0.5: the eater keeps 0.5 + 0.125, the others get 0.125 (%.3f, %.3f)", r0, r3);
+        } else {
+            CHECK(r0 > 0.6f && r0 < 0.7f && r3 < 0.01f && r3 > -0.05f, "fish 3 selfish: it gets nothing of fish 0's pellet (%.3f, %.3f)", r0, r3);
+            CHECK(fabsf(h.rew[1] - h.rew[2]) < 1e-6f && h.rew[1] > 0.1f, "the sharing fish 1 and 2 still get their share (%.3f)", h.rew[1]);
+        }
+        while (env->episode == 0) {
+            puf_step(env);
+        }
+        if (n == 1) {
+            CHECK(env->log.food_selfish_share >= 0.0f && env->log.food_selfish_share <= 1.0f, "Log food_selfish_share %.3f", env->log.food_selfish_share);
+        }
+        destroy(&h);
+        dict_clear(&kw);
+    }
+}
+
 static void test_single_commons(void) {
     printf("-- U48: single Commons (patch_layout 2, regrow_per_patch with one patch)\n");
     Dict kw = {0};
@@ -4667,6 +4705,7 @@ int main(int argc, char** argv) {
     test_bite_press_cost();
     test_single_commons();
     test_eat_ban();
+    test_selfish_minority();
 #ifdef WEF_INST
     test_violation_cost();
     test_auto_eat_ban();
