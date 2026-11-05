@@ -820,6 +820,42 @@ static void test_auto_eat_ban_p(void) {
     }
 }
 
+// U53 (2026-11-05): selfish_obs: with the key on, a selfish fish's observation differs from the key-off one in exactly one slot (by +1) and a
+// sharing fish's observation is unchanged.
+static void test_selfish_obs(void) {
+    printf("-- U53: selfish_obs (a selfish fish is told so)\n");
+    float o[2][2][OBS_SIZE];
+    for (int on = 0; on < 2; on++) {
+        Dict kw = {0};
+        kw_base(&kw, 4);
+        kw_inst_commons_single(&kw);
+        dict_set(&kw, "reward_share", 0.35);
+        dict_set(&kw, "reward_share_selfish_n", 1);
+        dict_set(&kw, "selfish_obs", on);
+        Harness h = make(&kw, 4);
+        Env* env = h.env;
+        for (int i = 0; i < 4; i++) {
+            place_fish(env, i, 10.0f + 6.0f * (float)i, 20.0f, 0.0f);
+            set_action(&h, i, -8.0f, 0.0f, 1.0f, -1.0f);
+        }
+        puf_step(env);
+        for (int k = 0; k < OBS_SIZE; k++) {
+            o[on][0][k] = (float)env->agents[0].observations[k];   // a sharing fish
+            o[on][1][k] = (float)env->agents[3].observations[k];   // the selfish fish (last slot)
+        }
+        destroy(&h);
+        dict_clear(&kw);
+    }
+    int d_share = 0, d_self = 0, idx = -1;
+    for (int k = 0; k < OBS_SIZE; k++) {
+        d_share += fabsf(o[1][0][k] - o[0][0][k]) > 1e-6f;
+        if (fabsf(o[1][1][k] - o[0][1][k]) > 1e-6f) { d_self++; idx = k; }
+    }
+    CHECK(d_share == 0, "a sharing fish's observation is unchanged by the key (%d slots differ)", d_share);
+    CHECK(d_self == 1 && idx >= 0 && fabsf(o[1][1][idx] - o[0][1][idx] - 1.0f) < 1e-6f,
+        "the selfish fish reads +1 in exactly one slot (%d slots differ, slot %d: %.2f -> %.2f)", d_self, idx, idx >= 0 ? o[0][1][idx] : 0.0f, idx >= 0 ? o[1][1][idx] : 0.0f);
+}
+
 static void test_here_obs_and_bounty_anneal(void) {
     printf("-- U46: inst_here_obs (where the fish stands relative to the rule) / U47: mark_zap_reward anneal\n");
     {
@@ -4710,6 +4746,7 @@ int main(int argc, char** argv) {
     test_violation_cost();
     test_auto_eat_ban();
     test_auto_eat_ban_p();
+    test_selfish_obs();
     test_here_obs_and_bounty_anneal();
 #else
     printf("-- U45: skipped (needs the -DWEF_INST build)\n");

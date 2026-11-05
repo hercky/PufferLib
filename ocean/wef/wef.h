@@ -646,6 +646,7 @@ struct Env {
     float eod_cost;
     float reward_share;
     int reward_share_selfish_n; // the last n slots keep their own reward under reward_share (a selfish minority among sharing fish)
+    int selfish_obs;            // 1 = a selfish fish reads +1 in the danger slot (one shared policy can then act by type); needs -DWEF_INST, inst_danger_obs 0, inst_here_obs 0
     float proximity_shaping;
     int obs_extra;
     float size_min;
@@ -869,6 +870,12 @@ static inline int wef_inst_rule_type(const Wef* env, int i) {
 }
 
 // Patchy layout: is a point inside patch p's disk (the per-patch Commons / rotating rule geometry).
+// reward_share_selfish_n (2026-11-05, heterogeneous fish): the last n slots are paid their own reward while
+// the others share at reward_share; a selfish fish is drawn in amber. 0 = every fish shares.
+static inline bool wef_is_selfish(const Wef* env, int i) {
+    return env->reward_share_selfish_n > 0 && i >= env->num_agents - env->reward_share_selfish_n;
+}
+
 static inline bool wef_in_patch(const Wef* env, Vec2 pos, int p) {
     float dx = pos.x - env->patch_center[p].x;
     float dy = pos.y - env->patch_center[p].y;
@@ -1657,6 +1664,9 @@ void compute_observations(Wef* env) {
             if (env->inst_obs && env->inst_here_obs && env->inst_mode == 4 && env->num_patches_ep >= 2) {
                 here = wef_in_patch(env, agent->pos, 1 - env->inst_type) ? 1.0f
                     : wef_in_patch(env, agent->pos, env->inst_type) ? -1.0f : 0.0f;
+            }
+            if (env->selfish_obs && wef_is_selfish(env, i)) {
+                here = 1.0f;  // selfish_obs (2026-11-05): a selfish fish is told so (the sharing fish read 0)
             }
             obs[obs_idx++] = env->inst_obs && env->inst_danger_obs ? agent->inst_danger : here;
         }
@@ -2734,12 +2744,6 @@ float wef_plant_reward_eff(const Wef* env) {
     float env_steps = (float)env->episode * (float)env->episode_length + (float)env->tick;
     float frac = fmaxf(0.0f, 1.0f - env_steps / env->plant_reward_anneal_steps);
     return env->plant_reward * frac;
-}
-
-// reward_share_selfish_n (2026-11-05, heterogeneous fish): the last n slots are paid their own reward while
-// the others share at reward_share; a selfish fish is drawn in amber. 0 = every fish shares.
-static inline bool wef_is_selfish(const Wef* env, int i) {
-    return env->reward_share_selfish_n > 0 && i >= env->num_agents - env->reward_share_selfish_n;
 }
 
 // Gini coefficient of non-negative counts; 0 when the total is 0.
@@ -4633,7 +4637,7 @@ static const char* WEF_ENV_KEYS[] = {
     "waste_sense_range_cm", "regrow_p_max", "regrow_mode", "regrow_allee", "season_steps",
     "season_growth", "regrow_radius_cm", "food_start", "clean_priority", "clean_radius_cm",
     "clean_max_items", "clean_cooldown_steps", "clean_reward", "clean_reward_anneal_steps",
-    "bitten_freeze_steps", "bitten_eat_ban_steps", "bitten_reward", "bite_reward", "eod_cost", "reward_share", "reward_share_selfish_n",
+    "bitten_freeze_steps", "bitten_eat_ban_steps", "bitten_reward", "bite_reward", "eod_cost", "reward_share", "reward_share_selfish_n", "selfish_obs",
     "proximity_shaping", "obs_extra", "size_min", "size_max", "desync_first_episode",
     "policy1_agents", "no_clean_agents", "roles", "bot_shift_steps", "bot_oracle", "bot_theta",
     "render_field", "render_field_alpha", "sustain_frac", "num_patches", "regrow_in_patches",
@@ -4723,6 +4727,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->eod_cost = wef_cfg(kwargs, "eod_cost", 0);
     env->reward_share = wef_cfg(kwargs, "reward_share", 0);
     env->reward_share_selfish_n = wef_cfg(kwargs, "reward_share_selfish_n", 0);
+    env->selfish_obs = wef_cfg(kwargs, "selfish_obs", 0);
     env->proximity_shaping = wef_cfg(kwargs, "proximity_shaping", PROXIMITY_SHAPING_REWARD);
     env->obs_extra = wef_cfg(kwargs, "obs_extra", 0);
     env->size_min = wef_cfg(kwargs, "size_min", 0.0);
@@ -4964,6 +4969,12 @@ void puf_init(Env* env, Dict* kwargs) {
     assert(env->reward_share >= 0.0f && env->reward_share <= 1.0f);
     assert(env->reward_share_selfish_n >= 0 && env->reward_share_selfish_n < env->num_agents
         && (env->reward_share_selfish_n == 0 || env->reward_share > 0.0f) && "reward_share_selfish_n: 0 .. num_agents - 1, needs reward_share > 0");
+#ifdef WEF_INST
+    assert((env->selfish_obs == 0 || (env->selfish_obs == 1 && env->reward_share_selfish_n > 0 && !env->inst_danger_obs && !env->inst_here_obs))
+        && "selfish_obs needs reward_share_selfish_n > 0, inst_danger_obs 0 and inst_here_obs 0 (it uses the danger slot)");
+#else
+    assert(env->selfish_obs == 0 && "selfish_obs needs the -DWEF_INST build (the danger slot)");
+#endif
     assert(env->waste_theta > 0.0f);
     assert(env->clean_max_items >= 1);
     assert(env->policy1_agents >= 0 && env->no_clean_agents >= 0
