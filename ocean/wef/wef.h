@@ -781,6 +781,7 @@ struct Env {
     int zaps_wrongful;          // per-episode counter
     int inst_auto_freeze;       // learnability ablation: a violation freezes the violator on the spot for this many steps (0 = off)
     int inst_auto_eat_ban;      // the institution bans a violator from eating for this many steps on the spot (2026-11-04); 0 = off; needs inst_mode > 0
+    float inst_auto_eat_ban_p;  // share of violations the institution bans itself (1 = all; < 1 = mixed delivery, the rest left to peers)
     int auto_sanctions;         // per-episode counter of those direct sanctions
     int inst_auto_freeze_scope; // 0: every violation triggers inst_auto_freeze; 1: only second-order ones (wrongful bites, shirks)
     float inst_violation_cost;  // (2026-11-01, compliance ladder C1/C2) reward taken from the violator for a first-order violation, by the
@@ -994,9 +995,13 @@ static inline void wef_inst_violation(Wef* env, int i, int cls) {
         env->freezes++;
         env->auto_sanctions++;
     }
-    if (env->inst_auto_eat_ban > 0 && (env->inst_auto_freeze_scope == 0 || cls > 0)) {
+    if (env->inst_auto_eat_ban > 0 && (env->inst_auto_freeze_scope == 0 || cls > 0)
+            && (env->inst_auto_eat_ban_p >= 1.0f || random_uniform(env, 0.0f, 1.0f) < env->inst_auto_eat_ban_p)) {
         // the institution delivers the eating ban itself (2026-11-04): certain and immediate, no enforcer;
-        // the violator keeps moving and stays biteable, it just cannot eat for inst_auto_eat_ban steps
+        // the violator keeps moving and stays biteable, it just cannot eat for inst_auto_eat_ban steps.
+        // inst_auto_eat_ban_p < 1 (2026-11-05, mixed delivery): only this share of violations is banned by the
+        // institution; the rest is left to the peers (marks). The draw is skipped at p 1, so the RNG stream of
+        // the certain arm is unchanged.
         if (fish->eat_ban < env->inst_auto_eat_ban) {
             fish->eat_ban = env->inst_auto_eat_ban;
         }
@@ -4628,7 +4633,7 @@ static const char* WEF_ENV_KEYS[] = {
     "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_frozen_biteable", "mark_pursuit_gain", "act_slow_steps", "act_slow_gain", "mark_freeze_steps", "mark_eat_ban_steps",
     "mark_fixed_n", "mark_near_reward", "mark_near_cm",   // D27
     "bite_press_cost", "inst_violation_cost", "inst_violation_cost_p", "inst_violation_cost_delay",
-    "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze", "inst_auto_eat_ban",
+    "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze", "inst_auto_eat_ban", "inst_auto_eat_ban_p",
     "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps", "inst_grace_steps", "inst_duty_mode",
     "inst_mark_contrast", "mark_bite_radius_cm", "mark_bite_angle_deg",   // D23
 };
@@ -4793,6 +4798,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->bot_respond_zaps = wef_cfg(kwargs, "bot_respond_zaps", 1);
     env->inst_auto_freeze = wef_cfg(kwargs, "inst_auto_freeze", 0);
     env->inst_auto_eat_ban = wef_cfg(kwargs, "inst_auto_eat_ban", 0);
+    env->inst_auto_eat_ban_p = wef_cfg(kwargs, "inst_auto_eat_ban_p", 1.0);
     env->inst_auto_freeze_scope = wef_cfg(kwargs, "inst_auto_freeze_scope", 0);
     env->inst_violation_cost = wef_cfg(kwargs, "inst_violation_cost", 0.0);
     env->inst_violation_cost_p = wef_cfg(kwargs, "inst_violation_cost_p", 1.0);
@@ -4858,6 +4864,7 @@ void puf_init(Env* env, Dict* kwargs) {
         && "inst_mark_until_zap / inst_mark_wrongful need inst_mark_steps > 0 (the mark value) under a rule; inert with inst_mode 0 (a preset's control arm)");
     assert(env->bot_respond_zaps >= 1);
     assert(env->inst_auto_eat_ban >= 0 && (env->inst_auto_eat_ban == 0 || env->inst_mode > 0) && "inst_auto_eat_ban needs inst_mode > 0");
+    assert(env->inst_auto_eat_ban_p >= 0.0f && env->inst_auto_eat_ban_p <= 1.0f && "inst_auto_eat_ban_p in [0, 1]");
     assert(env->inst_auto_freeze >= 0 && (env->inst_auto_freeze == 0 || env->inst_mode > 0)
         && "inst_auto_freeze needs inst_mode > 0");
     assert(env->inst_grace_steps >= 0 && "inst_grace_steps >= 0 (inert unless inst_mode 4, so a preset can carry it into the control arm)");

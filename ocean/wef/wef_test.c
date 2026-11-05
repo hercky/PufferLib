@@ -794,6 +794,32 @@ static void test_auto_eat_ban(void) {
     }
 }
 
+// U51 (2026-11-05): inst_auto_eat_ban_p: with p 0.5 about half of 400 violations are banned (binomial: 160-240 at 6 sd), with p 0 none, with p 1 all.
+static void test_auto_eat_ban_p(void) {
+    printf("-- U51: inst_auto_eat_ban_p (mixed delivery)\n");
+    float ps[3] = {0.0f, 0.5f, 1.0f};
+    for (int k = 0; k < 3; k++) {
+        Dict kw = {0};
+        kw_base(&kw, 4);
+        kw_inst_commons_single(&kw);
+        dict_set(&kw, "inst_mode", 1);
+        dict_set(&kw, "inst_auto_eat_ban", 10);
+        dict_set(&kw, "inst_auto_eat_ban_p", ps[k]);
+        Harness h = make(&kw, 4);
+        Env* env = h.env;
+        int banned = 0;
+        for (int t = 0; t < 400; t++) {
+            env->fish[0].eat_ban = 0;
+            wef_inst_violation(env, 0, 0);
+            banned += env->fish[0].eat_ban > 0;
+        }
+        bool ok = ps[k] == 0.0f ? banned == 0 : ps[k] == 1.0f ? banned == 400 : (banned >= 160 && banned <= 240);
+        CHECK(ok, "p %.1f: %d of 400 violations banned", ps[k], banned);
+        destroy(&h);
+        dict_clear(&kw);
+    }
+}
+
 static void test_here_obs_and_bounty_anneal(void) {
     printf("-- U46: inst_here_obs (where the fish stands relative to the rule) / U47: mark_zap_reward anneal\n");
     {
@@ -4644,6 +4670,7 @@ int main(int argc, char** argv) {
 #ifdef WEF_INST
     test_violation_cost();
     test_auto_eat_ban();
+    test_auto_eat_ban_p();
     test_here_obs_and_bounty_anneal();
 #else
     printf("-- U45: skipped (needs the -DWEF_INST build)\n");
