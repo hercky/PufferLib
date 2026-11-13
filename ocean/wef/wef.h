@@ -4917,6 +4917,7 @@ void puf_init(Env* env, Dict* kwargs) {
     assert(env->mark_pursuit_gain >= 1.0f && env->mark_pursuit_gain <= 3.0f && (env->mark_pursuit_gain == 1.0f || env->inst_mode > 0)
         && "mark_pursuit_gain in [1, 3], != 1 needs inst_mode > 0");
     assert((env->mark_bitten_reward == 0.0f || env->inst_mode > 0) && "mark_bitten_reward needs inst_mode > 0 (a marked victim)");
+    assert(env->mark_bitten_reward <= 0.0f && "mark_bitten_reward is ADDED to the marked victim's reward: a sanction of 5 is -5 (a positive value pays the victim; the peer arms of 2026-10-30 .. 11-05 ran with +5 by mistake)");
     assert((env->inst_danger_obs == 0 || (env->inst_danger_obs == 1 && env->inst_obs && env->inst_mode > 0))
         && "inst_danger_obs needs inst_obs 1 and inst_mode > 0 (the danger level is the institution's)");
     if (env->allelo) {
