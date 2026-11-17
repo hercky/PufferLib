@@ -3462,6 +3462,45 @@ static void test_inst_danger(void) {
     dict_clear(&kw0);
 }
 
+// U54 (2026-11-17): the signs of a sanction, checked numerically on one bite of a marked fish with mark_bitten_reward -5 and
+// mark_zap_loot 0.6: the VICTIM's step reward falls by 5 more than with the keys off, the BITER's rises by exactly 3, and a
+// third fish is untouched; the Log's mark_zap_loot is 3.
+static void test_inst_sanction_signs(void) {
+    printf("-- INST U54: sanction signs (mark_bitten_reward -5 takes from the victim, mark_zap_loot pays the biter)\n");
+    float rv[2], rb[2], ro[2]; float loot_log = -1.0f;
+    for (int on = 0; on < 2; on++) {
+        Dict kw = {0};
+        kw_inst_test(&kw, AH_FISH, 0);
+        if (on) {
+            dict_set(&kw, "mark_bitten_reward", -5.0);
+            dict_set(&kw, "mark_zap_loot", 0.6);
+        }
+        Harness h = make(&kw, AH_FISH);
+        Env* env = h.env;
+        clear_objects(env);
+        ah_park(&h, 0);
+        for (int i = 0; i < AH_FISH; i++) {
+            ah_still(&h, i);
+        }
+        int b = AH_FISH / 2;
+        env->fish[b].mark = 64;
+        place_fish(env, b, 10.0f, 20.0f, 0.0f);
+        place_fish(env, 0, 7.5f, 20.0f, 0.0f);
+        set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+        puf_step(env);
+        CHECK(env->fish[0].bite_victim == b && env->zaps_on_marked == 1, "run %d: fish 0 bites the marked fish", on);
+        rv[on] = env->agents[b].rewards[0]; rb[on] = env->agents[0].rewards[0]; ro[on] = env->agents[1].rewards[0];
+        if (on) {
+            loot_log = env->loot_sum;
+        }
+        destroy(&h);
+        dict_clear(&kw);
+    }
+    CHECK(fabsf((rv[1] - rv[0]) + 5.0f) < 1e-4f, "the victim LOSES 5 more with the sanction on (%.3f -> %.3f)", rv[0], rv[1]);
+    CHECK(fabsf((rb[1] - rb[0]) - 3.0f) < 1e-4f, "the biter GAINS 0.6 x 5 = 3 (%.3f -> %.3f)", rb[0], rb[1]);
+    CHECK(fabsf(ro[1] - ro[0]) < 1e-6f && fabsf(loot_log - 3.0f) < 1e-4f, "a bystander is untouched; loot counted %.2f", loot_log);
+}
+
 // U37 (probe keys): inst_mask_marks zeroes the mark slots while the marks act; mark_bitten_reward reaches a marked victim only.
 static void test_inst_probe_keys(void) {
     printf("-- INST U37: inst_mask_marks and mark_bitten_reward\n");
@@ -4219,6 +4258,7 @@ static void test_inst(void) {
     test_inst_free_riding();
     test_inst_danger();
     test_inst_probe_keys();
+    test_inst_sanction_signs();
     test_inst_frozen_biteable();
     test_inst_pursuit();
     test_inst_capability();
