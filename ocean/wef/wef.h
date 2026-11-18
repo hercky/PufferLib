@@ -414,6 +414,7 @@ struct Log {
     float eats_closed;       // Commons: eats that broke the rule
     float mark_zap_bounty;   // bounty paid for zapping marked fish
     float mark_zap_loot;     // reward transferred from sanctioned fish to their biters per episode (mark_zap_loot)
+    float free_presses;      // bite attempts per episode that were not charged (mark_press_free_cm)
     float beacon_first_visit;// mean over fish of the first-read tick / T (1 if never)
     float informed_frac;     // fish that read the beacon at least once / N
     float informed_mean;     // time-mean fraction of informed fish
@@ -835,6 +836,7 @@ struct Env {
     int inst_mask_marks;        // probe (2026-10-19): 1 = the own-mark and others'-mark slots read 0 (the marks still exist); eval-only perception test
     float mark_bitten_reward;   // probe: reward added to a MARKED victim when a bite lands on it (a felt sanction; D11-compatible); 0 = off
     float mark_zap_loot;        // share in [0, 1] of the sanction (-mark_bitten_reward) that the biter of a marked fish receives; 0 = off
+    float mark_press_free_cm;   // a bite attempt with a marked fish within this distance is not charged bite_press_cost; 0 = off
     int inst_danger_obs;        // D22: 1 = the beacon also broadcasts the danger level (marked fish / N, i.e. unsanctioned
                                 // violations outstanding under persistent marks) into the last institution slot; 0 = slot 0
     float danger_sum;           // per-episode sum over steps of marked fish / N (Log danger_mean)
@@ -860,6 +862,7 @@ struct Env {
     int eats_closed;
     float bounty_sum;
     float loot_sum;             // mark_zap_loot paid to biters this episode
+    int free_presses;           // bite attempts not charged this episode (mark_press_free_cm)
     int plantings_p;
     int plantings_np;
 };
@@ -1833,6 +1836,7 @@ void puf_reset(Wef* env) {
     env->eats_closed = 0;
     env->bounty_sum = 0.0f;
     env->loot_sum = 0.0f;
+    env->free_presses = 0;
     env->zaps_wrongful = 0;
     env->auto_sanctions = 0;
     env->fines = 0;
@@ -2881,7 +2885,25 @@ void puf_step(Wef* env) {
             }
         }
         if (env->bite_press_cost != 0.0f && raw_action[3] > 0.0f) {
-            env->agents[i].rewards[0] -= env->bite_press_cost;  // the press itself costs, whether or not a bite lands
+            // mark_press_free_cm (2026-11-17): an attempt made with a MARKED fish within this distance is free, landed
+            // or not: trying to punish a nearby rule-breaker costs nothing; every other attempt costs as before.
+            bool free_press = false;
+            if (env->mark_press_free_cm > 0.0f && env->inst_mode > 0) {
+                float r2 = env->mark_press_free_cm * env->mark_press_free_cm;
+                for (int j = 0; j < env->num_agents && !free_press; j++) {
+                    if (j == i || env->fish[j].mark <= 0) {
+                        continue;
+                    }
+                    float dx = env->fish[j].pos.x - agent->pos.x;
+                    float dy = env->fish[j].pos.y - agent->pos.y;
+                    free_press = dx * dx + dy * dy <= r2;
+                }
+            }
+            if (free_press) {
+                env->free_presses++;
+            } else {
+                env->agents[i].rewards[0] -= env->bite_press_cost;  // the press itself costs, whether or not a bite lands
+            }
         }
         if (agent->bite_action) {
             agent->bite_cooldown = BITE_COOLDOWN_STEPS;
@@ -3985,6 +4007,7 @@ void puf_step(Wef* env) {
             env->log.eats_closed += (float)env->eats_closed;
             env->log.mark_zap_bounty += env->bounty_sum;
             env->log.mark_zap_loot += env->loot_sum;
+            env->log.free_presses += (float)env->free_presses;
             env->log.beacon_first_visit += first_visit / (float)env->num_agents;
             env->log.informed_frac += (float)informed_n / (float)env->num_agents;
             env->log.informed_mean += (float)env->informed_steps / fish_steps;
@@ -4665,7 +4688,7 @@ static const char* WEF_ENV_KEYS[] = {
     // Institutions (docs/institutions-plan.md section 4)
     "inst_mode", "inst_obs", "inst_fixed_type", "inst_theta", "inst_hyst", "inst_flip_steps",
     "inst_mark_steps", "mark_zap_reward", "mark_zap_reward_anneal_steps", "inst_here_obs", "mark_zap_cooldown", "inst_pos_random", "inst_read_cm",
-    "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_zap_loot", "mark_frozen_biteable", "mark_pursuit_gain", "act_slow_steps", "act_slow_gain", "mark_freeze_steps", "mark_eat_ban_steps",
+    "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_zap_loot", "mark_press_free_cm", "mark_frozen_biteable", "mark_pursuit_gain", "act_slow_steps", "act_slow_gain", "mark_freeze_steps", "mark_eat_ban_steps",
     "mark_fixed_n", "mark_near_reward", "mark_near_cm",   // D27
     "bite_press_cost", "inst_violation_cost", "inst_violation_cost_p", "inst_violation_cost_delay",
     "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze", "inst_auto_eat_ban", "inst_auto_eat_ban_p",
@@ -4831,6 +4854,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->act_slow_gain = wef_cfg(kwargs, "act_slow_gain", 1.0);
     env->mark_bitten_reward = wef_cfg(kwargs, "mark_bitten_reward", 0.0);
     env->mark_zap_loot = wef_cfg(kwargs, "mark_zap_loot", 0.0);
+    env->mark_press_free_cm = wef_cfg(kwargs, "mark_press_free_cm", 0.0);
     env->inst_mark_until_zap = wef_cfg(kwargs, "inst_mark_until_zap", 0);
     env->inst_mark_wrongful = wef_cfg(kwargs, "inst_mark_wrongful", 0);
     env->bot_respond_zaps = wef_cfg(kwargs, "bot_respond_zaps", 1);
@@ -4931,6 +4955,7 @@ void puf_init(Env* env, Dict* kwargs) {
     assert((env->mark_bitten_reward == 0.0f || env->inst_mode > 0) && "mark_bitten_reward needs inst_mode > 0 (a marked victim)");
     assert(env->mark_zap_loot >= 0.0f && env->mark_zap_loot <= 1.0f && (env->mark_zap_loot == 0.0f || env->mark_bitten_reward < 0.0f)
         && "mark_zap_loot in [0, 1] and needs a sanction to share (mark_bitten_reward < 0)");
+    assert(env->mark_press_free_cm >= 0.0f && (env->mark_press_free_cm == 0.0f || env->inst_mode > 0) && "mark_press_free_cm >= 0 and needs inst_mode > 0");
     assert(env->mark_bitten_reward <= 0.0f && "mark_bitten_reward is ADDED to the marked victim's reward: a sanction of 5 is -5 (a positive value pays the victim; the peer arms of 2026-10-30 .. 11-05 ran with +5 by mistake)");
     assert((env->inst_danger_obs == 0 || (env->inst_danger_obs == 1 && env->inst_obs && env->inst_mode > 0))
         && "inst_danger_obs needs inst_obs 1 and inst_mode > 0 (the danger level is the institution's)");
@@ -5128,6 +5153,7 @@ static void wef_log_inst_tail(Log* log, Dict* out) {
     dict_set(out, "eats_closed", log->eats_closed);
     dict_set(out, "mark_zap_bounty", log->mark_zap_bounty);
     dict_set(out, "mark_zap_loot", log->mark_zap_loot);
+    dict_set(out, "free_presses", log->free_presses);
     dict_set(out, "beacon_first_visit", log->beacon_first_visit);
     dict_set(out, "informed_mean", log->informed_mean);
     dict_set(out, "beacon_visits", log->beacon_visits);

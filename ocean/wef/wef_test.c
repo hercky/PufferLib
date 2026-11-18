@@ -3501,6 +3501,44 @@ static void test_inst_sanction_signs(void) {
     CHECK(fabsf(ro[1] - ro[0]) < 1e-6f && fabsf(loot_log - 3.0f) < 1e-4f, "a bystander is untouched; loot counted %.2f", loot_log);
 }
 
+// U55 (2026-11-17): mark_press_free_cm 10: a bite attempt costs nothing while a marked fish is within 10 cm (here 6 cm away, out of
+// bite reach, so nothing lands) and costs bite_press_cost 0.5 when the only marked fish is 20 cm away or when nobody is marked; key off: always 0.5.
+static void test_inst_free_press(void) {
+    printf("-- INST U55: mark_press_free_cm (an attempt near a marked fish is free)\n");
+    float r[2][3];
+    for (int on = 0; on < 2; on++) {
+        for (int c = 0; c < 3; c++) {
+            Dict kw = {0};
+            kw_inst_test(&kw, AH_FISH, 0);
+            dict_set(&kw, "bite_press_cost", 0.5);
+            dict_set(&kw, "mark_press_free_cm", on ? 10.0 : 0.0);
+            Harness h = make(&kw, AH_FISH);
+            Env* env = h.env;
+            clear_objects(env);
+            ah_park(&h, 0);
+            for (int i = 0; i < AH_FISH; i++) {
+                ah_still(&h, i);
+            }
+            int b = AH_FISH / 2;
+            place_fish(env, 0, 10.0f, 20.0f, 0.0f);
+            place_fish(env, b, c == 1 ? 30.0f : 16.0f, 20.0f, 0.0f);   // 6 cm ahead (c 0, 2) or 20 cm (c 1)
+            env->fish[b].mark = c == 2 ? 0 : 64;                         // c 2: nobody marked
+            float before = env->agents[0].rewards[0];
+            set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+            puf_step(env);
+            r[on][c] = env->agents[0].rewards[0] - before;
+            CHECK(env->fish[0].bite_victim < 0, "run %d case %d: nothing in bite reach, no bite lands", on, c);
+            destroy(&h);
+            dict_clear(&kw);
+        }
+    }
+    CHECK(fabsf(r[0][0] + 0.5f) < 1e-3f && fabsf(r[0][1] + 0.5f) < 1e-3f && fabsf(r[0][2] + 0.5f) < 1e-3f,
+        "key off: every attempt costs 0.5 (%.3f %.3f %.3f)", r[0][0], r[0][1], r[0][2]);
+    CHECK(fabsf(r[1][0]) < 1e-3f, "key on, marked fish 6 cm away: the attempt is free (%.3f)", r[1][0]);
+    CHECK(fabsf(r[1][1] + 0.5f) < 1e-3f && fabsf(r[1][2] + 0.5f) < 1e-3f,
+        "key on, marked fish 20 cm away or nobody marked: 0.5 as before (%.3f %.3f)", r[1][1], r[1][2]);
+}
+
 // U37 (probe keys): inst_mask_marks zeroes the mark slots while the marks act; mark_bitten_reward reaches a marked victim only.
 static void test_inst_probe_keys(void) {
     printf("-- INST U37: inst_mask_marks and mark_bitten_reward\n");
@@ -4259,6 +4297,7 @@ static void test_inst(void) {
     test_inst_danger();
     test_inst_probe_keys();
     test_inst_sanction_signs();
+    test_inst_free_press();
     test_inst_frozen_biteable();
     test_inst_pursuit();
     test_inst_capability();
