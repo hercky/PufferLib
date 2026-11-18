@@ -3539,6 +3539,57 @@ static void test_inst_free_press(void) {
         "key on, marked fish 20 cm away or nobody marked: 0.5 as before (%.3f %.3f)", r[1][1], r[1][2]);
 }
 
+// U56 (2026-11-17): inst_mark_clear_on_zap 1: the first bite on a marked fish clears its mark (one sanction per mark) while an unbitten
+// mark still counts down; key off: the mark survives the bite and a second bite is a second sanction.
+static void test_inst_clear_on_zap(void) {
+    printf("-- INST U56: inst_mark_clear_on_zap (one sanction per mark, countdown kept)\n");
+    for (int on = 0; on < 2; on++) {
+        Dict kw = {0};
+        kw_inst_test(&kw, AH_FISH, 0);
+        dict_set(&kw, "inst_mark_clear_on_zap", on);
+        dict_set(&kw, "mark_bitten_reward", -5.0);
+        Harness h = make(&kw, AH_FISH);
+        Env* env = h.env;
+        clear_objects(env);
+        ah_park(&h, 0);
+        for (int i = 0; i < AH_FISH; i++) {
+            ah_still(&h, i);
+        }
+        int b = AH_FISH / 2;
+        env->fish[b].mark = 64;
+        place_fish(env, b, 10.0f, 20.0f, 0.0f);
+        place_fish(env, 0, 30.0f, 20.0f, 0.0f);        // far away: no bite yet
+        puf_step(env);
+        CHECK(env->fish[b].mark == 63, "run %d: an unbitten mark counts down (64 -> %d)", on, env->fish[b].mark);
+        place_fish(env, 0, 7.5f, 20.0f, 0.0f);         // right behind b, facing it
+        set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+        puf_step(env);
+        ah_still(&h, 0);
+        CHECK(env->fish[0].bite_victim == b && env->zaps_on_marked == 1, "run %d: the first bite is a sanction", on);
+        if (on) {
+            CHECK(env->fish[b].mark == 0, "key on: the sanction cleared the mark (%d)", env->fish[b].mark);
+        } else {
+            CHECK(env->fish[b].mark == 62, "key off: the mark survives the bite (%d)", env->fish[b].mark);
+        }
+        env->fish[b].freeze = 0;
+        env->fish[0].bite_cooldown = 0;
+        place_fish(env, 0, 7.5f, 20.0f, 0.0f);
+        set_action(&h, 0, -8.0f, 0.0f, 1.0f, AH_UPPER);
+        puf_step(env);
+        ah_still(&h, 0);
+        float d = env->agents[b].rewards[0];           // rewards are per step
+        CHECK(env->fish[0].bite_victim == b && env->zaps_on_marked == (on ? 1 : 2),
+            "run %d: the second bite lands; sanctions counted %d", on, env->zaps_on_marked);
+        if (on) {
+            CHECK(d > -5.0f, "key on: the second bite carries no fine (victim step reward %.3f)", d);
+        } else {
+            CHECK(d <= -5.0f + 1e-4f, "key off: the second bite fines again (victim step reward %.3f)", d);
+        }
+        destroy(&h);
+        dict_clear(&kw);
+    }
+}
+
 // U37 (probe keys): inst_mask_marks zeroes the mark slots while the marks act; mark_bitten_reward reaches a marked victim only.
 static void test_inst_probe_keys(void) {
     printf("-- INST U37: inst_mask_marks and mark_bitten_reward\n");
@@ -4298,6 +4349,7 @@ static void test_inst(void) {
     test_inst_probe_keys();
     test_inst_sanction_signs();
     test_inst_free_press();
+    test_inst_clear_on_zap();
     test_inst_frozen_biteable();
     test_inst_pursuit();
     test_inst_capability();

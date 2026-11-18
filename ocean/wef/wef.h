@@ -782,6 +782,7 @@ struct Env {
     int mark_freeze_steps;      // freeze of a MARKED victim (-1 = bitten_freeze_steps): the sanction the institution legitimates
     int mark_eat_ban_steps;     // eating ban of a MARKED victim (-1 = bitten_eat_ban_steps)
     int inst_mark_until_zap;    // 1: a mark does not decay; it is cleared by the sanction (a bite on the marked fish)
+    int inst_mark_clear_on_zap; // (2026-11-17) 1: the mark keeps its countdown AND is cleared by the first bite that lands on it (one sanction per mark)
     int inst_mark_wrongful;     // 1: a bite on an UNMARKED fish is itself a violation (the biter is marked)
     int bot_respond_zaps;       // role 15: sanctions received while marked before the bot complies (default 1)
     int zaps_wrongful;          // per-episode counter
@@ -3288,7 +3289,7 @@ void puf_step(Wef* env) {
                 env->agents[i].rewards[0] += loot;
                 env->loot_sum += loot;
                 env->agents[victim].rewards[0] += env->mark_bitten_reward;  // the felt sanction (probe), 0 by default
-                if (env->inst_mark_until_zap && !(env->mark_fixed_n > 0 && victim >= env->num_agents - env->mark_fixed_n)) {
+                if ((env->inst_mark_until_zap || env->inst_mark_clear_on_zap) && !(env->mark_fixed_n > 0 && victim >= env->num_agents - env->mark_fixed_n)) {
                     env->fish[victim].mark = 0;  // the sanction clears the label (phase 3, D11); a D27 fixed mark stays
                 }
             } else if (env->inst_mode > 0 && env->inst_mark_wrongful) {
@@ -4212,7 +4213,7 @@ void puf_render(Wef* env) {
         if (v >= 0) {
             c->bite_flash[v] = WEF_BITE_FLASH_FRAMES;
             c->bite_from[v] = i;
-            c->bite_sanction[v] = env->inst_mode > 0 && env->fish[v].mark > 0;
+            c->bite_sanction[v] = env->fish[i].trace_zap_marked || (env->inst_mode > 0 && env->fish[v].mark > 0);  // the bite may already have cleared the mark
             c->bites_given[i]++;
             c->bites_taken[v]++;
             c->bites_total++;
@@ -4691,7 +4692,7 @@ static const char* WEF_ENV_KEYS[] = {
     "inst_obj_radius_cm", "inst_contrast", "inst_latch", "inst_danger_obs", "inst_mask_marks", "mark_bitten_reward", "mark_zap_loot", "mark_press_free_cm", "mark_frozen_biteable", "mark_pursuit_gain", "act_slow_steps", "act_slow_gain", "mark_freeze_steps", "mark_eat_ban_steps",
     "mark_fixed_n", "mark_near_reward", "mark_near_cm",   // D27
     "bite_press_cost", "inst_violation_cost", "inst_violation_cost_p", "inst_violation_cost_delay",
-    "inst_mark_until_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze", "inst_auto_eat_ban", "inst_auto_eat_ban_p",
+    "inst_mark_until_zap", "inst_mark_clear_on_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze", "inst_auto_eat_ban", "inst_auto_eat_ban_p",
     "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps", "inst_grace_steps", "inst_duty_mode",
     "inst_mark_contrast", "mark_bite_radius_cm", "mark_bite_angle_deg",   // D23
 };
@@ -4856,6 +4857,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->mark_zap_loot = wef_cfg(kwargs, "mark_zap_loot", 0.0);
     env->mark_press_free_cm = wef_cfg(kwargs, "mark_press_free_cm", 0.0);
     env->inst_mark_until_zap = wef_cfg(kwargs, "inst_mark_until_zap", 0);
+    env->inst_mark_clear_on_zap = wef_cfg(kwargs, "inst_mark_clear_on_zap", 0);
     env->inst_mark_wrongful = wef_cfg(kwargs, "inst_mark_wrongful", 0);
     env->bot_respond_zaps = wef_cfg(kwargs, "bot_respond_zaps", 1);
     env->inst_auto_freeze = wef_cfg(kwargs, "inst_auto_freeze", 0);
