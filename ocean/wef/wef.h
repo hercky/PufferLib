@@ -40,7 +40,8 @@ typedef float obs_t;
 //   meta_roam_steps. Termination is judged after the step's eats, bites, marks and countdowns. A jam (8 steps that
 //   asked for forward motion and did not move; turning in place is not one) sends an EAT / READ / BITE fish on an
 //   8-step random heading (the bots' escape); the avoidance swerve keeps its side and then holds the heading 4 steps.
-//   Eat gate (meta_eat_gate 1): a learner fish eats only while its option is EAT.
+//   Eat gate (meta_eat_gate 1): a learner fish eats only while its option is EAT. meta_eat_stop_on_close 1: an EAT
+//   started in an open season stops uneaten when the season closes (meta_eat_aborts), so a violation is always a choice.
 //   Mask: env->meta_mask (always written) is copied to agents[i].action_mask when the trainer has bound it, at reset
 //   and at the end of every step. Log: the meta_* keys (wef_log_meta). Trace: V4 planted_slot = the executed option.
 //   Keys (every build, inert outside -DWEF_META): meta_options (1 required here, 0 elsewhere), meta_eat_pellets,
@@ -293,6 +294,8 @@ typedef struct FishAgent {
     int meta_steps;        // steps the running option has run (incl. this one)
     int meta_target;       // BITE_MARKED / BITE_ANY: the fish chosen at the option's start, -1 none
     int meta_eaten;        // EAT: pellets eaten since the option started
+    bool meta_eat_open_start;  // EAT: the season was open when the option started (meta_eat_stop_on_close)
+    bool meta_eat_abort;   // EAT: stopped this step because the season closed after an open-season start
     int meta_trace_opt;    // trace / render: the option this fish executed this step (0 = none: an invalid choice, held still)
     int meta_stall;        // consecutive steps without progress (no displacement, not eating, no cooldown or freeze; a collision reverts the move)
     Vec2 meta_last;        // position at the end of the previous step
@@ -529,6 +532,7 @@ struct Log {
     float meta_steps_bitea;
     float meta_steps_roam;
     float meta_timeouts;     // EAT / READ / BITE options ended by meta_max_steps
+    float meta_eat_aborts;   // EAT options started in an open season and stopped, uneaten, when it closed (meta_eat_stop_on_close)
     float meta_invalid;      // decision points whose choice was WAIT, out of range or masked (the fish held still)
     float meta_wait_breaks;  // non-WAIT choices while an option ran (ignored; impossible under the trainer's mask)
     float meta_dec_closed;   // deterrence (inst_mode > 0): decisions taken while the season is truly closed / open,
@@ -918,6 +922,7 @@ struct Env {
     int meta_roam_steps;        // ROAM length
     float meta_roam_r_cm;       // ROAM ring radius around the arena centre (outside patch + eating radius + body)
     int meta_eat_gate;          // 1: a learner fish eats only while its running option is EAT
+    int meta_eat_stop_on_close; // 1: an EAT started in an open season stops without eating once the season closes (a violation is always a choice)
     float inst_read_cm;         // a fish inside this radius reads the rule
     float inst_obj_radius_cm;   // the beacon's electrical signature: a waste-like conductor
     float inst_contrast;
@@ -984,6 +989,7 @@ struct Env {
     int meta_chosen[META_N];
     int meta_steps_in[META_N];
     int meta_timeouts;
+    int meta_eat_aborts;
     int meta_invalid;
     int meta_wait_breaks;
     int meta_dec_closed;
@@ -1989,6 +1995,7 @@ void puf_reset(Wef* env) {
         env->meta_steps_in[k] = 0;
     }
     env->meta_timeouts = 0;
+    env->meta_eat_aborts = 0;
     env->meta_invalid = 0;
     env->meta_wait_breaks = 0;
     env->meta_dec_closed = 0;
@@ -3341,6 +3348,8 @@ static void wef_meta_action(Wef* env, int i, float* raw) {
         fish->meta_opt = k;
         fish->meta_steps = 0;
         fish->meta_eaten = 0;
+        fish->meta_eat_open_start = !(env->inst_mode >= 1 && env->inst_mode <= 3 && wef_inst_closed(env, i));
+        fish->meta_eat_abort = false;
         fish->meta_escape = 0;  // a new option steers afresh
         fish->meta_stall = 0;
         fish->meta_avoid_left = 0;
@@ -3383,7 +3392,8 @@ static void wef_meta_end_step(Wef* env) {
         switch (fish->meta_opt) {
         case META_EAT:
             done = fish->meta_eaten >= env->meta_eat_pellets || fish->eat_ban > 0 || fish->freeze > 0
-                || env->food_active == 0 || env->collapsed;
+                || env->food_active == 0 || env->collapsed || fish->meta_eat_abort;
+            env->meta_eat_aborts += fish->meta_eat_abort;
             break;
         case META_READ:
             done = fish->last_read_tick == env->tick;
@@ -3667,6 +3677,13 @@ void puf_step(Wef* env) {
 #ifdef WEF_META
         // eat gate (meta_eat_gate): a learner fish eats only while its running option is EAT
         may_eat = !env->meta_eat_gate || env->roles[i] != 0 || agent->meta_opt == META_EAT;
+        // meta_eat_stop_on_close: an EAT chosen in an open season does not carry on into a closed one (judged with the
+        // same season state the violation test below uses, so it removes exactly the eats that would be lag violations)
+        if (may_eat && env->meta_eat_stop_on_close && env->roles[i] == 0 && agent->meta_opt == META_EAT && agent->meta_eat_open_start
+                && env->inst_mode >= 1 && env->inst_mode <= 3 && wef_inst_closed(env, i)) {
+            may_eat = false;
+            agent->meta_eat_abort = true;
+        }
 #endif
         if (may_eat && !agent->bite_action && agent->eat_cooldown <= 0 && agent->freeze <= 0 && agent->eat_ban <= 0) {
             for (int f = 0; f < env->num_food; f++) {
@@ -4792,6 +4809,7 @@ void puf_step(Wef* env) {
         env->log.meta_steps_bitea += (float)env->meta_steps_in[META_BITEA];
         env->log.meta_steps_roam += (float)env->meta_steps_in[META_ROAM];
         env->log.meta_timeouts += (float)env->meta_timeouts;
+        env->log.meta_eat_aborts += (float)env->meta_eat_aborts;
         env->log.meta_invalid += (float)env->meta_invalid;
         env->log.meta_wait_breaks += (float)env->meta_wait_breaks;
         env->log.meta_dec_closed += (float)env->meta_dec_closed;
@@ -5478,7 +5496,7 @@ static const char* WEF_ENV_KEYS[] = {
     "inst_mark_contrast", "mark_bite_radius_cm", "mark_bite_angle_deg",   // D23
     "inst_pos_x_cm", "inst_pos_y_cm",   // fixed beacon position (2026-11-20)
     // options build (-DWEF_META; the WEF_META block at the top of wef.h): accepted by every build, inert outside -DWEF_META
-    "meta_options", "meta_eat_pellets", "meta_max_steps", "meta_roam_steps", "meta_roam_r_cm", "meta_eat_gate",
+    "meta_options", "meta_eat_pellets", "meta_max_steps", "meta_roam_steps", "meta_roam_r_cm", "meta_eat_gate", "meta_eat_stop_on_close",
 };
 
 static void wef_check_keys(Dict* kwargs) {
@@ -5631,6 +5649,7 @@ void puf_init(Env* env, Dict* kwargs) {
     env->meta_roam_steps = wef_cfg(kwargs, "meta_roam_steps", 16);
     env->meta_roam_r_cm = wef_cfg(kwargs, "meta_roam_r_cm", 15.0);
     env->meta_eat_gate = wef_cfg(kwargs, "meta_eat_gate", 1);
+    env->meta_eat_stop_on_close = wef_cfg(kwargs, "meta_eat_stop_on_close", 1);
     env->inst_read_cm = wef_cfg(kwargs, "inst_read_cm", 5.0);
     env->inst_obj_radius_cm = wef_cfg(kwargs, "inst_obj_radius_cm", 0.5);
     env->inst_contrast = wef_cfg(kwargs, "inst_contrast", 1.0);
@@ -5746,7 +5765,7 @@ void puf_init(Env* env, Dict* kwargs) {
                 && env->inst_pos_y_cm >= 0.0f && env->inst_pos_y_cm <= env->min_arena_size_y && !env->inst_pos_random))
         && "inst_pos_x_cm / inst_pos_y_cm: both -1 (centre / inst_pos_random) or both inside the smallest arena, with inst_pos_random 0");
     assert(env->meta_eat_pellets >= 1 && env->meta_max_steps >= 1 && env->meta_roam_steps >= 1 && env->meta_roam_r_cm > 0.0f
-        && (env->meta_eat_gate == 0 || env->meta_eat_gate == 1)
+        && (env->meta_eat_gate == 0 || env->meta_eat_gate == 1) && (env->meta_eat_stop_on_close == 0 || env->meta_eat_stop_on_close == 1)
         && "meta_eat_pellets / meta_max_steps / meta_roam_steps >= 1, meta_roam_r_cm > 0, meta_eat_gate 0 / 1");
 #ifdef WEF_META
     assert(env->meta_options == 1 && "the -DWEF_META build is the options env: pass meta_options 1 (scripts/inst_commons_meta.args)");
@@ -6017,6 +6036,7 @@ static void wef_log_meta_tail(Log* log, Dict* out) {
     dict_set(out, "meta_steps_bitea", log->meta_steps_bitea);
     dict_set(out, "meta_steps_roam", log->meta_steps_roam);
     dict_set(out, "meta_timeouts", log->meta_timeouts);
+    dict_set(out, "meta_eat_aborts", log->meta_eat_aborts);
     dict_set(out, "meta_invalid", log->meta_invalid);
     dict_set(out, "meta_wait_breaks", log->meta_wait_breaks);
     dict_set(out, "meta_dec_closed", log->meta_dec_closed);
