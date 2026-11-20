@@ -31,17 +31,28 @@ typedef float obs_t;
 //   Controllers (oracle positions; wef_meta_control): EAT steers at the nearest active pellet, never bites, ends after
 //   meta_eat_pellets pellets, an eat_ban / freeze, no pellet / collapse; READ steers at inst_pos, ends on the step the
 //   fish reads; BITE_MARKED / BITE_ANY chase the nearest marked unfrozen / unfrozen fish chosen at the start (role 14's
-//   chase), press bite only with the target in the bite reach / cone and the bite off cooldown, end on any landed bite
-//   or when the target is frozen (BITE_MARKED: or unmarked); EAT / READ / BITEs time out after meta_max_steps
-//   (meta_timeouts); ROAM circles the arena centre on the ring meta_roam_r_cm at move 0.5 / |turn| < 0.5 (no effort
-//   penalty) for meta_roam_steps. Termination is judged after the step's eats, bites, marks and countdowns. A jam
-//   (8 steps without progress) sends an EAT / READ / BITE fish on an 8-step random heading (the bots' escape).
+//   chase, aimed at the quarry's predicted position, closing to 0.6 cm inside the reach instead of ramming it), press
+//   bite only when, on the predicted geometry of the bite resolution, the target will be in the bite reach / cone and
+//   the bite is off cooldown (BITE_MARKED also holds when a bystander would be the nearer victim; landings on another
+//   fish count meta_bite_offtarget), end on any landed bite or when the target is frozen (BITE_MARKED: or unmarked);
+//   EAT / READ / BITEs time out after meta_max_steps (meta_timeouts); ROAM circles the arena centre on the ring of
+//   radius meta_roam_r_cm (a guiding field: the orbit is r) at move 0.5 / |turn| < 0.5 (no effort penalty) for
+//   meta_roam_steps. Termination is judged after the step's eats, bites, marks and countdowns. A jam (8 steps that
+//   asked for forward motion and did not move; turning in place is not one) sends an EAT / READ / BITE fish on an
+//   8-step random heading (the bots' escape); the avoidance swerve keeps its side and then holds the heading 4 steps.
 //   Eat gate (meta_eat_gate 1): a learner fish eats only while its option is EAT.
 //   Mask: env->meta_mask (always written) is copied to agents[i].action_mask when the trainer has bound it, at reset
 //   and at the end of every step. Log: the meta_* keys (wef_log_meta). Trace: V4 planted_slot = the executed option.
 //   Keys (every build, inert outside -DWEF_META): meta_options (1 required here, 0 elsewhere), meta_eat_pellets,
 //   meta_max_steps, meta_roam_steps, meta_roam_r_cm, meta_eat_gate. Preset: scripts/inst_commons_meta.args. CPU
-//   checks: CFLAGS="-DMAX_AGENTS=8 -DWEF_INST -DWEF_META" ./ocean/wef/run_test.sh (U57-U66, U13m).
+//   checks: CFLAGS="-DMAX_AGENTS=8 -DWEF_INST -DWEF_META" ./ocean/wef/run_test.sh (U57-U69, U13m).
+//   Reading the trainer's numbers: rows with an option running are WAIT-only (logp 0, entropy 0, zero policy gradient),
+//   but PPO averages over all rows, so the dashboard's entropy / approx_kl / clipfrac / pg_loss are the decision values
+//   times f = meta_dec / (episode_length x learners) and do not compare with the continuous inst8 runs. Known
+//   limitation (kept for trajectory consistency: OBS_SIZE unchanged): no observation slot carries the running option or
+//   its age, so V(s) on WAIT-only rows infers them from the history (MinGRU); the last-action slots hold the executed
+//   low-level action. A META checkpoint (6-logit head, no logstd) is a different weight file from an inst8 one: load it
+//   only into a META binary (pufferl checks the file size).
 #ifndef WEF_INST
 #error "-DWEF_META needs -DWEF_INST (the options env is an institution build: beacon, marks, OBS_SIZE)"
 #endif
@@ -92,6 +103,8 @@ typedef float obs_t;
 // Option ids (the categorical action of the -DWEF_META build). META_WAIT is not an option: it continues the
 // running one; FishAgent.meta_opt == META_WAIT means "no option running" (a decision point).
 enum { META_WAIT = 0, META_EAT = 1, META_READ = 2, META_BITEM = 3, META_BITEA = 4, META_ROAM = 5, META_N = 6 };
+// ACT_SIZES {6} (the trainer's mask width, vec->mask_size) must equal META_N (the bytes wef_meta_write_mask copies)
+typedef char wef_meta_act_sizes_check[(META_N == 6 && NUM_ATNS == 1) ? 1 : -1];
 #endif
 // morm + amp + (knollen + metadata) per other fish + last action + 7 scalars:
 // 110 at MAX_AGENTS 4 (upstream), 162 at 8.
@@ -285,6 +298,10 @@ typedef struct FishAgent {
     Vec2 meta_last;        // position at the end of the previous step
     int meta_escape;       // steps left of a random-heading escape (EAT / READ / BITE controllers; the bots' stall escape)
     float meta_escape_turn;
+    bool meta_push;        // this step's controller asked for forward motion (raw move > -1.5): only such steps can stall
+    int meta_avoid_left;   // steps left of the avoidance memory (keep the swerve side, then hold the heading past the fish)
+    float meta_avoid_side; // -1 right / +1 left: the side of the running swerve
+    Vec2 meta_disp;        // every fish: its ground displacement of the last step (the chase predicts its quarry with it)
 #endif
 } FishAgent;
 
@@ -520,6 +537,13 @@ struct Log {
     float meta_eat_open;
     float meta_dec_known_closed;  // decisions / EAT choices while the fish's own reading says closed (inst_val > 0)
     float meta_eat_known_closed;
+    float meta_dec_closed_eatable;        // the deterrence denominators: the same decisions counted only when EAT was
+    float meta_dec_open_eatable;          // feasible (not banned / frozen / collapsed / no pellet), so
+    float meta_dec_known_closed_eatable;  // P(EAT | closed) = meta_eat_closed / meta_dec_closed_eatable
+    float meta_bite_offtarget;    // BITE_MARKED / BITE_ANY options whose landed bite hit a fish other than their target
+    float meta_timeouts_eat;      // meta_timeouts by kind: EAT, READ, the two BITEs
+    float meta_timeouts_read;
+    float meta_timeouts_bite;
 #endif
     float n;
 };
@@ -968,6 +992,11 @@ struct Env {
     int meta_eat_open;
     int meta_dec_known_closed;
     int meta_eat_known_closed;
+    int meta_dec_closed_eatable;        // the same decisions, counted only when EAT was feasible (the deterrence denominators)
+    int meta_dec_open_eatable;
+    int meta_dec_known_closed_eatable;
+    int meta_bite_offtarget;            // BITE options whose landed bite hit a fish other than the option's target
+    int meta_timeouts_in[META_N];       // meta_timeouts by option kind
 #endif
 };
 typedef Env Wef;
@@ -1968,6 +1997,13 @@ void puf_reset(Wef* env) {
     env->meta_eat_open = 0;
     env->meta_dec_known_closed = 0;
     env->meta_eat_known_closed = 0;
+    env->meta_dec_closed_eatable = 0;
+    env->meta_dec_open_eatable = 0;
+    env->meta_dec_known_closed_eatable = 0;
+    env->meta_bite_offtarget = 0;
+    for (int k = 0; k < META_N; k++) {
+        env->meta_timeouts_in[k] = 0;
+    }
 #endif
     // Only the first episode of an env can be shortened (desync_first_episode).
     env->cur_episode_length = env->episode == 0 ? env->first_episode_len : env->episode_length;
@@ -2897,53 +2933,297 @@ static void wef_meta_write_mask(Wef* env) {
     }
 }
 
-// Steer fish i at target (adapted from the bots' tail): a fish within 3 cm and roughly ahead triggers the 90-degree
-// avoidance turn (a chase, chase_j >= 0, exempts its quarry and ignores the rule inside 2 x the stop radius); stop
-// inside the stop radius, turn in place when within 2 x radius but off the cone, else 0.9 aligned (chase 1.0), 0.3
-// while turning. Never bites (the BITE controllers set raw[3]).
-static void wef_meta_steer(const Wef* env, int i, Vec2 target, float radius, float cone, int chase_j, float* raw) {
+// The controllers' stop: raw move -20 (3e-9 cm a step). The hold of an invalid choice is -8 (WEF_META_HOLD), which
+// still moves 4e-4 cm a step: over hundreds of steps next to another fish that creeps into contact (a collision).
+#define WEF_META_STOP (-20.0f)
+
+// No move into another fish: the env reverts a move that ends within 2 body radii of a fish (at the positions of that
+// moment: the fish with a lower index have moved, the others not, i.e. exactly what this fish sees now) and charges
+// COLLISION_REWARD, so every controller's move is cut short. Outside WEF_META_STANDOFF of a fish (not a BITE option's
+// quarry) the move stops where the path enters that standoff circle; inside it only the env's own test applies (the end point must clear 2 body
+// radii), so a fish next to another can still slide past or away instead of being pinned. The turn is kept; a move cut
+// to nothing is a blocked step (it counts towards the jam escape: meta_push stays set).
+#define WEF_META_STANDOFF 2.3f
+// the free length of a move of lin along heading ori2 (wef_meta_clear's test)
+static float wef_meta_free(const Wef* env, int i, float ori2, float lin) {
     const FishAgent* fish = &env->fish[i];
-    bool chase = chase_j >= 0;
-    float tx = target.x - fish->pos.x;
-    float ty = target.y - fish->pos.y;
-    float dist = sqrtf(tx * tx + ty * ty);
-    float err = wrap_angle(atan2f(ty, tx) - fish->orientation);
-    bool no_avoid = dist < 2.0f * radius;  // inside 2 x the stop radius the fish only turns in place or closes in
-    for (int j = 0; j < env->num_agents && !no_avoid; j++) {
-        if (j == i || j == chase_j) {
+    float ux = cosf(ori2);
+    float uy = sinf(ori2);
+    float rs = WEF_META_STANDOFF;
+    float rc = 2.0f * BODY_RADIUS_CM + 0.002f;
+    float free_len = lin;
+    for (int k = 0; k < env->num_agents; k++) {
+        if (k == i) {
+            continue;
+        }
+        float dx = env->fish[k].pos.x - fish->pos.x;
+        float dy = env->fish[k].pos.y - fish->pos.y;
+        float b = dx * ux + dy * uy;
+        if (b <= 0.0f) {
+            continue;  // behind the heading: a forward move only increases the distance
+        }
+        float d2 = dx * dx + dy * dy;
+        // the quarry of a BITE option gets no standoff (the chase closes to inside the bite reach)
+        bool quarry = (fish->meta_opt == META_BITEM || fish->meta_opt == META_BITEA) && k == fish->meta_target;
+        float c = d2 > rs * rs && !quarry ? d2 - rs * rs : d2 - rc * rc;
+        if (c <= 0.0f) {
+            // already within the contact margin (a scripted fish may stop there): only a move that ends beyond it
+            if (lin < b + sqrtf(b * b - c)) {
+                return 0.0f;
+            }
+            continue;
+        }
+        float disc = b * b - c;
+        if (disc > 0.0f) {
+            free_len = fminf(free_len, b - sqrtf(disc));
+        }
+    }
+    // the env clamps the end point to the arena after its collision test, so a move along a wall can be clamped into
+    // a fish there (an overlap that then collides every step): test the clamped end point too, halving the move
+    for (int h = 0; h < 8 && free_len > 0.0f; h++) {
+        float ex = clamp(fish->pos.x + ux * free_len, BODY_RADIUS_CM, env->arena_size_x - BODY_RADIUS_CM);
+        float ey = clamp(fish->pos.y + uy * free_len, BODY_RADIUS_CM, env->arena_size_y - BODY_RADIUS_CM);
+        bool hit = false;
+        for (int k = 0; k < env->num_agents && !hit; k++) {
+            float dx = env->fish[k].pos.x - ex;
+            float dy = env->fish[k].pos.y - ey;
+            hit = k != i && dx * dx + dy * dy < rc * rc;
+        }
+        if (!hit) {
+            break;
+        }
+        free_len = h == 7 ? 0.0f : 0.5f * free_len;
+    }
+    return free_len;
+}
+
+static float wef_meta_vmax(const Wef* env, const FishAgent* fish) {
+    return fish->max_linear_velocity * fmaxf(1.0f, env->mark_pursuit_gain);
+}
+
+static void wef_meta_clear(Wef* env, int i, float* raw) {
+    FishAgent* fish = &env->fish[i];
+    if (fish->eat_cooldown > 0 || fish->freeze > 0) {
+        return;  // no motion this step
+    }
+    float vmax = wef_meta_vmax(env, fish);
+    float lin = vmax / (1.0f + expf(-raw[0]));
+    float ori2 = wrap_angle(fish->orientation + tanhf(raw[1]) * fish->max_angular_velocity);
+    float free_len = wef_meta_free(env, i, ori2, lin);
+    if (free_len < lin) {
+        // raw -8 (the hold) still moves 4e-4 cm a step, which creeps into contact over an episode: -20 is 3e-9 cm
+        float f = free_len / vmax;
+        raw[0] = f < 2.1e-9f ? WEF_META_STOP : logf(f / (1.0f - f));
+    }
+}
+
+// Detour: when the move toward goal_dir (an absolute heading) is mostly blocked (free length under half the move
+// asked for), try the other turns reachable this step and take the one that makes the most progress along goal_dir
+// (free length x cos of the angle to it), so a fish next to another slides around it instead of waiting for it.
+static void wef_meta_detour(Wef* env, int i, float goal_dir, float* raw) {
+    FishAgent* fish = &env->fish[i];
+    if (fish->eat_cooldown > 0 || fish->freeze > 0) {
+        return;
+    }
+    float vmax = wef_meta_vmax(env, fish);
+    float lin = vmax / (1.0f + expf(-raw[0]));
+    if (lin < 0.05f) {
+        return;  // a deliberate stop or turn in place
+    }
+    float turn0 = tanhf(raw[1]);
+    float ori0 = wrap_angle(fish->orientation + turn0 * fish->max_angular_velocity);
+    float f0 = wef_meta_free(env, i, ori0, lin);
+    if (f0 >= 0.5f * lin) {
+        return;
+    }
+    float best = f0 * cosf(wrap_angle(goal_dir - ori0));
+    float best_turn = turn0;
+    for (int s = -4; s <= 4; s++) {
+        float turn = 0.2475f * (float)s;  // -0.99 .. 0.99
+        float ori2 = wrap_angle(fish->orientation + turn * fish->max_angular_velocity);
+        float prog = wef_meta_free(env, i, ori2, lin) * cosf(wrap_angle(goal_dir - ori2));
+        if (prog > best + 0.02f) {
+            best = prog;
+            best_turn = turn;
+        }
+    }
+    raw[1] = atanhf(best_turn);
+}
+
+// Avoidance (adapted from the bots' tail): a fish within 3 cm and roughly ahead (|bearing| < 1.22, skip_j exempt)
+// turns this one to pass it at right angles to its bearing; nearly dead ahead (two-way traffic between the patch and the beacon) always to the
+// right, so two fish meeting head-on both swerve the same way and pass instead of mirroring each other. Memory: the
+// side of a swerve is kept while it lasts, and for WEF_META_AVOID_HOLD steps after the last trigger the fish holds its
+// heading (err 0) instead of steering straight back into the fish it just avoided (the zigzag of alternate steps).
+#define WEF_META_AVOID_HOLD 4
+// in_way > 0 (the fish is close to its goal, within 2 x the stop radius): only fish nearer than in_way (between it
+// and the goal) count, so a crowd around a pellet or a quarry does not turn it away from its goal.
+static float wef_meta_avoid(Wef* env, int i, int skip_j, float in_way, float err) {
+    FishAgent* fish = &env->fish[i];
+    for (int j = 0; j < env->num_agents; j++) {
+        if (j == i || j == skip_j) {
             continue;
         }
         float dx = env->fish[j].pos.x - fish->pos.x;
         float dy = env->fish[j].pos.y - fish->pos.y;
-        if (dx * dx + dy * dy > 9.0f) {
+        float d2 = dx * dx + dy * dy;
+        if (d2 > 9.0f || (in_way > 0.0f && d2 >= in_way * in_way)) {
             continue;
         }
         float bearing = wrap_angle(atan2f(dy, dx) - fish->orientation);
         if (fabsf(bearing) < 1.22f) {
-            // turn away from it; nearly dead ahead (two-way traffic between the patch and the beacon) always to the
-            // right, so two fish meeting head-on both swerve the same way and pass instead of mirroring each other
-            err = fabsf(bearing) < 0.35f || bearing > 0.0f ? -0.5f * PI_F : 0.5f * PI_F;
-            break;
+            if (fish->meta_avoid_left <= 0) {
+                fish->meta_avoid_side = fabsf(bearing) < 0.35f || bearing > 0.0f ? -1.0f : 1.0f;
+            }
+            fish->meta_avoid_left = WEF_META_AVOID_HOLD;
+            // head at right angles to the fish's bearing (past it on the chosen side), not 90 degrees off the present
+            // heading: once the fish is abeam the turn stops, instead of spinning in place while the move is blocked
+            return wrap_angle(bearing + fish->meta_avoid_side * (0.5f * PI_F + 0.35f));  // a little outwards
         }
     }
+    if (fish->meta_avoid_left > 0) {
+        fish->meta_avoid_left--;
+        return 0.0f;
+    }
+    return err;
+}
+
+// Steer fish i at a fixed point (EAT: a pellet, READ: the beacon): avoidance outside 2 x the stop radius; stop inside
+// the stop radius, turn in place when within 2 x radius but off the cone, else 0.9 aligned, 0.3 while turning.
+// Never bites.
+// reach: the goal counts as reached within this distance of the target (READ: inst_read_cm; EAT: 0, the pellet itself);
+// within reach + 3 cm only the fish between this one and the edge of the reach turn it aside.
+static void wef_meta_steer(Wef* env, int i, Vec2 target, float radius, float cone, float reach, float* raw) {
+    FishAgent* fish = &env->fish[i];
+    float tx = target.x - fish->pos.x;
+    float ty = target.y - fish->pos.y;
+    float dist = sqrtf(tx * tx + ty * ty);
+    float err = wrap_angle(atan2f(ty, tx) - fish->orientation);
+    float in_way = dist < 2.0f * radius ? dist : reach > 0.0f && dist < reach + 3.0f ? fmaxf(dist - reach, 0.0f) + 1.0f : 0.0f;
+    err = wef_meta_avoid(env, i, -1, in_way, err);
     float turn = clamp(err / fish->max_angular_velocity, -0.99f, 0.99f);
     raw[1] = atanhf(turn);
     raw[2] = 1.0f;
     raw[3] = -1.0f;
     bool aligned = fabsf(err) <= cone * 0.5f;
     if (dist < radius || (dist < 2.0f * radius && !aligned)) {
-        raw[0] = -8.0f;
+        raw[0] = WEF_META_STOP;
     } else {
-        raw[0] = fabsf(err) < 0.6f ? (chase ? 8.0f : 2.2f) : -0.85f;
+        raw[0] = fabsf(err) < 0.6f ? 2.2f : -0.85f;
+        wef_meta_detour(env, i, atan2f(ty, tx), raw);
     }
 }
 
+// Where fish j will be when this step's bites resolve, as fish i (acting now) can tell: the fish with a lower index
+// have already moved this step; the others are assumed to repeat their last displacement.
+static Vec2 wef_meta_predict(const Wef* env, int i, int j) {
+    Vec2 p = env->fish[j].pos;
+    if (j > i) {
+        p.x += env->fish[j].meta_disp.x;
+        p.y += env->fish[j].meta_disp.y;
+    }
+    return p;
+}
+
+// in_forward_cone for a pose that is not (yet) a fish's
+static bool wef_meta_in_cone(Vec2 pos, float orientation, Vec2 target, float radius_cm, float cone) {
+    float dx = target.x - pos.x;
+    float dy = target.y - pos.y;
+    if (dx * dx + dy * dy >= radius_cm * radius_cm) {
+        return false;
+    }
+    return fabsf(wrap_angle(atan2f(dy, dx) - orientation)) <= cone * 0.5f;
+}
+
+// The chase of BITE_MARKED / BITE_ANY (role 14's: full speed, quarry exempt from the avoidance turn, turn in place when
+// close but off the cone), aimed at the quarry's predicted position and closing only to WEF_META_CHASE_GAP short of the
+// reach (bodies touch at 2 cm, so it does not ram the quarry). The press is decided on the predicted geometry: this
+// fish's pose after its own turn and move (a move into another fish reverts, as in the env) against the quarry's
+// predicted position, with a WEF_META_PRESS_MARGIN inside the reach; every press costs bite_press_cost, so a press that
+// would miss is not made. marked_only (BITE_MARKED) also holds the press when another biteable fish would be the
+// nearer victim (the bite lands on the nearest eligible fish in the cone, which would be a wrongful bite).
+#define WEF_META_CHASE_GAP 0.6f
+#define WEF_META_PRESS_MARGIN 0.15f
+static void wef_meta_chase(Wef* env, int i, int j, bool marked_only, float* raw) {
+    FishAgent* fish = &env->fish[i];
+    bool marked = env->inst_mode > 0 && env->fish[j].mark > 0;
+    float r = marked ? env->mark_bite_radius_cm : BITING_RADIUS_CM;
+    float cone = marked ? env->mark_bite_cone : EATING_ANGLE;
+    Vec2 tp = wef_meta_predict(env, i, j);
+    float tx = tp.x - fish->pos.x;
+    float ty = tp.y - fish->pos.y;
+    float dist = sqrtf(tx * tx + ty * ty);
+    float err = wrap_angle(atan2f(ty, tx) - fish->orientation);
+    err = wef_meta_avoid(env, i, j, dist < 2.0f * r ? dist : 0.0f, err);
+    float turn = clamp(err / fish->max_angular_velocity, -0.99f, 0.99f);
+    raw[1] = atanhf(turn);
+    raw[2] = 1.0f;
+    raw[3] = -1.0f;
+    bool aligned = fabsf(err) <= cone * 0.5f;
+    float gap = fmaxf(r - WEF_META_CHASE_GAP, 2.0f * BODY_RADIUS_CM + 0.3f);
+    if (dist < 2.0f * r && !aligned) {
+        raw[0] = WEF_META_STOP;  // close but off the cone: turn in place
+    } else if (fabsf(err) >= 0.6f) {
+        raw[0] = -0.85f;
+    } else {
+        // the fraction of full speed that ends the move at the gap (full speed while far; 0 inside the gap); a move
+        // into the quarry's present position is shortened by wef_meta_clear like any other
+        float f = clamp((dist - gap) / fish->max_linear_velocity, 0.0f, 1.0f);
+        raw[0] = f < 2.1e-9f ? WEF_META_STOP : f > 0.99966f ? 8.0f : logf(f / (1.0f - f));
+    }
+    if (fish->bite_cooldown > 0 || fish->freeze > 0) {
+        return;
+    }
+    // this fish's pose at the bite resolution (its move as cut short by wef_meta_clear, which wef_meta_action applies
+    // again: a no-op on a cleared move)
+    wef_meta_clear(env, i, raw);
+    float ori2 = wrap_angle(fish->orientation + tanhf(raw[1]) * fish->max_angular_velocity);
+    Vec2 p2 = fish->pos;
+    if (fish->eat_cooldown <= 0) {
+        float lin = fish->max_linear_velocity / (1.0f + expf(-raw[0]));
+        p2.x += cosf(ori2) * lin;
+        p2.y += sinf(ori2) * lin;
+    }
+    if (!wef_meta_in_cone(p2, ori2, tp, r - WEF_META_PRESS_MARGIN, cone)) {
+        return;
+    }
+    if (marked_only) {
+        float d2 = (tp.x - p2.x) * (tp.x - p2.x) + (tp.y - p2.y) * (tp.y - p2.y);
+        for (int k = 0; k < env->num_agents; k++) {
+            const FishAgent* o = &env->fish[k];
+            if (k == i || k == j || (o->freeze > 0 && !(env->mark_frozen_biteable && o->mark > 0))) {
+                continue;
+            }
+            bool marked_k = env->inst_mode > 0 && o->mark > 0;
+            Vec2 pk = wef_meta_predict(env, i, k);
+            float rk = (marked_k ? env->mark_bite_radius_cm : BITING_RADIUS_CM) + WEF_META_PRESS_MARGIN;
+            float ck = marked_k ? env->mark_bite_cone : EATING_ANGLE;
+            float dk2 = (pk.x - p2.x) * (pk.x - p2.x) + (pk.y - p2.y) * (pk.y - p2.y);
+            if (dk2 <= d2 + 0.25f && wef_meta_in_cone(p2, ori2, pk, rk, ck)) {
+                return;  // a bystander would (or might) take the bite
+            }
+        }
+    }
+    raw[3] = 1.0f;
+}
+
 // Jam escape of the steering controllers (adapted from the bots' stall escape): the avoidance turn and the reverted
-// move of a collision can pin fish heading for one point (8 fish at the 5 cm beacon in a corner did, every step, for
-// the whole episode); after WEF_META_STALL consecutive steps without progress the fish swims a random heading for
-// WEF_META_ESCAPE steps, then steers again. ROAM never escapes (its moves stay at 0.5 and it turns in place).
+// move of a collision can pin fish heading for one point; after WEF_META_STALL consecutive steps in which the
+// controller asked for forward motion (meta_push) and the fish did not move (a move cut by wef_meta_clear, a wall), it
+// swims a random heading for WEF_META_ESCAPE steps (short: a long escape carries a fish far off its course), then
+// steers again. Turning in place (raw move -8: a pellet or a quarry
+// behind the fish, about 12 steps for 180 degrees) and holding at the chase gap are not stalls. ROAM never escapes
+// (its moves stay at 0.5 and it turns in place).
 #define WEF_META_STALL 8
-#define WEF_META_ESCAPE 8
+#define WEF_META_ESCAPE 4
+
+// ROAM: circle the arena centre counter-clockwise (every fish the same way: no head-on meetings) on the ring of radius
+// meta_roam_r_cm by a guiding field: the heading is the ring's tangent bent by atan(WEF_META_ROAM_K (rho - r))
+// inwards outside the ring and outwards inside it, so the orbit settles on rho = r (a turn of l / r per step, well
+// inside the |turn| < 0.5 limit) whatever the radius. Move 0.5 and |turn| < 0.5: no effort penalty. Off the heading by
+// more than 0.6 rad it turns in place, so it never cuts inwards across the patch. Avoidance as for the other controllers
+// (wef_meta_avoid), at the same move 0.5: a roaming fish near the beacon or the patch is not a standing obstacle.
+#define WEF_META_ROAM_K 0.5f
 
 // The running option's controller for this step.
 static void wef_meta_control(Wef* env, int i, float* raw) {
@@ -2982,60 +3262,40 @@ static void wef_meta_control(Wef* env, int i, float* raw) {
             }
         }
         if (best >= 0) {
-            wef_meta_steer(env, i, env->food[best].pos, EATING_RADIUS_CM, EATING_ANGLE, -1, raw);
+            wef_meta_steer(env, i, env->food[best].pos, EATING_RADIUS_CM, EATING_ANGLE, 0.0f, raw);
         }
         return;
     }
     case META_READ:
-        wef_meta_steer(env, i, env->inst_pos, 0.5f, EATING_ANGLE, -1, raw);
+        wef_meta_steer(env, i, env->inst_pos, 0.5f, EATING_ANGLE, env->inst_read_cm, raw);
         return;
     case META_BITEM:
-    case META_BITEA: {
-        // chase the fish chosen at the start (role 14's chase); press bite only when it is inside the bite reach /
-        // cone (the D23 mark reach for a marked target) and the bite is off cooldown (bite_press_cost is per press)
-        int j = fish->meta_target;
-        if (j < 0) {
-            return;
-        }
-        bool marked = env->inst_mode > 0 && env->fish[j].mark > 0;
-        float r = marked ? env->mark_bite_radius_cm : BITING_RADIUS_CM;
-        float cone = marked ? env->mark_bite_cone : EATING_ANGLE;
-        wef_meta_steer(env, i, env->fish[j].pos, r, cone, j, raw);
-        if (fish->bite_cooldown <= 0 && fish->freeze <= 0 && in_forward_cone(fish, env->fish[j].pos, r, cone)) {
-            raw[3] = 1.0f;
+    case META_BITEA:
+        // chase the fish chosen at the start; press only when the bite would land (wef_meta_chase)
+        if (fish->meta_target >= 0) {
+            wef_meta_chase(env, i, fish->meta_target, fish->meta_opt == META_BITEM, raw);
         }
         return;
-    }
     case META_ROAM: {
-        // circle the arena centre counter-clockwise (every fish the same way: no head-on meetings) on the ring of
-        // radius meta_roam_r_cm (pure pursuit of a point 0.6 rad ahead settles at r cos 0.3 = 0.96 r), at move 0.5
-        // and |turn| < 0.5: no effort penalty. Off the heading by more than 0.6 rad it turns in place, so it never
-        // cuts inwards across the patch; the avoidance turn also turns in place.
         float cx = 0.5f * env->arena_size_x;
         float cy = 0.5f * env->arena_size_y;
-        float a = atan2f(fish->pos.y - cy, fish->pos.x - cx) + 0.6f;
-        float tx = cx + env->meta_roam_r_cm * cosf(a) - fish->pos.x;
-        float ty = cy + env->meta_roam_r_cm * sinf(a) - fish->pos.y;
-        float err = wrap_angle(atan2f(ty, tx) - fish->orientation);
-        for (int j = 0; j < env->num_agents; j++) {
-            if (j == i) {
-                continue;
-            }
-            float dx = env->fish[j].pos.x - fish->pos.x;
-            float dy = env->fish[j].pos.y - fish->pos.y;
-            if (dx * dx + dy * dy > 9.0f) {
-                continue;
-            }
-            float bearing = wrap_angle(atan2f(dy, dx) - fish->orientation);
-            if (fabsf(bearing) < 1.22f) {
-                err = bearing > 0.0f ? -0.5f * PI_F : 0.5f * PI_F;
-                break;
-            }
-        }
-        raw[0] = fabsf(err) < 0.6f ? 0.0f : -8.0f;
+        float dx = fish->pos.x - cx;
+        float dy = fish->pos.y - cy;
+        float rho = sqrtf(dx * dx + dy * dy);
+        float heading = atan2f(dy, dx) + 0.5f * PI_F + atanf(WEF_META_ROAM_K * (rho - env->meta_roam_r_cm));
+        float err = wef_meta_avoid(env, i, -1, 0.0f, wrap_angle(heading - fish->orientation));
+        raw[0] = fabsf(err) < 0.6f ? 0.0f : WEF_META_STOP;
         raw[1] = atanhf(clamp(err / fish->max_angular_velocity, -0.49f, 0.49f));
         raw[2] = 1.0f;
         raw[3] = -1.0f;
+        if (raw[0] > WEF_META_STOP) {
+            // blocked: slide around (the detour's turns are capped to |turn| < 0.5 here: no effort penalty)
+            float t0 = raw[1];
+            wef_meta_detour(env, i, heading, raw);
+            if (fabsf(tanhf(raw[1])) > 0.5f) {
+                raw[1] = t0;
+            }
+        }
         return;
     }
     default:
@@ -3054,6 +3314,7 @@ static void wef_meta_action(Wef* env, int i, float* raw) {
         if (k <= META_WAIT || !env->meta_mask[i][k]) {
             env->meta_invalid++;  // WAIT, out of range or masked at a decision point: hold still, decide again next step
             fish->meta_trace_opt = META_WAIT;
+            fish->meta_push = false;
             memcpy(raw, WEF_META_HOLD, sizeof(WEF_META_HOLD));
             return;
         }
@@ -3070,12 +3331,19 @@ static void wef_meta_action(Wef* env, int i, float* raw) {
                 env->meta_dec_known_closed++;
                 env->meta_eat_known_closed += k == META_EAT;
             }
+            // the denominators of P(EAT | ...): only decisions at which EAT was on offer (not banned, frozen,
+            // collapsed, out of pellets), so a ban arm's forced restraint does not read as deterrence
+            bool eatable = env->meta_mask[i][META_EAT];
+            env->meta_dec_closed_eatable += closed && eatable;
+            env->meta_dec_open_eatable += !closed && eatable;
+            env->meta_dec_known_closed_eatable += fish->inst_val > 0.0f && eatable;
         }
         fish->meta_opt = k;
         fish->meta_steps = 0;
         fish->meta_eaten = 0;
         fish->meta_escape = 0;  // a new option steers afresh
         fish->meta_stall = 0;
+        fish->meta_avoid_left = 0;
         fish->meta_target = k == META_BITEM ? wef_meta_nearest_target(env, i, true)
             : k == META_BITEA ? wef_meta_nearest_target(env, i, false) : -1;
     } else if (k != META_WAIT) {
@@ -3085,6 +3353,8 @@ static void wef_meta_action(Wef* env, int i, float* raw) {
     env->meta_steps_in[fish->meta_opt]++;
     fish->meta_trace_opt = fish->meta_opt;
     wef_meta_control(env, i, raw);
+    fish->meta_push = raw[0] > -1.5f;  // asked for forward motion (before the clearance cut: a blocked step is a stall)
+    wef_meta_clear(env, i, raw);
 }
 
 // Option termination, after the step's eats, bites, marks and countdowns: an ended option makes the fish a decision
@@ -3097,8 +3367,13 @@ static void wef_meta_end_step(Wef* env) {
         }
         float moved = fabsf(fish->pos.x - fish->meta_last.x) + fabsf(fish->pos.y - fish->meta_last.y);
         fish->meta_last = fish->pos;
-        bool idle = moved < 0.05f && !fish->ate && fish->eat_cooldown <= 0 && fish->freeze <= 0;
-        fish->meta_stall = idle ? fish->meta_stall + 1 : 0;
+        // a stall is a step that asked for forward motion and did not move (a reverted move, a wall); turning in place
+        // or holding at the chase gap is neither a stall nor progress
+        if (fish->ate || fish->eat_cooldown > 0 || fish->freeze > 0 || (fish->meta_push && moved >= 0.05f)) {
+            fish->meta_stall = 0;
+        } else if (fish->meta_push) {
+            fish->meta_stall++;
+        }
         if (fish->meta_opt == META_WAIT) {
             continue;
         }
@@ -3115,9 +3390,11 @@ static void wef_meta_end_step(Wef* env) {
             break;
         case META_BITEM:
             done = fish->bite_victim >= 0 || j < 0 || env->fish[j].mark <= 0 || env->fish[j].freeze > 0;
+            env->meta_bite_offtarget += fish->bite_victim >= 0 && fish->bite_victim != j;
             break;
         case META_BITEA:
             done = fish->bite_victim >= 0 || j < 0 || env->fish[j].freeze > 0;
+            env->meta_bite_offtarget += fish->bite_victim >= 0 && fish->bite_victim != j;
             break;
         case META_ROAM:
             done = fish->meta_steps >= env->meta_roam_steps;
@@ -3128,6 +3405,7 @@ static void wef_meta_end_step(Wef* env) {
         }
         bool timeout = !done && fish->meta_opt != META_ROAM && fish->meta_steps >= env->meta_max_steps;
         env->meta_timeouts += timeout;
+        env->meta_timeouts_in[fish->meta_opt] += timeout;
         if (done || timeout) {
             fish->meta_opt = META_WAIT;
             fish->meta_target = -1;
@@ -3520,6 +3798,9 @@ void puf_step(Wef* env) {
         );
         float gx = agent->pos.x - prev.x;
         float gy = agent->pos.y - prev.y;
+#ifdef WEF_META
+        agent->meta_disp = (Vec2){gx, gy};
+#endif
         float c = cosf(prev_ori);
         float s = sinf(prev_ori);
         // rotate ground displacement into ego frame (angle -prev_ori)
@@ -4519,6 +4800,13 @@ void puf_step(Wef* env) {
         env->log.meta_eat_open += (float)env->meta_eat_open;
         env->log.meta_dec_known_closed += (float)env->meta_dec_known_closed;
         env->log.meta_eat_known_closed += (float)env->meta_eat_known_closed;
+        env->log.meta_dec_closed_eatable += (float)env->meta_dec_closed_eatable;
+        env->log.meta_dec_open_eatable += (float)env->meta_dec_open_eatable;
+        env->log.meta_dec_known_closed_eatable += (float)env->meta_dec_known_closed_eatable;
+        env->log.meta_bite_offtarget += (float)env->meta_bite_offtarget;
+        env->log.meta_timeouts_eat += (float)env->meta_timeouts_in[META_EAT];
+        env->log.meta_timeouts_read += (float)env->meta_timeouts_in[META_READ];
+        env->log.meta_timeouts_bite += (float)(env->meta_timeouts_in[META_BITEM] + env->meta_timeouts_in[META_BITEA]);
 #endif
         env->log.n += 1.0f;
         puf_reset(env);
@@ -4630,8 +4918,13 @@ void puf_render(Wef* env) {
     if (IsKeyPressed(KEY_TAB)) {
         ToggleFullscreen();
     }
-    // Hold Left Shift + WASD/arrows; Space bites. Skip F/S viz toggles while driving.
+    // Hold Left Shift + WASD/arrows; Space bites. Skip F/S viz toggles while driving. Not in the options build (one
+    // action float per fish: the 4 raw values would overwrite fish 1-3's options).
+#ifdef WEF_META
+    if (false) {
+#else
     if (IsWindowReady() && IsKeyDown(KEY_LEFT_SHIFT)) {
+#endif
         float* a = env->agents[0].actions;
         a[0] = 0.0f;
         a[1] = 0.0f;
@@ -5462,7 +5755,7 @@ void puf_init(Env* env, Dict* kwargs) {
         && "-DWEF_META: the ROAM ring (meta_roam_r_cm + body + 1 cm) must fit in the smallest arena");
     assert((env->food_distribution != FOOD_PATCHY || env->patch_layout != 2
             || env->meta_roam_r_cm > env->patch_radius_cm + env->patch_radius_std_cm + EATING_RADIUS_CM + BODY_RADIUS_CM)
-        && "-DWEF_META: the ROAM ring must clear the centred patch (patch_radius + patch_radius_std + eating radius + body)");
+        && "-DWEF_META: the ROAM ring (the orbit is meta_roam_r_cm itself, U59) must clear the centred patch (patch_radius + patch_radius_std + eating radius + body)");
 #else
     assert(env->meta_options == 0 && "meta_options 1 needs the options build (NVCC_EXTRA / CFLAGS -DMAX_AGENTS=8 -DWEF_INST -DWEF_META)");
 #endif
@@ -5730,6 +6023,13 @@ static void wef_log_meta_tail(Log* log, Dict* out) {
     dict_set(out, "meta_dec_open", log->meta_dec_open);
     dict_set(out, "meta_dec_known_closed", log->meta_dec_known_closed);
     dict_set(out, "meta_eat_known_closed", log->meta_eat_known_closed);
+    dict_set(out, "meta_dec_closed_eatable", log->meta_dec_closed_eatable);
+    dict_set(out, "meta_dec_open_eatable", log->meta_dec_open_eatable);
+    dict_set(out, "meta_dec_known_closed_eatable", log->meta_dec_known_closed_eatable);
+    dict_set(out, "meta_bite_offtarget", log->meta_bite_offtarget);
+    dict_set(out, "meta_timeouts_eat", log->meta_timeouts_eat);
+    dict_set(out, "meta_timeouts_read", log->meta_timeouts_read);
+    dict_set(out, "meta_timeouts_bite", log->meta_timeouts_bite);
 }
 #endif
 

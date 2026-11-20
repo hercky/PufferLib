@@ -7,7 +7,7 @@
 #   CFLAGS="-DMAX_AGENTS=8 -DWEF_INST" ./ocean/wef/run_test.sh   # institution build: build/wef_test8i
 #   CFLAGS=-DWEF_INST ./ocean/wef/run_test.sh                    # 4-fish institution build: build/wef_test4i
 #   CFLAGS="-DMAX_AGENTS=8 -DWEF_INST -DWEF_META" ./ocean/wef/run_test.sh   # options build: build/wef_test8m
-# An options build (-DWEF_META, the WEF_META block at the top of wef.h) runs its own unit checks (U57-U66; the raw-action suites need
+# An options build (-DWEF_META, the WEF_META block at the top of wef.h) runs its own unit checks (U57-U69; the raw-action suites need
 # 4 action floats per fish) and, instead of U13, U13m: with every fish scripted its episodes must be bit-identical to the
 # same-MAX_AGENTS institution build's (calibration hash=1 over obs rows and rewards, plus every printed metric).
 # An institution build also runs U13: at inst_obs 0 its bench projection onto the base slots and its

@@ -1741,6 +1741,16 @@ void puf_load_weights_into(Float dst, Prec params,
     int64_t nbytes = numel(dst.shape) * sizeof(float);
     FILE* fp = fopen(path, "rb");
     assert(fp && "failed to open weights for reading");
+    // The file must hold exactly this net's weights: a larger file (e.g. a -DWEF_META 6-logit checkpoint read by a
+    // continuous inst8 binary) would otherwise load a misaligned prefix without complaint.
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if ((int64_t)fsize != nbytes) {
+        fprintf(stderr, "puf_load_weights_into: %s holds %ld bytes, this net needs %lld (checkpoint from another build / "
+            "network shape?)\n", path, fsize, (long long)nbytes);
+        exit(1);
+    }
     char* buf = (char*)malloc(nbytes);
     size_t nread = fread(buf, 1, nbytes, fp);
     fclose(fp);
