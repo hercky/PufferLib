@@ -24,6 +24,11 @@
  *      mark). They need the -DWEF_INST build
  *      (build/wef_test8i via CFLAGS="-DMAX_AGENTS=8 -DWEF_INST") and are skipped elsewhere;
  *      run_test.sh adds U13' (base-slot projection identity of the institution build).
+ *   7. Options build (-DWEF_META on top of -DWEF_INST, the WEF_META block at the top of wef.h), checks U57-U66: the action mask,
+ *      each option controller (EAT, ROAM, READ, BITE_MARKED, BITE_ANY), WAIT / invalid handling and the counters,
+ *      the eat gate, the deterrence Log keys, the trace field, random-option episodes. In that build NUM_ATNS is 1
+ *      (one option index per fish), so the raw-action suites above are not run (set_action aborts); run_test.sh adds
+ *      U13m (all-scripted episodes are bit-identical to the plain institution build's).
  */
 #include <stdbool.h>
 #include <stdio.h>
@@ -33,6 +38,11 @@
 #include <time.h>
 
 #include "wef.h"
+
+#ifdef WEF_META
+// The raw-action suites (set_action: 4 floats per fish) are compiled but not run in the options build.
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
 
 static int g_fail = 0;
 #define CHECK(cond, ...) do { \
@@ -45,6 +55,7 @@ typedef struct {
     float* act;
     float* rew;
     float* term;
+    unsigned char* mask;  // the trainer's action-mask buffer (bound in the options build only, NULL otherwise)
 } Harness;
 
 static void kw_base(Dict* kw, int num_fish) {
@@ -61,6 +72,9 @@ static void kw_base(Dict* kw, int num_fish) {
     dict_set(kw, "electric_field_radius", 15);
     dict_set(kw, "reflection_wall_range", 100);
     dict_set(kw, "episode_length", 1024);
+#ifdef WEF_META
+    dict_set(kw, "meta_options", 1);  // the options build requires it (every harness preset runs there)
+#endif
 }
 
 // The scripts/cleanup.args preset.
@@ -232,6 +246,24 @@ static void kw_inst_commons_single(Dict* kw) {
 }
 
 // shape=conv: the AH-conv keys on top of kw_allelo (paper cubic F, hold 8, 2048 steps).
+#ifdef WEF_META
+// preset=inst_commons_meta: the options env (scripts/inst_commons_meta.args): the single Commons with the rule on
+// (inst_mode 1) and a short-range beacon off the patch (5 cm at (5, 5)); options at their defaults.
+static void kw_inst_commons_meta(Dict* kw) {
+    kw_inst_commons_single(kw);
+    dict_set(kw, "inst_mode", 1);
+    dict_set(kw, "inst_read_cm", 5);
+    dict_set(kw, "inst_pos_x_cm", 5);
+    dict_set(kw, "inst_pos_y_cm", 5);
+    dict_set(kw, "meta_options", 1);
+    dict_set(kw, "meta_eat_pellets", 1);
+    dict_set(kw, "meta_max_steps", 64);
+    dict_set(kw, "meta_roam_steps", 16);
+    dict_set(kw, "meta_roam_r_cm", 15);
+    dict_set(kw, "meta_eat_gate", 1);
+}
+#endif
+
 static void kw_allelo_conv(Dict* kw) {
     dict_set(kw, "ripen_lin", 1.7e-3);
     dict_set(kw, "ripen_cubic", 7.2e-3);
@@ -265,11 +297,17 @@ static Harness make_ex(Dict* kw, int num_fish, int stride) {
     h.act = (float*)calloc((size_t)num_fish * NUM_ATNS, sizeof(float));
     h.rew = (float*)calloc(num_fish, sizeof(float));
     h.term = (float*)calloc(num_fish, sizeof(float));
+#ifdef WEF_META
+    h.mask = (unsigned char*)calloc((size_t)num_fish * META_N, 1);
+#endif
     for (int i = 0; i < num_fish; i++) {
         h.env->agents[i].observations = h.obs + i * stride;
         h.env->agents[i].actions = h.act + i * NUM_ATNS;
         h.env->agents[i].rewards = h.rew + i;
         h.env->agents[i].terminals = h.term + i;
+#ifdef WEF_META
+        h.env->agents[i].action_mask = h.mask + i * META_N;  // bound before the reset, as pufferl's env_setup does
+#endif
     }
     puf_reset(h.env);
     return h;
@@ -286,15 +324,71 @@ static void destroy(Harness* h) {
     free(h->act);
     free(h->rew);
     free(h->term);
+    free(h->mask);
     *h = (Harness){0};
 }
 
 static void set_action(Harness* h, int i, float move_raw, float turn_raw, float eod_raw, float bite_raw) {
+#ifdef WEF_META
+    (void)h; (void)i; (void)move_raw; (void)turn_raw; (void)eod_raw; (void)bite_raw;
+    fprintf(stderr, "set_action: the -DWEF_META build takes one option index per fish (set_option)\n");
+    abort();
+#else
     h->act[i * NUM_ATNS + 0] = move_raw;
     h->act[i * NUM_ATNS + 1] = turn_raw;
     h->act[i * NUM_ATNS + 2] = eod_raw;
     h->act[i * NUM_ATNS + 3] = bite_raw;
+#endif
 }
+
+#ifdef WEF_META
+static void set_option(Harness* h, int i, int option) {
+    h->act[i * NUM_ATNS] = (float)option;
+}
+
+// Scripted option policies for learner slots (calibration meta=s0,s1,...; U66). At a decision point: 0 WAIT (an
+// invalid choice: the fish holds still), 1 always EAT (ROAM when EAT is masked), 2 complier (READ when it has never
+// read or not for bot_shift_steps; EAT when its last read says open; ROAM otherwise), 3 enforcer (BITE_MARKED when
+// feasible, else 2), 4 uniform over the feasible options. With an option running (or a scripted slot): WAIT.
+static uint32_t g_ms = 0x2545F491u;
+static int meta_strategy(const Env* env, int i, int s) {
+    const unsigned char* m = env->meta_mask[i];
+    if (m[META_WAIT]) {
+        return META_WAIT;
+    }
+    const FishAgent* f = &env->fish[i];
+    switch (s) {
+    case 1:
+        return m[META_EAT] ? META_EAT : META_ROAM;
+    case 3:
+        if (m[META_BITEM]) {
+            return META_BITEM;
+        }
+        // fall through: the complier
+    case 2:
+        if (m[META_READ] && (!f->informed || env->tick - f->last_read_tick > env->bot_shift_steps)) {
+            return META_READ;
+        }
+        return f->inst_val < 0.0f && m[META_EAT] ? META_EAT : META_ROAM;
+    case 4: {
+        int n = 0;
+        for (int k = 1; k < META_N; k++) {
+            n += m[k];
+        }
+        g_ms ^= g_ms << 13; g_ms ^= g_ms >> 17; g_ms ^= g_ms << 5;
+        int pick = (int)((g_ms >> 8) % (uint32_t)n);
+        for (int k = 1; k < META_N; k++) {
+            if (m[k] && pick-- == 0) {
+                return k;
+            }
+        }
+        return META_ROAM;
+    }
+    default:
+        return META_WAIT;
+    }
+}
+#endif
 
 static void place_fish(Env* env, int i, float x, float y, float orientation) {
     env->fish[i].pos = (Vec2){x, y};
@@ -4366,6 +4460,10 @@ static void test_inst(void) {
 //   wef_test roles=3,3,2,2 [episodes=100] [oracle=0] [preset=harvest|allelo|inst_ah|inst_commons|inst_commons_rot|inst_commons_single] [shape=conv] [num_agents=N] [key=value ...]
 // Prints per-slot pellets / cleans / strip time per episode and episode-level
 // waste fraction and open fraction, in the scripts/cleanup.args preset.
+//   hash=1: also print an FNV-1a hash of every observation row and reward (run_test.sh U13m compares builds with it).
+//   Options build (-DWEF_META): preset=inst_commons_meta, and meta=s0,s1,... picks the scripted option policy of each
+//   learner slot (roles 0; meta_strategy: 0 WAIT, 1 always EAT, 2 complier, 3 enforcer, 4 random feasible).
+static uint64_t fnv1a(uint64_t h, const void* data, size_t n);
 static int run_calibration(int argc, char** argv) {
     Dict kw = {0};
     kw_base(&kw, 4);
@@ -4375,6 +4473,7 @@ static int run_calibration(int argc, char** argv) {
     bool inst_commons = false;
     bool inst_commons_rot = false;
     bool inst_commons_single = false;
+    bool inst_commons_meta = false;
     bool conv = false;
     for (int a = 1; a < argc; a++) {
         if (strcmp(argv[a], "preset=harvest") == 0) {
@@ -4389,11 +4488,20 @@ static int run_calibration(int argc, char** argv) {
             inst_commons_rot = true;
         } else if (strcmp(argv[a], "preset=inst_commons_single") == 0) {
             inst_commons_single = true;
+        } else if (strcmp(argv[a], "preset=inst_commons_meta") == 0) {
+            inst_commons_meta = true;
         } else if (strcmp(argv[a], "shape=conv") == 0) {
             conv = true;
         }
     }
-    if (inst_ah) {
+    if (inst_commons_meta) {
+#ifdef WEF_META
+        kw_inst_commons_meta(&kw);
+#else
+        fprintf(stderr, "preset=inst_commons_meta needs the options build (CFLAGS=\"-DMAX_AGENTS=8 -DWEF_INST -DWEF_META\")\n");
+        return 2;
+#endif
+    } else if (inst_ah) {
         kw_inst_ah(&kw);
     } else if (inst_commons_single) {
         kw_inst_commons_single(&kw);
@@ -4413,11 +4521,17 @@ static int run_calibration(int argc, char** argv) {
     }
     int episodes = 100;
     const char* roles = "0,0,0,0";
+    bool do_hash = false;
+    uint64_t hash = 1469598103934665603ULL;
+    int strategy[MAX_AGENTS] = {0};
+    double meta_chosen[MAX_AGENTS][8] = {{0}};  // options build: options started per slot (index = option id)
+    (void)strategy;
+    (void)meta_chosen;
     for (int a = 1; a < argc; a++) {
         if (strcmp(argv[a], "preset=harvest") == 0 || strcmp(argv[a], "preset=allelo") == 0
                 || strcmp(argv[a], "preset=inst_ah") == 0 || strcmp(argv[a], "preset=inst_commons") == 0
                 || strcmp(argv[a], "preset=inst_commons_rot") == 0 || strcmp(argv[a], "preset=inst_commons_single") == 0
-                || strcmp(argv[a], "shape=conv") == 0) {
+                || strcmp(argv[a], "preset=inst_commons_meta") == 0 || strcmp(argv[a], "shape=conv") == 0) {
             continue;
         }
         char key[64];
@@ -4434,6 +4548,24 @@ static int run_calibration(int argc, char** argv) {
         }
         if (strcmp(key, "roles") == 0) {
             roles = argv[a] + 6;
+        } else if (strcmp(key, "hash") == 0) {
+            do_hash = atoi(val) != 0;
+        } else if (strcmp(key, "meta") == 0) {
+#ifdef WEF_META
+            const char* p = argv[a] + 5;
+            for (int i = 0; i < MAX_AGENTS && *p; i++) {
+                strategy[i] = atoi(p);
+                while (*p && *p != ',') {
+                    p++;
+                }
+                if (*p == ',') {
+                    p++;
+                }
+            }
+#else
+            fprintf(stderr, "meta= needs the options build (-DWEF_META)\n");
+            return 2;
+#endif
         } else if (strcmp(key, "seed") == 0) {
             g_seed = (unsigned int)atoi(val);
         } else if (strcmp(key, "episodes") == 0) {
@@ -4524,7 +4656,20 @@ static int run_calibration(int argc, char** argv) {
             noop_step[i] = 0;
         }
         while (env->episode == e) {
+#ifdef WEF_META
+            for (int i = 0; i < env->num_agents; i++) {
+                int c = meta_strategy(env, i, strategy[i]);
+                set_option(&h, i, c);
+                if (!env->meta_mask[i][META_WAIT] && c > META_WAIT && env->meta_mask[i][c]) {
+                    meta_chosen[i][c] += 1.0;  // a valid choice at a decision point starts option c
+                }
+            }
+#endif
             puf_step(env);
+            if (do_hash) {
+                hash = fnv1a(hash, h.obs, (size_t)env->num_agents * OBS_SIZE * sizeof(obs_t));
+                hash = fnv1a(hash, h.rew, (size_t)env->num_agents * sizeof(float));
+            }
             if (env->tick > 0) {
                 // per-slot event tallies from this step's trace fields (the env keeps totals only)
                 for (int i = 0; i < env->num_agents; i++) {
@@ -4686,6 +4831,34 @@ static int run_calibration(int argc, char** argv) {
                 zapped_mk[i] / episodes, wrongful[i] / episodes, shirks[i] / episodes);
         }
     }
+#ifdef WEF_META
+    {
+        // options: the Log's meta_* keys (per-episode totals over the learner slots) and the options started per slot
+        const Log* L = &env->log;
+        float n = L->n > 0.0f ? L->n : 1.0f;
+        printf("  meta: decisions %.1f   EAT %.1f READ %.1f BITE_MARKED %.1f BITE_ANY %.1f ROAM %.1f   steps EAT %.1f READ %.1f BITE_MARKED %.1f BITE_ANY %.1f ROAM %.1f   timeouts %.1f invalid %.1f wait_breaks %.1f\n",
+            L->meta_dec / n, L->meta_eat / n, L->meta_read / n, L->meta_bitem / n, L->meta_bitea / n, L->meta_roam / n,
+            L->meta_steps_eat / n, L->meta_steps_read / n, L->meta_steps_bitem / n, L->meta_steps_bitea / n, L->meta_steps_roam / n,
+            L->meta_timeouts / n, L->meta_invalid / n, L->meta_wait_breaks / n);
+        printf("  meta deterrence: decisions closed %.1f (EAT %.1f) open %.1f (EAT %.1f) known closed %.1f (EAT %.1f)   P(EAT | closed) %.3f  P(EAT | open) %.3f\n",
+            L->meta_dec_closed / n, L->meta_eat_closed / n, L->meta_dec_open / n, L->meta_eat_open / n,
+            L->meta_dec_known_closed / n, L->meta_eat_known_closed / n,
+            L->meta_dec_closed > 0.0f ? L->meta_eat_closed / L->meta_dec_closed : 0.0f,
+            L->meta_dec_open > 0.0f ? L->meta_eat_open / L->meta_dec_open : 0.0f);
+        printf("  slot strategy   EAT  READ BITE_MARKED BITE_ANY  ROAM  (options started per episode)\n");
+        for (int i = 0; i < env->num_agents; i++) {
+            if (env->roles[i] != 0) {
+                continue;
+            }
+            printf("  %4d %8d %5.1f %5.1f %11.1f %8.1f %5.1f\n", i, strategy[i], meta_chosen[i][META_EAT] / episodes,
+                meta_chosen[i][META_READ] / episodes, meta_chosen[i][META_BITEM] / episodes,
+                meta_chosen[i][META_BITEA] / episodes, meta_chosen[i][META_ROAM] / episodes);
+        }
+    }
+#endif
+    if (do_hash) {
+        printf("  hash %016llx (every obs row and reward, %d episodes)\n", (unsigned long long)hash, episodes);
+    }
     puf_close(env);
     dict_clear(&kw);
     return 0;
@@ -4751,6 +4924,12 @@ static int run_bench(int argc, char** argv) {
             kw_inst_commons(&kw);
             continue;
         }
+#ifdef WEF_META
+        if (strcmp(argv[a], "preset=inst_commons_meta") == 0) {
+            kw_inst_commons_meta(&kw);  // the options build's bench (the default bench arenas are too small for the ROAM ring)
+            continue;
+        }
+#endif
         if (strcmp(argv[a], "shape=conv") == 0) {
             kw_allelo_conv(&kw);
             continue;
@@ -4785,8 +4964,12 @@ static int run_bench(int argc, char** argv) {
     double t0 = now_s();
     for (long s = 0; s < steps; s++) {
         for (int i = 0; i < n; i++) {
+#ifdef WEF_META
+            set_option(&h, i, meta_strategy(env, i, 4));  // options build: a uniformly random feasible option
+#else
             set_action(&h, i, 6.0f * xs_uniform() - 3.0f, 4.0f * xs_uniform() - 2.0f,
                 xs_uniform() < 0.86f ? 1.0f : -1.0f, xs_uniform() < 0.05f ? 1.0f : -1.0f);
+#endif
         }
         puf_step(env);
         hash = fnv1a(hash, h.obs, (size_t)n * OBS_SIZE * sizeof(obs_t));
@@ -4815,8 +4998,12 @@ static int run_bench(int argc, char** argv) {
     double t_obs = 0.0;
     for (long s = 0; s < obs_steps; s++) {
         for (int i = 0; i < n; i++) {
+#ifdef WEF_META
+            set_option(&h, i, meta_strategy(env, i, 4));
+#else
             set_action(&h, i, 6.0f * xs_uniform() - 3.0f, 4.0f * xs_uniform() - 2.0f,
                 xs_uniform() < 0.86f ? 1.0f : -1.0f, xs_uniform() < 0.05f ? 1.0f : -1.0f);
+#endif
         }
         puf_step(env);
         double a = now_s();
@@ -4853,6 +5040,507 @@ static void test_rand_r(void) {
     CHECK(same, "wef_rand_r matches glibc rand_r over 100000 draws");
 }
 
+#ifdef WEF_META
+// ------------------------------------------------------------------------------------------------------------------
+// Options build (the WEF_META block at the top of wef.h), U57-U66. The single Commons with the rule on and a 5 cm beacon at (5, 5)
+// (kw_inst_commons_meta), 4 fish; the patch is centred at (20, 20) with r 8.5 cm, the ROAM ring has r 15 cm.
+static const unsigned char META_WAIT_ONLY[META_N] = {1, 0, 0, 0, 0, 0};
+
+static void meta_kw(Dict* kw) {
+    kw_base(kw, 4);
+    kw_inst_commons_meta(kw);
+    dict_set(kw, "inst_mark_steps", 64);
+}
+
+static Harness meta_make(Dict* kw, const char* roles) {
+    puf_ini_set(kw, "roles", roles);
+    return make(kw, (int)dict_get(kw, "num_agents"));
+}
+
+// park slots from..3 in the corners, away from the patch, the ring's inside and the beacon
+static void meta_park(Env* env, int from) {
+    static const float px[4] = {3.0f, 37.0f, 37.0f, 20.0f};
+    static const float py[4] = {37.0f, 37.0f, 3.0f, 38.0f};
+    for (int i = from; i < env->num_agents && i < 4; i++) {
+        place_fish(env, i, px[i], py[i], 0.0f);
+    }
+}
+
+static void meta_all_wait(Harness* h) {
+    for (int i = 0; i < h->env->num_agents; i++) {
+        set_option(h, i, META_WAIT);
+    }
+}
+
+// U57: the action mask (reset, feasibility, a running option, scripted slots, the trainer's buffer, no rule).
+static void test_meta_mask(void) {
+    printf("-- META U57: action mask\n");
+    Dict kw = {0};
+    meta_kw(&kw);
+    Harness h = meta_make(&kw, "0,0,0,14");
+    Env* env = h.env;
+    const unsigned char* m0 = env->meta_mask[0];
+    CHECK(m0[META_WAIT] == 0 && m0[META_EAT] == 1 && m0[META_READ] == 1 && m0[META_BITEM] == 0 && m0[META_BITEA] == 1 && m0[META_ROAM] == 1,
+        "reset: decision point, WAIT masked; EAT / READ / BITE_ANY / ROAM allowed, BITE_MARKED masked (nobody marked)");
+    bool same = true;
+    for (int i = 0; i < env->num_agents; i++) {
+        same = same && memcmp(h.mask + i * META_N, env->meta_mask[i], META_N) == 0;
+    }
+    CHECK(same, "the reset wrote the trainer's bound action_mask buffer (the first step is masked)");
+    CHECK(memcmp(env->meta_mask[3], META_WAIT_ONLY, META_N) == 0, "a scripted slot (role 14) is masked to WAIT only");
+    env->fish[1].mark = 64;
+    wef_meta_write_mask(env);
+    CHECK(m0[META_BITEM] == 1, "fish 1 marked: BITE_MARKED allowed");
+    env->fish[1].freeze = 10;
+    wef_meta_write_mask(env);
+    CHECK(m0[META_BITEM] == 0 && m0[META_BITEA] == 1, "the only marked fish frozen: BITE_MARKED masked, BITE_ANY still allowed");
+    env->fish[2].freeze = 10;
+    env->fish[3].freeze = 10;
+    wef_meta_write_mask(env);
+    CHECK(m0[META_BITEA] == 0, "every other fish frozen: BITE_ANY masked");
+    for (int i = 1; i < 4; i++) {
+        env->fish[i].freeze = 0;
+    }
+    env->fish[1].mark = 0;
+    env->fish[0].eat_ban = 5;
+    wef_meta_write_mask(env);
+    CHECK(m0[META_EAT] == 0, "an eating ban masks EAT");
+    env->fish[0].eat_ban = 0;
+    env->collapsed = true;
+    wef_meta_write_mask(env);
+    CHECK(m0[META_EAT] == 0, "a collapsed commons masks EAT");
+    env->collapsed = false;
+    wef_meta_write_mask(env);
+    meta_all_wait(&h);
+    set_option(&h, 0, META_ROAM);
+    puf_step(env);
+    CHECK(env->fish[0].meta_opt == META_ROAM && memcmp(m0, META_WAIT_ONLY, META_N) == 0
+        && memcmp(h.mask, META_WAIT_ONLY, META_N) == 0,
+        "ROAM running: the mask is WAIT only (env and trainer buffer)");
+    CHECK(memcmp(env->meta_mask[1], META_WAIT_ONLY, META_N) != 0 && env->meta_mask[1][META_WAIT] == 0,
+        "fish 1 (chose WAIT at a decision point: invalid) is still at a decision point");
+    destroy(&h);
+    dict_clear(&kw);
+    meta_kw(&kw);
+    dict_set(&kw, "inst_mode", 0);
+    h = meta_make(&kw, "0,0,0,0");
+    env = h.env;
+    env->fish[1].mark = 64;
+    wef_meta_write_mask(env);
+    m0 = env->meta_mask[0];
+    CHECK(m0[META_READ] == 0 && m0[META_BITEM] == 0 && m0[META_EAT] == 1 && m0[META_ROAM] == 1,
+        "inst_mode 0: READ and BITE_MARKED masked (no rule), EAT and ROAM allowed");
+    destroy(&h);
+    dict_clear(&kw);
+}
+
+// U58: EAT reaches the nearest pellet, eats it and ends (meta_eat_pellets 1); with 3 it eats three then ends.
+static void test_meta_eat(void) {
+    printf("-- META U58: EAT\n");
+    for (int n_eat = 1; n_eat <= 3; n_eat += 2) {
+        Dict kw = {0};
+        meta_kw(&kw);
+        dict_set(&kw, "meta_eat_pellets", n_eat);
+        Harness h = meta_make(&kw, "0,17,17,17");
+        Env* env = h.env;
+        meta_park(env, 1);
+        place_fish(env, 0, 20.0f, 8.0f, 0.5f * PI_F);   // 3.5 cm below the patch edge, facing it
+        wef_meta_write_mask(env);
+        meta_all_wait(&h);
+        set_option(&h, 0, META_EAT);
+        int end_tick = -1;
+        int first_eat = -1;
+        for (int t = 0; t < 120 && end_tick < 0; t++) {
+            puf_step(env);
+            set_option(&h, 0, META_WAIT);
+            if (env->fish[0].ate && first_eat < 0) {
+                first_eat = env->tick;
+            }
+            if (env->fish[0].meta_opt == META_WAIT) {
+                end_tick = env->tick;
+            }
+        }
+        CHECK(first_eat > 0 && first_eat <= 40 && end_tick > 0 && env->food_by[0] == n_eat && env->fish[0].ate
+            && env->meta_chosen[META_EAT] == 1 && env->meta_steps_in[META_EAT] == end_tick && env->meta_timeouts == 0,
+            "meta_eat_pellets %d: first pellet at tick %d, %d eaten, the option ended on the last eat (tick %d), one decision, no timeout",
+            n_eat, first_eat, env->food_by[0], end_tick);
+        CHECK(env->meta_mask[0][META_WAIT] == 0 && env->meta_mask[0][META_EAT] == 1, "after EAT ended: a decision point again (EAT allowed)");
+        destroy(&h);
+        dict_clear(&kw);
+    }
+}
+
+// U59: ROAM (4 fish, 200 steps) never eats, never comes near the patch, pays no effort penalty and keeps moving.
+static void test_meta_roam(void) {
+    printf("-- META U59: ROAM\n");
+    Dict kw = {0};
+    meta_kw(&kw);
+    Harness h = meta_make(&kw, "0,0,0,0");
+    Env* env = h.env;
+    place_fish(env, 0, 36.0f, 20.0f, 1.0f);
+    place_fish(env, 1, 20.0f, 36.0f, 3.0f);
+    place_fish(env, 2, 4.0f, 20.0f, -2.0f);
+    place_fish(env, 3, 20.0f, 4.0f, 0.3f);
+    wef_meta_write_mask(env);
+    float rmin = INFINITY;
+    float max_move = 0.0f;
+    float max_turn = 0.0f;
+    float path0 = 0.0f;
+    for (int t = 0; t < 200; t++) {
+        for (int i = 0; i < 4; i++) {
+            set_option(&h, i, env->meta_mask[i][META_WAIT] ? META_WAIT : META_ROAM);
+        }
+        Vec2 p0 = env->fish[0].pos;
+        puf_step(env);
+        path0 += sqrtf((env->fish[0].pos.x - p0.x) * (env->fish[0].pos.x - p0.x) + (env->fish[0].pos.y - p0.y) * (env->fish[0].pos.y - p0.y));
+        for (int i = 0; i < 4; i++) {
+            float dx = env->fish[i].pos.x - env->patch_center[0].x;
+            float dy = env->fish[i].pos.y - env->patch_center[0].y;
+            rmin = fminf(rmin, sqrtf(dx * dx + dy * dy));
+            max_move = fmaxf(max_move, env->fish[i].last_action[0]);
+            max_turn = fmaxf(max_turn, fabsf(env->fish[i].last_action[1]));
+        }
+    }
+    float edge = env->patch_radius_ep[0] + EATING_RADIUS_CM;
+    CHECK(rmin > edge, "closest approach to the patch centre %.2f cm > patch radius + eating radius %.2f cm", rmin, edge);
+    CHECK(env->food_eaten == 0, "no pellet eaten over 200 ROAM steps x 4 fish");
+    float ret = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        ret += fabsf(env->return_by[i]);
+    }
+    CHECK(max_move <= 0.5f && max_turn <= 0.5f && env->collisions_fish == 0 && ret == 0.0f,
+        "no effort penalty: max move %.3f, max |turn| %.3f (both <= 0.5), no collision, every return exactly 0", max_move, max_turn);
+    CHECK(env->meta_chosen[META_ROAM] == 4 * 13 && env->meta_invalid == 0 && path0 > 50.0f,
+        "52 ROAM options of 16 steps (13 per fish in 200 steps), fish 0 swam %.1f cm", path0);
+    destroy(&h);
+    dict_clear(&kw);
+}
+
+// U60: READ reaches the 5 cm beacon off the patch (crossing the patch without eating: the eat gate), reads and ends;
+// with meta_max_steps 3 it times out.
+static void test_meta_read(void) {
+    printf("-- META U60: READ\n");
+    Dict kw = {0};
+    meta_kw(&kw);
+    Harness h = meta_make(&kw, "0,17,17,17");
+    Env* env = h.env;
+    CHECK(env->inst_pos.x == 5.0f && env->inst_pos.y == 5.0f, "inst_pos_x_cm / inst_pos_y_cm place the beacon at (5, 5)");
+    meta_park(env, 1);
+    place_fish(env, 0, 30.0f, 30.0f, 0.0f);
+    wef_meta_write_mask(env);
+    meta_all_wait(&h);
+    set_option(&h, 0, META_READ);
+    int read_at = -1;
+    bool ended = false;
+    for (int t = 0; t < 80 && read_at < 0; t++) {
+        puf_step(env);
+        set_option(&h, 0, META_WAIT);
+        if (env->fish[0].last_read_tick == env->tick) {
+            read_at = env->tick;
+            ended = env->fish[0].meta_opt == META_WAIT;
+        }
+    }
+    CHECK(read_at > 0 && read_at <= 64 && ended && env->fish[0].informed && env->fish[0].inst_val != 0.0f && env->meta_timeouts == 0,
+        "READ from (30, 30): read at tick %d (inst_val %+.0f) and ended on that step", read_at, env->fish[0].inst_val);
+    CHECK(env->food_by[0] == 0, "the path crossed the patch and nothing was eaten (eat gate)");
+    destroy(&h);
+    dict_clear(&kw);
+    meta_kw(&kw);
+    dict_set(&kw, "meta_max_steps", 3);
+    h = meta_make(&kw, "0,17,17,17");
+    env = h.env;
+    meta_park(env, 1);
+    place_fish(env, 0, 35.0f, 35.0f, 0.0f);
+    wef_meta_write_mask(env);
+    meta_all_wait(&h);
+    set_option(&h, 0, META_READ);
+    puf_step(env);
+    set_option(&h, 0, META_WAIT);
+    puf_step(env);
+    bool running2 = env->fish[0].meta_opt == META_READ;
+    puf_step(env);
+    CHECK(running2 && env->fish[0].meta_opt == META_WAIT && env->meta_timeouts == 1 && env->fish[0].last_read_tick == 0,
+        "meta_max_steps 3: READ still running after 2 steps, timed out after 3 (meta_timeouts 1, never read)");
+    destroy(&h);
+    dict_clear(&kw);
+}
+
+// U61 / U62: BITE_MARKED / BITE_ANY chase a stationary target (role 17), land a bite and end.
+static void test_meta_bite(void) {
+    printf("-- META U61 / U62: BITE_MARKED / BITE_ANY\n");
+    for (int pass = 0; pass < 3; pass++) {
+        // pass 0: BITE_MARKED (fish 1 marked 6 cm north, fish 2 unmarked 4 cm east: the target is 1)
+        // pass 1: BITE_ANY with fish 2 frozen (the target is 1); pass 2: BITE_ANY (the target is 2, the nearest)
+        Dict kw = {0};
+        meta_kw(&kw);
+        Harness h = meta_make(&kw, "0,17,17,17");
+        Env* env = h.env;
+        meta_park(env, 3);
+        place_fish(env, 0, 30.0f, 8.0f, PI_F);
+        place_fish(env, 1, 30.0f, 14.0f, 0.0f);
+        place_fish(env, 2, 34.0f, 8.0f, 0.0f);
+        int opt = pass == 0 ? META_BITEM : META_BITEA;
+        int want = pass == 2 ? 2 : 1;
+        if (pass == 0) {
+            env->fish[1].mark = 64;
+        } else if (pass == 1) {
+            env->fish[2].freeze = 200;
+        }
+        wef_meta_write_mask(env);
+        CHECK(env->meta_mask[0][opt] == 1, "%s allowed", WEF_META_NAMES[opt]);
+        meta_all_wait(&h);
+        set_option(&h, 0, opt);
+        puf_step(env);
+        CHECK(env->fish[0].meta_target == want, "%s: the target is fish %d (%s)", WEF_META_NAMES[opt], env->fish[0].meta_target,
+            pass == 0 ? "the nearest MARKED fish, not the nearer unmarked one" : pass == 1 ? "the nearest unfrozen fish" : "the nearest fish");
+        set_option(&h, 0, META_WAIT);
+        int landed = -1;
+        int victim = -1;
+        bool ended = false;
+        for (int t = 0; t < 40 && landed < 0; t++) {
+            puf_step(env);
+            if (env->fish[0].bite_victim >= 0) {
+                landed = env->tick;
+                victim = env->fish[0].bite_victim;
+                ended = env->fish[0].meta_opt == META_WAIT;
+            }
+        }
+        CHECK(landed > 0 && victim == want && ended && env->bites == 1 && env->zaps_on_marked == (pass == 0 ? 1 : 0),
+            "%s landed on fish %d at tick %d (one bite%s) and the option ended on that step", WEF_META_NAMES[opt], victim, landed,
+            pass == 0 ? ", a zap on a marked fish" : "");
+        destroy(&h);
+        dict_clear(&kw);
+    }
+    // BITE_MARKED ends when its target loses the mark
+    Dict kw = {0};
+    meta_kw(&kw);
+    Harness h = meta_make(&kw, "0,17,17,17");
+    Env* env = h.env;
+    meta_park(env, 2);
+    place_fish(env, 0, 30.0f, 8.0f, PI_F);
+    place_fish(env, 1, 30.0f, 14.0f, 0.0f);
+    env->fish[1].mark = 64;
+    wef_meta_write_mask(env);
+    meta_all_wait(&h);
+    set_option(&h, 0, META_BITEM);
+    puf_step(env);
+    bool running = env->fish[0].meta_opt == META_BITEM;
+    env->fish[1].mark = 0;
+    set_option(&h, 0, META_WAIT);
+    puf_step(env);
+    CHECK(running && env->fish[0].meta_opt == META_WAIT && env->bites == 0 && env->meta_mask[0][META_BITEM] == 0,
+        "BITE_MARKED ends when the target loses its mark (no bite; BITE_MARKED masked again)");
+    destroy(&h);
+    dict_clear(&kw);
+}
+
+// U63: WAIT / invalid choices at a decision point hold the fish still; a non-WAIT choice while an option runs is ignored.
+static void test_meta_wait(void) {
+    printf("-- META U63: WAIT, invalid choices, wait breaks\n");
+    Dict kw = {0};
+    meta_kw(&kw);
+    Harness h = meta_make(&kw, "0,17,17,17");
+    Env* env = h.env;
+    meta_park(env, 1);
+    place_fish(env, 0, 30.0f, 30.0f, 0.5f);
+    wef_meta_write_mask(env);
+    meta_all_wait(&h);
+    Vec2 p0 = env->fish[0].pos;
+    puf_step(env);
+    CHECK(env->meta_invalid == 1 && env->meta_dec == 0 && fabsf(env->fish[0].pos.x - p0.x) < 1e-3f && fabsf(env->fish[0].pos.y - p0.y) < 1e-3f
+        && !env->fish[0].emits_eod && env->fish[0].last_action[0] < 1e-3f && env->fish[0].meta_opt == META_WAIT
+        && env->fish[0].meta_trace_opt == 0,
+        "WAIT at a decision point: invalid (meta_invalid 1), the fish holds still (move raw -8: < 1e-3 cm) with no EOD, still at a decision point");
+    float bad[4] = {9.0f, -1.0f, (float)META_BITEM, NAN};
+    for (int b = 0; b < 4; b++) {
+        h.act[0] = bad[b];
+        puf_step(env);
+    }
+    CHECK(env->meta_invalid == 5 && env->meta_dec == 0 && fabsf(env->fish[0].pos.x - p0.x) < 1e-2f && fabsf(env->fish[0].pos.y - p0.y) < 1e-2f,
+        "out of range (9, -1), masked (BITE_MARKED, nobody marked) and NaN choices are invalid too (meta_invalid 5)");
+    set_option(&h, 0, META_ROAM);
+    puf_step(env);
+    CHECK(env->fish[0].meta_opt == META_ROAM && env->meta_dec == 1 && env->meta_chosen[META_ROAM] == 1, "ROAM started (one decision)");
+    set_option(&h, 0, META_EAT);
+    puf_step(env);
+    CHECK(env->fish[0].meta_opt == META_ROAM && env->meta_wait_breaks == 1 && env->fish[0].meta_steps == 2 && env->meta_dec == 1,
+        "EAT chosen while ROAM runs: ignored (meta_wait_breaks 1), ROAM continues");
+    set_option(&h, 0, META_WAIT);
+    int ended_at = -1;
+    for (int t = 0; t < 20 && ended_at < 0; t++) {
+        puf_step(env);
+        if (env->fish[0].meta_opt == META_WAIT) {
+            ended_at = env->fish[0].meta_trace_opt == META_ROAM ? t + 3 : -2;
+        }
+    }
+    CHECK(ended_at == 16 && env->meta_steps_in[META_ROAM] == 16 && env->meta_invalid == 5 && env->meta_wait_breaks == 1,
+        "ROAM ran meta_roam_steps = 16 steps (ended after its step %d), WAIT while running is neither invalid nor a break", ended_at);
+    destroy(&h);
+    dict_clear(&kw);
+}
+
+// U64: the eat gate. A fish facing a pellet 1 cm away does not eat under ROAM or while holding at a decision point;
+// with meta_eat_gate 0 the same ROAM step eats.
+static void test_meta_gate(void) {
+    printf("-- META U64: eat gate\n");
+    for (int pass = 0; pass < 3; pass++) {
+        Dict kw = {0};
+        meta_kw(&kw);
+        dict_set(&kw, "meta_eat_gate", pass == 2 ? 0 : 1);
+        Harness h = meta_make(&kw, "0,17,17,17");
+        Env* env = h.env;
+        meta_park(env, 1);
+        int f = 0;
+        while (!env->food[f].active) {
+            f++;
+        }
+        place_fish(env, 0, env->food[f].pos.x - 1.0f, env->food[f].pos.y, 0.0f);
+        wef_meta_write_mask(env);
+        meta_all_wait(&h);
+        if (pass != 1) {
+            set_option(&h, 0, META_ROAM);
+        }
+        puf_step(env);
+        bool ate = env->fish[0].ate;
+        if (pass == 0) {
+            CHECK(!ate && env->food_by[0] == 0, "gate on: a ROAM fish facing a pellet 1 cm ahead does not eat");
+        } else if (pass == 1) {
+            CHECK(!ate && env->food_by[0] == 0 && env->meta_invalid == 1, "gate on: a fish holding at a decision point (invalid WAIT) does not eat");
+        } else {
+            CHECK(ate && env->food_by[0] == 1, "meta_eat_gate 0: the same ROAM step eats the pellet");
+        }
+        destroy(&h);
+        dict_clear(&kw);
+    }
+}
+
+// U65: the deterrence counters and the Log: decisions in a truly closed season, EAT chosen then, the fish's own reading.
+static void test_meta_log(void) {
+    printf("-- META U65: deterrence counters and the episode Log\n");
+    Dict kw = {0};
+    meta_kw(&kw);
+    dict_set(&kw, "episode_length", 16);
+    Harness h = meta_make(&kw, "0,0,17,17");
+    Env* env = h.env;
+    meta_park(env, 2);
+    place_fish(env, 0, 20.0f, 8.0f, 0.5f * PI_F);
+    place_fish(env, 1, 36.0f, 20.0f, 0.5f * PI_F);
+    env->inst_type = 1;              // the season is closed
+    env->fish[0].inst_val = 1.0f;    // and fish 0 has read it so
+    wef_meta_write_mask(env);
+    set_option(&h, 0, META_EAT);
+    set_option(&h, 1, META_ROAM);
+    puf_step(env);
+    CHECK(env->meta_dec == 2 && env->meta_dec_closed == 2 && env->meta_eat_closed == 1 && env->meta_dec_open == 0
+        && env->meta_dec_known_closed == 1 && env->meta_eat_known_closed == 1,
+        "closed season: 2 decisions closed, 1 EAT closed, 0 open; fish 0 knew (1 decision, 1 EAT known closed)");
+    meta_all_wait(&h);
+    while (env->episode == 0) {
+        puf_step(env);
+    }
+    const Log* L = &env->log;
+    CHECK(L->n == 1.0f && L->meta_dec == 2.0f && L->meta_eat == 1.0f && L->meta_roam == 1.0f && L->meta_eat_closed == 1.0f
+        && L->meta_dec_closed == 2.0f && L->meta_eat_known_closed == 1.0f && L->meta_steps_roam == 16.0f && L->meta_wait_breaks == 0.0f,
+        "episode Log: meta_dec 2, meta_eat 1, meta_roam 1, meta_eat_closed 1, meta_dec_closed 2, meta_steps_roam 16");
+    Dict out = {0};
+    puf_log(&env->log, &out);
+    DictItem* it = dict_find(&out, "meta_eat_closed");
+    DictItem* it2 = dict_find(&out, "meta_invalid");
+    CHECK(it != NULL && it->value == 1.0 && it2 != NULL && it2->value == L->meta_invalid,
+        "puf_log emits the meta_* keys by name (meta_eat_closed %.0f, meta_invalid %.0f)", it ? it->value : -1.0, it2 ? it2->value : -1.0);
+    dict_clear(&out);
+    destroy(&h);
+    dict_clear(&kw);
+}
+
+// U66: the V4 trace's planted_slot carries the executed option; random-option episodes with scripted fish mixed in
+// keep to the mask, never eat outside EAT, and fill every learner step with an option.
+static void test_meta_trace_and_episodes(void) {
+    printf("-- META U66: trace field and random-option episodes\n");
+    const char* dir = getenv("WEF_TEST_TRACE_DIR");
+    if (dir != NULL && dir[0] != '\0') {
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/meta_trace.v4.bin", dir);
+        Dict kw = {0};
+        meta_kw(&kw);
+        Harness h = meta_make(&kw, "0,0,17,17");
+        Env* env = h.env;
+        meta_park(env, 1);
+        place_fish(env, 0, 36.0f, 20.0f, 0.5f * PI_F);
+        env->trace_file = fopen(path, "wb");
+        meta_all_wait(&h);
+        set_option(&h, 0, META_ROAM);
+        puf_step(env);
+        meta_all_wait(&h);
+        puf_step(env);
+        fclose(env->trace_file);
+        env->trace_file = NULL;
+        FILE* fp = fopen(path, "rb");
+        WefTraceRowV4 rows[8];
+        size_t nr = fp ? fread(rows, sizeof(WefTraceRowV4), 8, fp) : 0;
+        if (fp) {
+            fclose(fp);
+        }
+        CHECK(nr == 8 && rows[0].planted_slot == META_ROAM && rows[1].planted_slot == 0 && rows[2].planted_slot == 0
+            && rows[4].planted_slot == META_ROAM && rows[0].plant_type == 0 && rows[4].plant_type == 0,
+            "V4 trace: planted_slot = the executed option (fish 0 ROAM = 5 at ticks 1 and 2; fish 1 invalid = 0; scripted = 0), plant_type 0");
+        destroy(&h);
+        dict_clear(&kw);
+    } else {
+        printf("-- META U66: trace skipped (set WEF_TEST_TRACE_DIR)\n");
+    }
+    int nf = MAX_AGENTS < 8 ? MAX_AGENTS : 8;
+    Dict kw = {0};
+    meta_kw(&kw);
+    dict_set(&kw, "num_agents", nf);
+    dict_set(&kw, "inst_mark_steps", 128);   // the single Commons sanction arm (scratchpad launch scripts' BASE)
+    dict_set(&kw, "inst_mark_wrongful", 0);
+    dict_set(&kw, "mark_bitten_reward", -5);
+    dict_set(&kw, "mark_eat_ban_steps", 32);
+    Harness h = meta_make(&kw, nf == 8 ? "0,0,0,0,0,0,14,2" : "0,0,14,2");
+    Env* env = h.env;
+    int learners = nf - 2;
+    long gate_breach = 0;
+    long untraced = 0;
+    while (env->episode < 3) {
+        for (int i = 0; i < nf; i++) {
+            set_option(&h, i, meta_strategy(env, i, 4));
+        }
+        puf_step(env);
+        for (int i = 0; i < nf && env->tick > 0; i++) {  // tick 0: the step ended the episode and the reset cleared the fish
+            if (env->roles[i] != 0) {
+                continue;
+            }
+            gate_breach += env->fish[i].ate && env->fish[i].meta_trace_opt != META_EAT;
+            untraced += env->fish[i].meta_trace_opt == 0;
+        }
+    }
+    const Log* L = &env->log;
+    float steps = L->meta_steps_eat + L->meta_steps_read + L->meta_steps_bitem + L->meta_steps_bitea + L->meta_steps_roam;
+    CHECK(L->n == 3.0f && L->meta_invalid == 0.0f && L->meta_wait_breaks == 0.0f && untraced == 0
+        && steps == 3.0f * 1024.0f * (float)learners,
+        "3 episodes, %d learners + an enforcer (14) + an eater (2): no invalid choice (%.0f), no wait break (%.0f), every learner step ran an option (%.0f steps, %ld without; episode-end steps not inspected)",
+        learners, L->meta_invalid, L->meta_wait_breaks, steps, untraced);
+    CHECK(gate_breach == 0 && L->meta_eat > 0.0f && L->meta_read > 0.0f && L->meta_bitea > 0.0f && L->meta_roam > 0.0f,
+        "no learner ate outside EAT; options chosen per episode: EAT %.0f READ %.0f BITE_MARKED %.0f BITE_ANY %.0f ROAM %.0f",
+        L->meta_eat / 3, L->meta_read / 3, L->meta_bitem / 3, L->meta_bitea / 3, L->meta_roam / 3);
+    destroy(&h);
+    dict_clear(&kw);
+}
+
+static void test_meta(void) {
+    test_meta_mask();
+    test_meta_eat();
+    test_meta_roam();
+    test_meta_read();
+    test_meta_bite();
+    test_meta_wait();
+    test_meta_gate();
+    test_meta_log();
+    test_meta_trace_and_episodes();
+}
+#endif
+
 int main(int argc, char** argv) {
     if (argc > 1 && strcmp(argv[1], "bench") == 0) {
         return run_bench(argc, argv);
@@ -4861,6 +5549,13 @@ int main(int argc, char** argv) {
         return run_calibration(argc, argv);
     }
     test_rand_r();
+#ifdef WEF_META
+    // options build: one option index per fish; the raw-action suites need 4 floats per fish and are not run here
+    printf("-- U1-U56: skipped in the options build (-DWEF_META: NUM_ATNS 1); run_test.sh U13m checks its scripted-fish identity\n");
+    test_meta();
+    printf("%s (%d failures)\n", g_fail ? "FAILED" : "PASSED", g_fail);
+    return g_fail ? 1 : 0;
+#endif
     test_sensing();
     test_dynamics();
     test_actions();

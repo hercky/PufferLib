@@ -6,6 +6,10 @@
 #   CFLAGS=-DMAX_AGENTS=8 ./ocean/wef/run_test.sh  # 8-fish build:          build/wef_test8
 #   CFLAGS="-DMAX_AGENTS=8 -DWEF_INST" ./ocean/wef/run_test.sh   # institution build: build/wef_test8i
 #   CFLAGS=-DWEF_INST ./ocean/wef/run_test.sh                    # 4-fish institution build: build/wef_test4i
+#   CFLAGS="-DMAX_AGENTS=8 -DWEF_INST -DWEF_META" ./ocean/wef/run_test.sh   # options build: build/wef_test8m
+# An options build (-DWEF_META, the WEF_META block at the top of wef.h) runs its own unit checks (U57-U66; the raw-action suites need
+# 4 action floats per fish) and, instead of U13, U13m: with every fish scripted its episodes must be bit-identical to the
+# same-MAX_AGENTS institution build's (calibration hash=1 over obs rows and rewards, plus every printed metric).
 # An institution build also runs U13: at inst_obs 0 its bench projection onto the base slots and its
 # rewards hash must equal the same-MAX_AGENTS plain build's (project=MAX_AGENTS), i.e. the extra slots
 # are the only difference.
@@ -21,10 +25,13 @@ cd "$ROOT"
 CFLAGS="${CFLAGS:-}"
 NFISH=$(printf '%s' "$CFLAGS" | sed -n 's/.*-DMAX_AGENTS=\([0-9][0-9]*\).*/\1/p')
 INST=0
+META=0
 case "$CFLAGS" in *-DWEF_INST*) INST=1 ;; esac
+case "$CFLAGS" in *-DWEF_META*) META=1 ;; esac
 SUFFIX=$NFISH
 if [ "$INST" = 1 ]; then SUFFIX="${NFISH:-4}i"; fi
-BASE_CFLAGS=$(printf '%s' "$CFLAGS" | sed 's/-DMAX_AGENTS=[0-9][0-9]*//; s/-DWEF_INST//')
+if [ "$META" = 1 ]; then SUFFIX="${NFISH:-4}m"; fi
+BASE_CFLAGS=$(printf '%s' "$CFLAGS" | sed 's/-DMAX_AGENTS=[0-9][0-9]*//; s/-DWEF_INST//; s/-DWEF_META//')
 OUT=build/wef_test$SUFFIX
 mkdir -p build
 CC="${CC:-gcc}"
@@ -87,7 +94,30 @@ else
 fi
 hash8=$(printf '%s\n' "$out8" | sed -n 's/^  hash \([0-9a-f]*\)$/\1/p')
 echo "     (8-fish build, num_agents=4, full 162-slot hash $hash8; 4-fish harness hash $(printf '%s\n' "$out4" | sed -n 's/^  hash \([0-9a-f]*\)$/\1/p'))"
-if [ "$INST" = 1 ]; then
+if [ "$META" = 1 ]; then
+    # U13m: the options build with every fish scripted (roles != 0 never take options) is the institution build:
+    # same obs rows and rewards bit for bit (hash) and the same printed metrics, on the single Commons with the rule
+    # on and marks, at the centre broadcast beacon and at a 5 cm beacon placed with inst_pos_x_cm / inst_pos_y_cm.
+    n=${NFISH:-4}
+    plain_i=build/wef_test${n}i
+    # shellcheck disable=SC2086
+    compile "$plain_i" -O1 -g -mavx2 -mfma $BASE_CFLAGS -DMAX_AGENTS="$n" -DWEF_INST
+    roles=13,14,15,2; [ "$n" = 8 ] && roles=13,14,15,2,13,14,15,2
+    for beacon in "inst_read_cm=36" "inst_read_cm=5 inst_pos_x_cm=5 inst_pos_y_cm=5"; do
+        # shellcheck disable=SC2086
+        set -- preset=inst_commons_single num_agents="$n" roles="$roles" inst_mode=1 inst_mark_steps=64 mark_bitten_reward=-5 episodes=2 hash=1 $beacon
+        outi=$("$plain_i" "$@" 2>&1 | grep -v 'meta\|strategy') || true
+        outm=$("$OUT" "$@" 2>&1 | grep -v 'meta\|strategy') || true
+        hi=$(printf '%s\n' "$outi" | sed -n 's/^  hash \([0-9a-f]*\) .*/\1/p')
+        if [ -n "$hi" ] && [ "$outi" = "$outm" ]; then
+            echo "ok   U13m options build, all fish scripted ($beacon): bit-identical to the institution build (hash $hi, every metric line equal, 2 episodes)"
+        else
+            echo "FAIL U13m options build vs institution build ($beacon):"
+            diff <(printf '%s\n' "$outi") <(printf '%s\n' "$outm") | head -20
+            fail=1
+        fi
+    done
+elif [ "$INST" = 1 ]; then
     # U13: the institution build at inst_obs 0 is the plain build plus zero-filled slots.
     n=${NFISH:-4}
     plain=build/wef_test; [ "$n" = 4 ] || plain=build/wef_test$n
@@ -107,7 +137,11 @@ if [ "$INST" = 1 ]; then
     fi
 fi
 if [ "$fail" = 0 ]; then
-    echo "run_test.sh PASSED (unit suite, U11, U12${INST:+, U13})"
+    if [ "$META" = 1 ]; then
+        echo "run_test.sh PASSED (unit suite, U11, U12, U13m)"
+    else
+        echo "run_test.sh PASSED (unit suite, U11, U12${INST:+, U13})"
+    fi
 else
     echo "run_test.sh FAILED"
     exit 1

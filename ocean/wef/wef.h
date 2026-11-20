@@ -15,8 +15,41 @@ typedef float obs_t;
 #include "pufferenv.h"
 
 // 5c trainer macros (no binding.c). Float obs; pufferl converts on upload.
+#ifdef WEF_META
+// Options build (-DWEF_META, needs -DWEF_INST): every learner fish (roles[i] == 0) chooses
+// among discrete OPTIONS run by scripted controllers, one categorical head of META_N: 0 WAIT (continue the running
+// option), 1 EAT, 2 READ (go read the beacon), 3 BITE_MARKED, 4 BITE_ANY, 5 ROAM. The action mask allows only WAIT
+// while an option runs and every feasible option except WAIT at a decision point. The controllers write the same 4
+// raw low-level values a continuous policy would (ACTION_SIZE stays 4; the last-action obs slots carry the executed
+// low-level action), so physics, rewards, observations and the one-trainer-step = one-env-step timing are unchanged.
+//   Learner fish (roles 0) take options; scripted fish (roles != 0) keep wef_bot_action and are masked to WAIT only.
+//   Decision point (no option running): WAIT, an out-of-range or a masked choice holds the fish still for the step
+//   (raw {-8, 0, -1, -1}) and counts meta_invalid; it decides again next step. Running: WAIT continues, any other
+//   choice is ignored (meta_wait_breaks). The choice is validated against the mask the policy saw.
+//   Feasible: EAT (not collapsed, a pellet active, no eat_ban, not frozen), READ (inst_mode > 0), BITE_MARKED
+//   (inst_mode > 0 and another marked, unfrozen fish), BITE_ANY (another unfrozen fish), ROAM (always).
+//   Controllers (oracle positions; wef_meta_control): EAT steers at the nearest active pellet, never bites, ends after
+//   meta_eat_pellets pellets, an eat_ban / freeze, no pellet / collapse; READ steers at inst_pos, ends on the step the
+//   fish reads; BITE_MARKED / BITE_ANY chase the nearest marked unfrozen / unfrozen fish chosen at the start (role 14's
+//   chase), press bite only with the target in the bite reach / cone and the bite off cooldown, end on any landed bite
+//   or when the target is frozen (BITE_MARKED: or unmarked); EAT / READ / BITEs time out after meta_max_steps
+//   (meta_timeouts); ROAM circles the arena centre on the ring meta_roam_r_cm at move 0.5 / |turn| < 0.5 (no effort
+//   penalty) for meta_roam_steps. Termination is judged after the step's eats, bites, marks and countdowns.
+//   Eat gate (meta_eat_gate 1): a learner fish eats only while its option is EAT.
+//   Mask: env->meta_mask (always written) is copied to agents[i].action_mask when the trainer has bound it, at reset
+//   and at the end of every step. Log: the meta_* keys (wef_log_meta). Trace: V4 planted_slot = the executed option.
+//   Keys (every build, inert outside -DWEF_META): meta_options (1 required here, 0 elsewhere), meta_eat_pellets,
+//   meta_max_steps, meta_roam_steps, meta_roam_r_cm, meta_eat_gate. Preset: scripts/inst_commons_meta.args. CPU
+//   checks: CFLAGS="-DMAX_AGENTS=8 -DWEF_INST -DWEF_META" ./ocean/wef/run_test.sh (U57-U66, U13m).
+#ifndef WEF_INST
+#error "-DWEF_META needs -DWEF_INST (the options env is an institution build: beacon, marks, OBS_SIZE)"
+#endif
+#define ACT_SIZES {6}
+#define NUM_ATNS 1
+#else
 #define ACT_SIZES {1, 1, 1, 1}
 #define NUM_ATNS 4
+#endif
 
 // Constants
 #define PI_F 3.14159265358979323846f
@@ -54,6 +87,11 @@ typedef float obs_t;
 #define MAX_FOOD 64
 #define ACTION_SIZE 4
 #define WEF_FINES 8   // pending delayed charges per fish (inst_violation_cost_delay)
+#ifdef WEF_META
+// Option ids (the categorical action of the -DWEF_META build). META_WAIT is not an option: it continues the
+// running one; FishAgent.meta_opt == META_WAIT means "no option running" (a decision point).
+enum { META_WAIT = 0, META_EAT = 1, META_READ = 2, META_BITEM = 3, META_BITEA = 4, META_ROAM = 5, META_N = 6 };
+#endif
 // morm + amp + (knollen + metadata) per other fish + last action + 7 scalars:
 // 110 at MAX_AGENTS 4 (upstream), 162 at 8.
 #define OBS_BASE_SIZE (NUM_MORMYROMASTS + NUM_AMPULLARY + (NUM_KNOLLEN + 1) * (MAX_AGENTS - 1) + ACTION_SIZE + 7)
@@ -235,6 +273,14 @@ typedef struct FishAgent {
     int duties;            // duties taken this episode
     int duties_discharged; // duties ended by the target losing its mark (any sanction, own or another's)
     int shirks;            // class-2 violations: duties that ran to inst_duty_steps
+#ifdef WEF_META
+    // options (learner fish only; zero at reset = a decision point)
+    int meta_opt;          // the running option (META_EAT .. META_ROAM), META_WAIT = none: a decision point
+    int meta_steps;        // steps the running option has run (incl. this one)
+    int meta_target;       // BITE_MARKED / BITE_ANY: the fish chosen at the option's start, -1 none
+    int meta_eaten;        // EAT: pellets eaten since the option started
+    int meta_trace_opt;    // trace / render: the option this fish executed this step (0 = none: an invalid choice, held still)
+#endif
 } FishAgent;
 
 // Shared sensor layouts (body radius fixed → identical for every fish)
@@ -447,6 +493,29 @@ struct Log {
     float danger_mean;       // D22: time-mean of marked fish / N (the public danger level), zero unless inst_mode > 0
     float pursuit_frac;      // pursuit bonus: fish-steps with the speed bonus active / fish-steps (0 unless mark_pursuit_gain != 1)
     float near_frac;         // D27 proximity diagnostic: fish-steps with mark_near_reward paid / fish-steps (0 unless mark_near_reward != 0)
+#ifdef WEF_META
+    // Options build (the WEF_META block at the top of wef.h): per-episode totals over the learner fish (roles 0).
+    float meta_dec;          // valid decisions (options started)
+    float meta_eat;          // options chosen, by kind
+    float meta_read;
+    float meta_bitem;
+    float meta_bitea;
+    float meta_roam;
+    float meta_steps_eat;    // fish-steps spent in each option
+    float meta_steps_read;
+    float meta_steps_bitem;
+    float meta_steps_bitea;
+    float meta_steps_roam;
+    float meta_timeouts;     // EAT / READ / BITE options ended by meta_max_steps
+    float meta_invalid;      // decision points whose choice was WAIT, out of range or masked (the fish held still)
+    float meta_wait_breaks;  // non-WAIT choices while an option ran (ignored; impossible under the trainer's mask)
+    float meta_dec_closed;   // deterrence (inst_mode > 0): decisions taken while the season is truly closed / open,
+    float meta_eat_closed;   // ... and EAT chosen then
+    float meta_dec_open;
+    float meta_eat_open;
+    float meta_dec_known_closed;  // decisions / EAT choices while the fish's own reading says closed (inst_val > 0)
+    float meta_eat_known_closed;
+#endif
     float n;
 };
 
@@ -496,6 +565,9 @@ typedef struct WefTraceRowV3 {
 // Institution trace row (file name env_<id>.v4.bin, written when inst_mode > 0 or inst_obs):
 // WefTraceRowV3 + the rule as this fish has read it, its mark, this step's violation / marked zap,
 // whether it has read the beacon, and the public rule state (AH: 0 A / 1 B; Commons: 1 closed).
+// -DWEF_META builds: planted_slot (always -1 in the Commons otherwise) carries the option this fish executed this
+// step: 0 none (an invalid choice at a decision point: held still; scripted fish), 1 EAT, 2 READ, 3 BITE_MARKED,
+// 4 BITE_ANY, 5 ROAM. plant_type stays 0 (analysis/institutions.py tells AH from the Commons by it).
 typedef struct WefTraceRowV4 {
     int32_t env_id, episode, tick, agent;
     float x, y, orientation, size;
@@ -808,6 +880,15 @@ struct Env {
     int duties;
     int duties_discharged;
     int inst_pos_random;        // 0 beacon at the arena centre, 1 drawn uniformly per episode
+    float inst_pos_x_cm;        // (2026-11-20) fixed beacon position in cm; -1 / -1 = the centre (or inst_pos_random); both or neither
+    float inst_pos_y_cm;
+    // Options build (-DWEF_META; the WEF_META block at the top of wef.h). Read in every build, inert outside -DWEF_META.
+    int meta_options;           // 1 = this run is the options env: the -DWEF_META build requires 1, every other build 0
+    int meta_eat_pellets;       // EAT ends after this many pellets
+    int meta_max_steps;         // timeout of EAT, READ and both BITE options
+    int meta_roam_steps;        // ROAM length
+    float meta_roam_r_cm;       // ROAM ring radius around the arena centre (outside patch + eating radius + body)
+    int meta_eat_gate;          // 1: a learner fish eats only while its running option is EAT
     float inst_read_cm;         // a fish inside this radius reads the rule
     float inst_obj_radius_cm;   // the beacon's electrical signature: a waste-like conductor
     float inst_contrast;
@@ -866,6 +947,23 @@ struct Env {
     int free_presses;           // bite attempts not charged this episode (mark_press_free_cm)
     int plantings_p;
     int plantings_np;
+#ifdef WEF_META
+    // options build: the action mask (always written: end of every step and at reset; copied to
+    // agents[i].action_mask when the trainer has bound it) and the per-episode counters of the meta_* Log keys
+    unsigned char meta_mask[MAX_AGENTS][META_N];
+    int meta_dec;
+    int meta_chosen[META_N];
+    int meta_steps_in[META_N];
+    int meta_timeouts;
+    int meta_invalid;
+    int meta_wait_breaks;
+    int meta_dec_closed;
+    int meta_eat_closed;
+    int meta_dec_open;
+    int meta_eat_open;
+    int meta_dec_known_closed;
+    int meta_eat_known_closed;
+#endif
 };
 typedef Env Wef;
 
@@ -1749,6 +1847,10 @@ Vec2 wef_patch_spawn_pos(Wef* env, int p) {
     };
 }
 
+#ifdef WEF_META
+static void wef_meta_write_mask(Wef* env);
+#endif
+
 void puf_reset(Wef* env) {
     // Sample arena size from configured min/max
     env->arena_size_x = random_uniform(env, env->min_arena_size_x, env->max_arena_size_x);
@@ -1846,6 +1948,22 @@ void puf_reset(Wef* env) {
     env->duties_discharged = 0;
     env->plantings_p = 0;
     env->plantings_np = 0;
+#ifdef WEF_META
+    env->meta_dec = 0;
+    for (int k = 0; k < META_N; k++) {
+        env->meta_chosen[k] = 0;
+        env->meta_steps_in[k] = 0;
+    }
+    env->meta_timeouts = 0;
+    env->meta_invalid = 0;
+    env->meta_wait_breaks = 0;
+    env->meta_dec_closed = 0;
+    env->meta_eat_closed = 0;
+    env->meta_dec_open = 0;
+    env->meta_eat_open = 0;
+    env->meta_dec_known_closed = 0;
+    env->meta_eat_known_closed = 0;
+#endif
     // Only the first episode of an env can be shortened (desync_first_episode).
     env->cur_episode_length = env->episode == 0 ? env->first_episode_len : env->episode_length;
 
@@ -2091,6 +2209,10 @@ void puf_reset(Wef* env) {
                 random_uniform(env, 3.0f, env->arena_size_y - 3.0f),
             };
         }
+        if (env->inst_pos_x_cm >= 0.0f) {
+            // fixed beacon position (inst_pos_x_cm / inst_pos_y_cm; both set, inst_pos_random 0: asserted at init)
+            env->inst_pos = (Vec2){env->inst_pos_x_cm, env->inst_pos_y_cm};
+        }
         env->inst_moment = (Vec2){0.0f, 0.0f};
         if (env->allelo) {
             env->inst_type = env->inst_fixed_type >= 0 ? env->inst_fixed_type
@@ -2145,6 +2267,9 @@ void puf_reset(Wef* env) {
         }
     }
 
+#ifdef WEF_META
+    wef_meta_write_mask(env);  // every fish starts at a decision point; the first step is masked from here
+#endif
     compute_observations(env);
 }
 
@@ -2192,6 +2317,9 @@ void wef_trace_step(Wef* env) {
             .zap_marked = agent->trace_zap_marked, .informed = agent->informed,
             .inst_type = env->inst_type,
         };
+#ifdef WEF_META
+        rows[i].planted_slot = agent->meta_trace_opt;  // the option executed this step (V4 field doc above)
+#endif
     }
     if (env->inst_mode > 0 || env->inst_obs) {
         fwrite(rows, sizeof(WefTraceRowV4), env->num_agents, env->trace_file);
@@ -2696,6 +2824,282 @@ void wef_bot_action(Wef* env, int i, float* raw) {
     }
 }
 
+#ifdef WEF_META
+// ------------------------------------------------------------------------------------------------------------------
+// Options build (-DWEF_META; the WEF_META block at the top of wef.h). New code only: wef_bot_action and every scripted role above are
+// untouched (calibration tables and U-checks keep their meaning); the steering tail is adapted from the bots' (oracle
+// positions, the enforcer's chase: full speed, quarry exempt from the avoidance turn, turn in place when close but off
+// the cone). Each controller writes the 4 raw low-level values; the step then runs exactly as for a continuous policy.
+static const char* WEF_META_NAMES[META_N] = {"-", "EAT", "READ", "BITE*", "BITE", "ROAM"};
+
+static const float WEF_META_HOLD[ACTION_SIZE] = {-8.0f, 0.0f, -1.0f, -1.0f};  // no motion, no turn, no EOD, no bite
+
+// The nearest other fish that is not frozen (BITE_ANY) and, with marked_only, marked (BITE_MARKED); -1 if none.
+static int wef_meta_nearest_target(const Wef* env, int i, bool marked_only) {
+    const FishAgent* fish = &env->fish[i];
+    int best = -1;
+    float nearest = INFINITY;
+    for (int j = 0; j < env->num_agents; j++) {
+        const FishAgent* o = &env->fish[j];
+        if (j == i || o->freeze > 0 || (marked_only && o->mark <= 0)) {
+            continue;
+        }
+        float dx = o->pos.x - fish->pos.x;
+        float dy = o->pos.y - fish->pos.y;
+        float d2 = dx * dx + dy * dy;
+        if (d2 < nearest) {
+            nearest = d2;
+            best = j;
+        }
+    }
+    return best;
+}
+
+// Feasibility of option k for fish i at a decision point (the action mask).
+static bool wef_meta_feasible(const Wef* env, int i, int k) {
+    const FishAgent* fish = &env->fish[i];
+    switch (k) {
+    case META_EAT:
+        return !env->collapsed && env->food_active > 0 && fish->eat_ban <= 0 && fish->freeze <= 0;
+    case META_READ:
+        return env->inst_mode > 0;
+    case META_BITEM:
+        return env->inst_mode > 0 && wef_meta_nearest_target(env, i, true) >= 0;
+    case META_BITEA:
+        return wef_meta_nearest_target(env, i, false) >= 0;
+    case META_ROAM:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The action mask: a learner fish at a decision point may choose every feasible option but WAIT; a learner fish
+// with a running option, and every scripted fish (its sampled action is ignored), may choose only WAIT. Written to
+// env->meta_mask always and copied to agents[i].action_mask once the trainer has bound it (puf_init leaves it NULL;
+// pufferl's env_setup binds it before the first puf_reset, so the reset's write reaches the first step's upload).
+static void wef_meta_write_mask(Wef* env) {
+    for (int i = 0; i < env->num_agents; i++) {
+        unsigned char* m = env->meta_mask[i];
+        bool decide = env->roles[i] == 0 && env->fish[i].meta_opt == META_WAIT;
+        m[META_WAIT] = decide ? 0 : 1;
+        for (int k = 1; k < META_N; k++) {
+            m[k] = decide && wef_meta_feasible(env, i, k) ? 1 : 0;
+        }
+        if (env->agents[i].action_mask != NULL) {
+            memcpy(env->agents[i].action_mask, m, META_N);
+        }
+    }
+}
+
+// Steer fish i at target (adapted from the bots' tail): a fish within 3 cm and roughly ahead triggers the 90-degree
+// avoidance turn (a chase, chase_j >= 0, exempts its quarry and ignores the rule inside 2 x the stop radius); stop
+// inside the stop radius, turn in place when within 2 x radius but off the cone, else 0.9 aligned (chase 1.0), 0.3
+// while turning. Never bites (the BITE controllers set raw[3]).
+static void wef_meta_steer(const Wef* env, int i, Vec2 target, float radius, float cone, int chase_j, float* raw) {
+    const FishAgent* fish = &env->fish[i];
+    bool chase = chase_j >= 0;
+    float tx = target.x - fish->pos.x;
+    float ty = target.y - fish->pos.y;
+    float dist = sqrtf(tx * tx + ty * ty);
+    float err = wrap_angle(atan2f(ty, tx) - fish->orientation);
+    bool no_avoid = chase && dist < 2.0f * radius;
+    for (int j = 0; j < env->num_agents && !no_avoid; j++) {
+        if (j == i || j == chase_j) {
+            continue;
+        }
+        float dx = env->fish[j].pos.x - fish->pos.x;
+        float dy = env->fish[j].pos.y - fish->pos.y;
+        if (dx * dx + dy * dy > 9.0f) {
+            continue;
+        }
+        float bearing = wrap_angle(atan2f(dy, dx) - fish->orientation);
+        if (fabsf(bearing) < 1.22f) {
+            err = bearing > 0.0f ? -0.5f * PI_F : 0.5f * PI_F;
+            break;
+        }
+    }
+    float turn = clamp(err / fish->max_angular_velocity, -0.99f, 0.99f);
+    raw[1] = atanhf(turn);
+    raw[2] = 1.0f;
+    raw[3] = -1.0f;
+    bool aligned = fabsf(err) <= cone * 0.5f;
+    if (dist < radius || (dist < 2.0f * radius && !aligned)) {
+        raw[0] = -8.0f;
+    } else {
+        raw[0] = fabsf(err) < 0.6f ? (chase ? 8.0f : 2.2f) : -0.85f;
+    }
+}
+
+// The running option's controller for this step.
+static void wef_meta_control(Wef* env, int i, float* raw) {
+    FishAgent* fish = &env->fish[i];
+    memcpy(raw, WEF_META_HOLD, sizeof(WEF_META_HOLD));
+    switch (fish->meta_opt) {
+    case META_EAT: {
+        // the nearest active pellet (oracle, like role 2 with bot_oracle 1); eating itself is the env's contact rule
+        int best = -1;
+        float nearest = INFINITY;
+        for (int f = 0; f < env->num_food; f++) {
+            if (!env->food[f].active) {
+                continue;
+            }
+            float dx = env->food[f].pos.x - fish->pos.x;
+            float dy = env->food[f].pos.y - fish->pos.y;
+            float d2 = dx * dx + dy * dy;
+            if (d2 < nearest) {
+                nearest = d2;
+                best = f;
+            }
+        }
+        if (best >= 0) {
+            wef_meta_steer(env, i, env->food[best].pos, EATING_RADIUS_CM, EATING_ANGLE, -1, raw);
+        }
+        return;
+    }
+    case META_READ:
+        wef_meta_steer(env, i, env->inst_pos, 0.5f, EATING_ANGLE, -1, raw);
+        return;
+    case META_BITEM:
+    case META_BITEA: {
+        // chase the fish chosen at the start (role 14's chase); press bite only when it is inside the bite reach /
+        // cone (the D23 mark reach for a marked target) and the bite is off cooldown (bite_press_cost is per press)
+        int j = fish->meta_target;
+        if (j < 0) {
+            return;
+        }
+        bool marked = env->inst_mode > 0 && env->fish[j].mark > 0;
+        float r = marked ? env->mark_bite_radius_cm : BITING_RADIUS_CM;
+        float cone = marked ? env->mark_bite_cone : EATING_ANGLE;
+        wef_meta_steer(env, i, env->fish[j].pos, r, cone, j, raw);
+        if (fish->bite_cooldown <= 0 && fish->freeze <= 0 && in_forward_cone(fish, env->fish[j].pos, r, cone)) {
+            raw[3] = 1.0f;
+        }
+        return;
+    }
+    case META_ROAM: {
+        // circle the arena centre counter-clockwise (every fish the same way: no head-on meetings) on the ring of
+        // radius meta_roam_r_cm (pure pursuit of a point 0.6 rad ahead settles at r cos 0.3 = 0.96 r), at move 0.5
+        // and |turn| < 0.5: no effort penalty. Off the heading by more than 0.6 rad it turns in place, so it never
+        // cuts inwards across the patch; the avoidance turn also turns in place.
+        float cx = 0.5f * env->arena_size_x;
+        float cy = 0.5f * env->arena_size_y;
+        float a = atan2f(fish->pos.y - cy, fish->pos.x - cx) + 0.6f;
+        float tx = cx + env->meta_roam_r_cm * cosf(a) - fish->pos.x;
+        float ty = cy + env->meta_roam_r_cm * sinf(a) - fish->pos.y;
+        float err = wrap_angle(atan2f(ty, tx) - fish->orientation);
+        for (int j = 0; j < env->num_agents; j++) {
+            if (j == i) {
+                continue;
+            }
+            float dx = env->fish[j].pos.x - fish->pos.x;
+            float dy = env->fish[j].pos.y - fish->pos.y;
+            if (dx * dx + dy * dy > 9.0f) {
+                continue;
+            }
+            float bearing = wrap_angle(atan2f(dy, dx) - fish->orientation);
+            if (fabsf(bearing) < 1.22f) {
+                err = bearing > 0.0f ? -0.5f * PI_F : 0.5f * PI_F;
+                break;
+            }
+        }
+        raw[0] = fabsf(err) < 0.6f ? 0.0f : -8.0f;
+        raw[1] = atanhf(clamp(err / fish->max_angular_velocity, -0.49f, 0.49f));
+        raw[2] = 1.0f;
+        raw[3] = -1.0f;
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+// A learner fish's step: at a decision point validate the choice against the mask the policy saw (written at the
+// end of the previous step / at reset) and start the option; with an option running, WAIT continues it and any
+// other choice is ignored (meta_wait_breaks). Then the running option's controller writes the raw action.
+static void wef_meta_action(Wef* env, int i, float* raw) {
+    FishAgent* fish = &env->fish[i];
+    float a = env->agents[i].actions[0];
+    int k = a >= 0.0f && a < (float)META_N ? (int)a : -1;
+    if (fish->meta_opt == META_WAIT) {
+        if (k <= META_WAIT || !env->meta_mask[i][k]) {
+            env->meta_invalid++;  // WAIT, out of range or masked at a decision point: hold still, decide again next step
+            fish->meta_trace_opt = META_WAIT;
+            memcpy(raw, WEF_META_HOLD, sizeof(WEF_META_HOLD));
+            return;
+        }
+        env->meta_dec++;
+        env->meta_chosen[k]++;
+        if (env->inst_mode >= 1 && env->inst_mode <= 3) {
+            // deterrence counters (the Commons season): truly closed / open, and as this fish last read it
+            bool closed = wef_inst_closed(env, i);
+            env->meta_dec_closed += closed;
+            env->meta_eat_closed += closed && k == META_EAT;
+            env->meta_dec_open += !closed;
+            env->meta_eat_open += !closed && k == META_EAT;
+            if (fish->inst_val > 0.0f) {
+                env->meta_dec_known_closed++;
+                env->meta_eat_known_closed += k == META_EAT;
+            }
+        }
+        fish->meta_opt = k;
+        fish->meta_steps = 0;
+        fish->meta_eaten = 0;
+        fish->meta_target = k == META_BITEM ? wef_meta_nearest_target(env, i, true)
+            : k == META_BITEA ? wef_meta_nearest_target(env, i, false) : -1;
+    } else if (k != META_WAIT) {
+        env->meta_wait_breaks++;
+    }
+    fish->meta_steps++;
+    env->meta_steps_in[fish->meta_opt]++;
+    fish->meta_trace_opt = fish->meta_opt;
+    wef_meta_control(env, i, raw);
+}
+
+// Option termination, after the step's eats, bites, marks and countdowns: an ended option makes the fish a decision
+// point for the next step (the mask written after this sees it).
+static void wef_meta_end_step(Wef* env) {
+    for (int i = 0; i < env->num_agents; i++) {
+        FishAgent* fish = &env->fish[i];
+        if (env->roles[i] != 0 || fish->meta_opt == META_WAIT) {
+            continue;
+        }
+        fish->meta_eaten += fish->ate;
+        int j = fish->meta_target;
+        bool done = false;
+        switch (fish->meta_opt) {
+        case META_EAT:
+            done = fish->meta_eaten >= env->meta_eat_pellets || fish->eat_ban > 0 || fish->freeze > 0
+                || env->food_active == 0 || env->collapsed;
+            break;
+        case META_READ:
+            done = fish->last_read_tick == env->tick;
+            break;
+        case META_BITEM:
+            done = fish->bite_victim >= 0 || j < 0 || env->fish[j].mark <= 0 || env->fish[j].freeze > 0;
+            break;
+        case META_BITEA:
+            done = fish->bite_victim >= 0 || j < 0 || env->fish[j].freeze > 0;
+            break;
+        case META_ROAM:
+            done = fish->meta_steps >= env->meta_roam_steps;
+            break;
+        default:
+            done = true;
+            break;
+        }
+        bool timeout = !done && fish->meta_opt != META_ROAM && fish->meta_steps >= env->meta_max_steps;
+        env->meta_timeouts += timeout;
+        if (done || timeout) {
+            fish->meta_opt = META_WAIT;
+            fish->meta_target = -1;
+            fish->meta_steps = 0;
+            fish->meta_eaten = 0;
+        }
+    }
+}
+#endif
+
 // Cleanup: nearest active waste item inside the fish's clean cone, -1 if none.
 int wef_nearest_waste_in_cone(const Wef* env, const FishAgent* fish) {
     int best = -1;
@@ -2871,6 +3275,12 @@ void puf_step(Wef* env) {
             wef_bot_action(env, i, bot_raw);
             raw_action = bot_raw;
         }
+#ifdef WEF_META
+        else {
+            wef_meta_action(env, i, bot_raw);  // a learner fish: its option's controller writes the raw action
+            raw_action = bot_raw;
+        }
+#endif
         float move = 1.0f / (1.0f + expf(-(float)raw_action[0]));
         float turn = tanhf((float)raw_action[1]);
         agent->emits_eod = raw_action[2] > 0.0f;
@@ -2937,7 +3347,12 @@ void puf_step(Wef* env) {
 
         // Eat first active pellet in forward 45° cone within 2 cm (AH: first ripe bush; it
         // turns unripe in place and stays active, reward by taste)
-        if (!agent->bite_action && agent->eat_cooldown <= 0 && agent->freeze <= 0 && agent->eat_ban <= 0) {
+        bool may_eat = true;
+#ifdef WEF_META
+        // eat gate (meta_eat_gate): a learner fish eats only while its running option is EAT
+        may_eat = !env->meta_eat_gate || env->roles[i] != 0 || agent->meta_opt == META_EAT;
+#endif
+        if (may_eat && !agent->bite_action && agent->eat_cooldown <= 0 && agent->freeze <= 0 && agent->eat_ban <= 0) {
             for (int f = 0; f < env->num_food; f++) {
                 if (!env->food[f].active) {
                     continue;
@@ -3796,6 +4211,9 @@ void puf_step(Wef* env) {
         env->return_by[i] += env->agents[i].rewards[0];
         env->raw_return_sum += env->agents[i].rewards[0];
     }
+#ifdef WEF_META
+    wef_meta_end_step(env);  // option termination after this step's eats, bites, marks and countdowns
+#endif
 
     if (env->trace_file != NULL) {
         wef_trace_step(env);
@@ -3836,6 +4254,9 @@ void puf_step(Wef* env) {
         env->episode_return += env->agents[i].rewards[0];
     }
 
+#ifdef WEF_META
+    wef_meta_write_mask(env);  // the next step's mask (an episode end below rewrites it at the reset)
+#endif
     compute_observations(env);
 
     if (env->tick >= env->cur_episode_length
@@ -4039,6 +4460,28 @@ void puf_step(Wef* env) {
                 env->log.enf_gini_n += (float)m.gini_defined;
             }
         }
+#ifdef WEF_META
+        env->log.meta_dec += (float)env->meta_dec;
+        env->log.meta_eat += (float)env->meta_chosen[META_EAT];
+        env->log.meta_read += (float)env->meta_chosen[META_READ];
+        env->log.meta_bitem += (float)env->meta_chosen[META_BITEM];
+        env->log.meta_bitea += (float)env->meta_chosen[META_BITEA];
+        env->log.meta_roam += (float)env->meta_chosen[META_ROAM];
+        env->log.meta_steps_eat += (float)env->meta_steps_in[META_EAT];
+        env->log.meta_steps_read += (float)env->meta_steps_in[META_READ];
+        env->log.meta_steps_bitem += (float)env->meta_steps_in[META_BITEM];
+        env->log.meta_steps_bitea += (float)env->meta_steps_in[META_BITEA];
+        env->log.meta_steps_roam += (float)env->meta_steps_in[META_ROAM];
+        env->log.meta_timeouts += (float)env->meta_timeouts;
+        env->log.meta_invalid += (float)env->meta_invalid;
+        env->log.meta_wait_breaks += (float)env->meta_wait_breaks;
+        env->log.meta_dec_closed += (float)env->meta_dec_closed;
+        env->log.meta_eat_closed += (float)env->meta_eat_closed;
+        env->log.meta_dec_open += (float)env->meta_dec_open;
+        env->log.meta_eat_open += (float)env->meta_eat_open;
+        env->log.meta_dec_known_closed += (float)env->meta_dec_known_closed;
+        env->log.meta_eat_known_closed += (float)env->meta_eat_known_closed;
+#endif
         env->log.n += 1.0f;
         puf_reset(env);
         for (int i = 0; i < env->num_agents; i++) {
@@ -4535,9 +4978,16 @@ void puf_render(Wef* env) {
             DrawText(env->allelo ? TextFormat("Q%c", agent->taste == 0 ? 'A' : 'B') : "Q",
                 (int)(center.x + radius + 4), (int)(center.y - radius), 16, gold);
         } else {
+#ifdef WEF_META
+            // options build: the slot number and the option this fish executed this step
+            DrawText(TextFormat("%d %s", i + 1, WEF_META_NAMES[agent->meta_trace_opt]),
+                (int)(center.x + radius + 4), (int)(center.y - radius), 16,
+                WEF_COLOR_TEXT);
+#else
             DrawText(env->allelo ? TextFormat("%d%c", i + 1, agent->taste == 0 ? 'A' : 'B') : TextFormat("%d", i + 1),
                 (int)(center.x + radius + 4), (int)(center.y - radius), 16,
                 WEF_COLOR_TEXT);
+#endif
         }
         if (!env->inst_obs && (env->client->bites_given[i] > 0 || env->client->bites_taken[i] > 0)) {
             // (institution builds: the per-fish tally is dropped to keep the arena legible; the HUD counts zaps)
@@ -4695,6 +5145,9 @@ static const char* WEF_ENV_KEYS[] = {
     "inst_mark_until_zap", "inst_mark_clear_on_zap", "inst_mark_wrongful", "bot_respond_zaps", "inst_auto_freeze", "inst_auto_eat_ban", "inst_auto_eat_ban_p",
     "inst_auto_freeze_scope", "inst_duty_cm", "inst_duty_steps", "inst_grace_steps", "inst_duty_mode",
     "inst_mark_contrast", "mark_bite_radius_cm", "mark_bite_angle_deg",   // D23
+    "inst_pos_x_cm", "inst_pos_y_cm",   // fixed beacon position (2026-11-20)
+    // options build (-DWEF_META; the WEF_META block at the top of wef.h): accepted by every build, inert outside -DWEF_META
+    "meta_options", "meta_eat_pellets", "meta_max_steps", "meta_roam_steps", "meta_roam_r_cm", "meta_eat_gate",
 };
 
 static void wef_check_keys(Dict* kwargs) {
@@ -4839,6 +5292,14 @@ void puf_init(Env* env, Dict* kwargs) {
     env->mark_freeze_steps = wef_cfg(kwargs, "mark_freeze_steps", -1);
     env->mark_eat_ban_steps = wef_cfg(kwargs, "mark_eat_ban_steps", -1);
     env->inst_pos_random = wef_cfg(kwargs, "inst_pos_random", 0);
+    env->inst_pos_x_cm = wef_cfg(kwargs, "inst_pos_x_cm", -1.0);
+    env->inst_pos_y_cm = wef_cfg(kwargs, "inst_pos_y_cm", -1.0);
+    env->meta_options = wef_cfg(kwargs, "meta_options", 0);
+    env->meta_eat_pellets = wef_cfg(kwargs, "meta_eat_pellets", 1);
+    env->meta_max_steps = wef_cfg(kwargs, "meta_max_steps", 64);
+    env->meta_roam_steps = wef_cfg(kwargs, "meta_roam_steps", 16);
+    env->meta_roam_r_cm = wef_cfg(kwargs, "meta_roam_r_cm", 15.0);
+    env->meta_eat_gate = wef_cfg(kwargs, "meta_eat_gate", 1);
     env->inst_read_cm = wef_cfg(kwargs, "inst_read_cm", 5.0);
     env->inst_obj_radius_cm = wef_cfg(kwargs, "inst_obj_radius_cm", 0.5);
     env->inst_contrast = wef_cfg(kwargs, "inst_contrast", 1.0);
@@ -4949,6 +5410,24 @@ void puf_init(Env* env, Dict* kwargs) {
     assert(env->inst_mark_steps >= 0 && env->mark_zap_cooldown >= -1 && env->mark_freeze_steps >= -1
         && env->inst_read_cm > 0.0f && env->inst_obj_radius_cm > 0.0f);
     assert((env->inst_pos_random == 0 || env->inst_pos_random == 1) && (env->inst_latch == 0 || env->inst_latch == 1));
+    assert(((env->inst_pos_x_cm == -1.0f && env->inst_pos_y_cm == -1.0f)
+            || (env->inst_pos_x_cm >= 0.0f && env->inst_pos_x_cm <= env->min_arena_size_x
+                && env->inst_pos_y_cm >= 0.0f && env->inst_pos_y_cm <= env->min_arena_size_y && !env->inst_pos_random))
+        && "inst_pos_x_cm / inst_pos_y_cm: both -1 (centre / inst_pos_random) or both inside the smallest arena, with inst_pos_random 0");
+    assert(env->meta_eat_pellets >= 1 && env->meta_max_steps >= 1 && env->meta_roam_steps >= 1 && env->meta_roam_r_cm > 0.0f
+        && (env->meta_eat_gate == 0 || env->meta_eat_gate == 1)
+        && "meta_eat_pellets / meta_max_steps / meta_roam_steps >= 1, meta_roam_r_cm > 0, meta_eat_gate 0 / 1");
+#ifdef WEF_META
+    assert(env->meta_options == 1 && "the -DWEF_META build is the options env: pass meta_options 1 (scripts/inst_commons_meta.args)");
+    assert(!env->allelo && !env->cleanup && "-DWEF_META: the option controllers are written for the Commons (allelo 0, cleanup 0)");
+    assert(2.0f * (env->meta_roam_r_cm + BODY_RADIUS_CM + 1.0f) <= fminf(env->min_arena_size_x, env->min_arena_size_y)
+        && "-DWEF_META: the ROAM ring (meta_roam_r_cm + body + 1 cm) must fit in the smallest arena");
+    assert((env->food_distribution != FOOD_PATCHY || env->patch_layout != 2
+            || env->meta_roam_r_cm > env->patch_radius_cm + env->patch_radius_std_cm + EATING_RADIUS_CM + BODY_RADIUS_CM)
+        && "-DWEF_META: the ROAM ring must clear the centred patch (patch_radius + patch_radius_std + eating radius + body)");
+#else
+    assert(env->meta_options == 0 && "meta_options 1 needs the options build (NVCC_EXTRA / CFLAGS -DMAX_AGENTS=8 -DWEF_INST -DWEF_META)");
+#endif
     assert((env->inst_mask_marks == 0 || env->inst_mask_marks == 1) && "inst_mask_marks: 0 / 1");
     assert((env->mark_frozen_biteable == 0 || (env->mark_frozen_biteable == 1 && env->inst_mode > 0)) && "mark_frozen_biteable: 0 / 1, needs inst_mode > 0");
     assert(env->act_slow_steps >= 0 && env->act_slow_gain > 0.0f && env->act_slow_gain <= 1.0f && "act_slow_steps >= 0, act_slow_gain in (0, 1]");
@@ -5186,6 +5665,36 @@ static void wef_log_inst_tail(Log* log, Dict* out) {
     dict_set(out, "near_frac", log->near_frac);
 }
 
+#ifdef WEF_META
+// Options build (the WEF_META block at the top of wef.h): the options chosen go on the dashboard (after the institution keys), the
+// rest into the [metrics] series. Per-episode totals over the learner fish.
+static void wef_log_meta(Log* log, Dict* out) {
+    dict_set(out, "meta_dec", log->meta_dec);
+    dict_set(out, "meta_eat", log->meta_eat);
+    dict_set(out, "meta_read", log->meta_read);
+    dict_set(out, "meta_bitem", log->meta_bitem);
+    dict_set(out, "meta_bitea", log->meta_bitea);
+    dict_set(out, "meta_roam", log->meta_roam);
+    dict_set(out, "meta_eat_closed", log->meta_eat_closed);
+    dict_set(out, "meta_eat_open", log->meta_eat_open);
+}
+
+static void wef_log_meta_tail(Log* log, Dict* out) {
+    dict_set(out, "meta_steps_eat", log->meta_steps_eat);
+    dict_set(out, "meta_steps_read", log->meta_steps_read);
+    dict_set(out, "meta_steps_bitem", log->meta_steps_bitem);
+    dict_set(out, "meta_steps_bitea", log->meta_steps_bitea);
+    dict_set(out, "meta_steps_roam", log->meta_steps_roam);
+    dict_set(out, "meta_timeouts", log->meta_timeouts);
+    dict_set(out, "meta_invalid", log->meta_invalid);
+    dict_set(out, "meta_wait_breaks", log->meta_wait_breaks);
+    dict_set(out, "meta_dec_closed", log->meta_dec_closed);
+    dict_set(out, "meta_dec_open", log->meta_dec_open);
+    dict_set(out, "meta_dec_known_closed", log->meta_dec_known_closed);
+    dict_set(out, "meta_eat_known_closed", log->meta_eat_known_closed);
+}
+#endif
+
 // The rest of the AH keys (off the 30-key live dashboard in the AH build, in the [metrics] series).
 static void wef_log_allelo_tail(Log* log, Dict* out) {
     dict_set(out, "mono_final", log->mono_final);
@@ -5275,6 +5784,10 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "policy_1_score", log->policy_1_score);
     dict_set(out, "draw_rate", log->draw_rate);
     dict_set(out, "n", log->n);
+#ifdef WEF_META
+    wef_log_meta(log, out);
+    wef_log_meta_tail(log, out);
+#endif
 }
 #else
 void puf_log(Log* log, Dict* out) {
@@ -5291,6 +5804,9 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "food_selfish_share", log->food_selfish_share);
 #ifdef WEF_INST
     wef_log_inst(log, out);  // 4-fish institution build (Commons arms): on the dashboard
+#endif
+#ifdef WEF_META
+    wef_log_meta(log, out);
 #endif
     dict_set(out, "waste_frac", log->waste_frac);
     dict_set(out, "frac_open", log->frac_open);
@@ -5323,5 +5839,8 @@ void puf_log(Log* log, Dict* out) {
     wef_log_inst(log, out);
 #endif
     wef_log_inst_tail(log, out);
+#ifdef WEF_META
+    wef_log_meta_tail(log, out);
+#endif
 }
 #endif
