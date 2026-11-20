@@ -34,7 +34,8 @@ typedef float obs_t;
 //   chase), press bite only with the target in the bite reach / cone and the bite off cooldown, end on any landed bite
 //   or when the target is frozen (BITE_MARKED: or unmarked); EAT / READ / BITEs time out after meta_max_steps
 //   (meta_timeouts); ROAM circles the arena centre on the ring meta_roam_r_cm at move 0.5 / |turn| < 0.5 (no effort
-//   penalty) for meta_roam_steps. Termination is judged after the step's eats, bites, marks and countdowns.
+//   penalty) for meta_roam_steps. Termination is judged after the step's eats, bites, marks and countdowns. A jam
+//   (8 steps without progress) sends an EAT / READ / BITE fish on an 8-step random heading (the bots' escape).
 //   Eat gate (meta_eat_gate 1): a learner fish eats only while its option is EAT.
 //   Mask: env->meta_mask (always written) is copied to agents[i].action_mask when the trainer has bound it, at reset
 //   and at the end of every step. Log: the meta_* keys (wef_log_meta). Trace: V4 planted_slot = the executed option.
@@ -280,6 +281,10 @@ typedef struct FishAgent {
     int meta_target;       // BITE_MARKED / BITE_ANY: the fish chosen at the option's start, -1 none
     int meta_eaten;        // EAT: pellets eaten since the option started
     int meta_trace_opt;    // trace / render: the option this fish executed this step (0 = none: an invalid choice, held still)
+    int meta_stall;        // consecutive steps without progress (no displacement, not eating, no cooldown or freeze; a collision reverts the move)
+    Vec2 meta_last;        // position at the end of the previous step
+    int meta_escape;       // steps left of a random-heading escape (EAT / READ / BITE controllers; the bots' stall escape)
+    float meta_escape_turn;
 #endif
 } FishAgent;
 
@@ -2903,7 +2908,7 @@ static void wef_meta_steer(const Wef* env, int i, Vec2 target, float radius, flo
     float ty = target.y - fish->pos.y;
     float dist = sqrtf(tx * tx + ty * ty);
     float err = wrap_angle(atan2f(ty, tx) - fish->orientation);
-    bool no_avoid = chase && dist < 2.0f * radius;
+    bool no_avoid = dist < 2.0f * radius;  // inside 2 x the stop radius the fish only turns in place or closes in
     for (int j = 0; j < env->num_agents && !no_avoid; j++) {
         if (j == i || j == chase_j) {
             continue;
@@ -2915,7 +2920,9 @@ static void wef_meta_steer(const Wef* env, int i, Vec2 target, float radius, flo
         }
         float bearing = wrap_angle(atan2f(dy, dx) - fish->orientation);
         if (fabsf(bearing) < 1.22f) {
-            err = bearing > 0.0f ? -0.5f * PI_F : 0.5f * PI_F;
+            // turn away from it; nearly dead ahead (two-way traffic between the patch and the beacon) always to the
+            // right, so two fish meeting head-on both swerve the same way and pass instead of mirroring each other
+            err = fabsf(bearing) < 0.35f || bearing > 0.0f ? -0.5f * PI_F : 0.5f * PI_F;
             break;
         }
     }
@@ -2931,10 +2938,32 @@ static void wef_meta_steer(const Wef* env, int i, Vec2 target, float radius, flo
     }
 }
 
+// Jam escape of the steering controllers (adapted from the bots' stall escape): the avoidance turn and the reverted
+// move of a collision can pin fish heading for one point (8 fish at the 5 cm beacon in a corner did, every step, for
+// the whole episode); after WEF_META_STALL consecutive steps without progress the fish swims a random heading for
+// WEF_META_ESCAPE steps, then steers again. ROAM never escapes (its moves stay at 0.5 and it turns in place).
+#define WEF_META_STALL 8
+#define WEF_META_ESCAPE 8
+
 // The running option's controller for this step.
 static void wef_meta_control(Wef* env, int i, float* raw) {
     FishAgent* fish = &env->fish[i];
     memcpy(raw, WEF_META_HOLD, sizeof(WEF_META_HOLD));
+    if (fish->meta_opt != META_ROAM) {
+        if (fish->meta_stall >= WEF_META_STALL && fish->meta_escape == 0) {
+            fish->meta_escape = WEF_META_ESCAPE;
+            fish->meta_escape_turn = random_uniform(env, -1.0f, 1.0f);
+            fish->meta_stall = 0;
+        }
+        if (fish->meta_escape > 0) {
+            fish->meta_escape--;
+            raw[0] = 2.2f;
+            raw[1] = fish->meta_escape_turn;
+            raw[2] = 1.0f;
+            raw[3] = -1.0f;
+            return;
+        }
+    }
     switch (fish->meta_opt) {
     case META_EAT: {
         // the nearest active pellet (oracle, like role 2 with bot_oracle 1); eating itself is the env's contact rule
@@ -3045,6 +3074,8 @@ static void wef_meta_action(Wef* env, int i, float* raw) {
         fish->meta_opt = k;
         fish->meta_steps = 0;
         fish->meta_eaten = 0;
+        fish->meta_escape = 0;  // a new option steers afresh
+        fish->meta_stall = 0;
         fish->meta_target = k == META_BITEM ? wef_meta_nearest_target(env, i, true)
             : k == META_BITEA ? wef_meta_nearest_target(env, i, false) : -1;
     } else if (k != META_WAIT) {
@@ -3061,7 +3092,14 @@ static void wef_meta_action(Wef* env, int i, float* raw) {
 static void wef_meta_end_step(Wef* env) {
     for (int i = 0; i < env->num_agents; i++) {
         FishAgent* fish = &env->fish[i];
-        if (env->roles[i] != 0 || fish->meta_opt == META_WAIT) {
+        if (env->roles[i] != 0) {
+            continue;
+        }
+        float moved = fabsf(fish->pos.x - fish->meta_last.x) + fabsf(fish->pos.y - fish->meta_last.y);
+        fish->meta_last = fish->pos;
+        bool idle = moved < 0.05f && !fish->ate && fish->eat_cooldown <= 0 && fish->freeze <= 0;
+        fish->meta_stall = idle ? fish->meta_stall + 1 : 0;
+        if (fish->meta_opt == META_WAIT) {
             continue;
         }
         fish->meta_eaten += fish->ate;

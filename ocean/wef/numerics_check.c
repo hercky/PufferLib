@@ -21,6 +21,9 @@
 #include <string.h>
 
 #include "wef.h"
+#ifdef WEF_META
+#error "this harness drives the 4 raw action floats per fish; the options build (-DWEF_META, one option index per fish) is not supported (use wef_test.c)"
+#endif
 
 #define FNV_OFFSET 14695981039346656037ULL
 #define FNV_PRIME 1099511628211ULL

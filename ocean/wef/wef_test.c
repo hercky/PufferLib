@@ -364,7 +364,8 @@ static int meta_strategy(const Env* env, int i, int s) {
         if (m[META_BITEM]) {
             return META_BITEM;
         }
-        // fall through: the complier
+        // else the complier below
+        // fall through
     case 2:
         if (m[META_READ] && (!f->informed || env->tick - f->last_read_tick > env->bot_shift_steps)) {
             return META_READ;

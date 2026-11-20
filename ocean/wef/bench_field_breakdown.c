@@ -17,6 +17,9 @@
 #include <x86intrin.h>
 
 #include "wef.h"
+#ifdef WEF_META
+#error "this harness drives the 4 raw action floats per fish; the options build (-DWEF_META, one option index per fish) is not supported (use wef_test.c)"
+#endif
 
 #define TOTAL_FISH 2048
 #define NUM_FISH 4

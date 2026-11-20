@@ -22,6 +22,9 @@
 #include <time.h>
 
 #include "wef.h"
+#ifdef WEF_META
+#error "this harness drives the 4 raw action floats per fish; the options build (-DWEF_META, one option index per fish) is not supported (use wef_test.c)"
+#endif
 
 #define DEFAULT_TOTAL_FISH 8192
 #define DEFAULT_NUM_FISH 4
