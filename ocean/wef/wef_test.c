@@ -5811,6 +5811,56 @@ static void test_meta_stop_on_close(void) {
     }
 }
 
+// U71: inst_mode 0 (no rule) feeds the deterrence counters from the shadow season (the stock hysteresis the rule would
+// use): a decision at full stock counts as open, a decision after the stock is cut below 0.5 K counts as closed; and the
+// options build's 30-key dashboard carries the denominators (evals print only the dashboard).
+static void test_meta_shadow(void) {
+    printf("-- META U71: shadow season under inst_mode 0, dashboard keys\n");
+    Dict kw = {0};
+    meta_kw(&kw);
+    dict_set(&kw, "inst_mode", 0);
+    dict_set(&kw, "inst_mark_steps", 0);
+    Harness h = meta_make(&kw, "0,17,17,17");
+    Env* env = h.env;
+    meta_park(env, 1);
+    place_fish(env, 0, 36.0f, 20.0f, 1.6f);
+    wef_meta_write_mask(env);
+    meta_all_wait(&h);
+    set_option(&h, 0, META_ROAM);
+    puf_step(env);                                   // decision 1 at full stock: open
+    set_option(&h, 0, META_WAIT);
+    for (int f = 0; f < 40; f++) {                   // cut the stock to 24 of 64 (< 0.5 K)
+        env->food[f].active = false;
+    }
+    env->food_active = 24;
+    int guard = 0;
+    while (env->fish[0].meta_opt != META_WAIT && guard++ < 64) {
+        puf_step(env);
+    }
+    set_option(&h, 0, META_EAT);
+    puf_step(env);                                   // decision 2 below 0.5 K: closed (shadow)
+    CHECK(env->meta_shadow_closed == 1 && env->meta_dec_open == 1 && env->meta_dec_closed == 1 && env->meta_eat_closed == 1
+        && env->meta_dec_closed_eatable == 1 && env->violations == 0,
+        "inst_mode 0: shadow season closed (%d); decisions open %d / closed %d, EAT while would-be closed %d, no violation",
+        env->meta_shadow_closed, env->meta_dec_open, env->meta_dec_closed, env->meta_eat_closed);
+    Dict out = {0};
+    puf_log(&env->log, &out);
+    int pos_closed = -1, pos_open = -1, pos_invalid = -1, pos_aborts = -1;
+    for (int k = 0; k < out.size; k++) {
+        const char* key = out.items[k].key;
+        if (strcmp(key, "meta_dec_closed_eatable") == 0) pos_closed = k;
+        if (strcmp(key, "meta_dec_open_eatable") == 0) pos_open = k;
+        if (strcmp(key, "meta_invalid") == 0) pos_invalid = k;
+        if (strcmp(key, "meta_eat_aborts") == 0) pos_aborts = k;
+    }
+    CHECK(pos_closed >= 0 && pos_closed < 30 && pos_open >= 0 && pos_open < 30 && pos_invalid >= 0 && pos_invalid < 30 && pos_aborts >= 0 && pos_aborts < 30,
+        "dashboard (first 30 keys): meta_dec_closed_eatable %d, meta_dec_open_eatable %d, meta_invalid %d, meta_eat_aborts %d",
+        pos_closed, pos_open, pos_invalid, pos_aborts);
+    dict_clear(&out);
+    destroy(&h);
+    dict_clear(&kw);
+}
+
 static void test_meta(void) {
     test_meta_bite_moving();
     test_meta_behind();
@@ -5825,6 +5875,7 @@ static void test_meta(void) {
     test_meta_log();
     test_meta_trace_and_episodes();
     test_meta_stop_on_close();
+    test_meta_shadow();
 }
 #endif
 

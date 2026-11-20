@@ -990,6 +990,7 @@ struct Env {
     int meta_steps_in[META_N];
     int meta_timeouts;
     int meta_eat_aborts;
+    int meta_shadow_closed;     // inst_mode 0: the season the rule WOULD show (same stock hysteresis), for the deterrence counters only
     int meta_invalid;
     int meta_wait_breaks;
     int meta_dec_closed;
@@ -1996,6 +1997,7 @@ void puf_reset(Wef* env) {
     }
     env->meta_timeouts = 0;
     env->meta_eat_aborts = 0;
+    env->meta_shadow_closed = 0;
     env->meta_invalid = 0;
     env->meta_wait_breaks = 0;
     env->meta_dec_closed = 0;
@@ -3327,9 +3329,11 @@ static void wef_meta_action(Wef* env, int i, float* raw) {
         }
         env->meta_dec++;
         env->meta_chosen[k]++;
-        if (env->inst_mode >= 1 && env->inst_mode <= 3) {
-            // deterrence counters (the Commons season): truly closed / open, and as this fish last read it
-            bool closed = wef_inst_closed(env, i);
+        if (env->inst_mode <= 3) {
+            // deterrence counters (the Commons season): truly closed / open, and as this fish last read it. Under
+            // inst_mode 0 (no rule) "closed" is the shadow season, the state the rule would show at this stock, so the
+            // no-rule arms give the baseline P(EAT | would-be closed); nothing in the dynamics reads it.
+            bool closed = env->inst_mode == 0 ? env->meta_shadow_closed != 0 : wef_inst_closed(env, i);
             env->meta_dec_closed += closed;
             env->meta_eat_closed += closed && k == META_EAT;
             env->meta_dec_open += !closed;
@@ -3369,6 +3373,14 @@ static void wef_meta_action(Wef* env, int i, float* raw) {
 // Option termination, after the step's eats, bites, marks and countdowns: an ended option makes the fish a decision
 // point for the next step (the mask written after this sees it).
 static void wef_meta_end_step(Wef* env) {
+    if (env->inst_mode == 0) {  // the shadow season: the stock beacon's hysteresis, read by the counters only
+        float stock = (float)env->food_active, k = (float)env->num_food;
+        if (!env->meta_shadow_closed && stock <= env->inst_theta * k) {
+            env->meta_shadow_closed = 1;
+        } else if (env->meta_shadow_closed && stock > (env->inst_theta + env->inst_hyst) * k) {
+            env->meta_shadow_closed = 0;
+        }
+    }
     for (int i = 0; i < env->num_agents; i++) {
         FishAgent* fish = &env->fish[i];
         if (env->roles[i] != 0) {
@@ -6036,15 +6048,11 @@ static void wef_log_meta_tail(Log* log, Dict* out) {
     dict_set(out, "meta_steps_bitea", log->meta_steps_bitea);
     dict_set(out, "meta_steps_roam", log->meta_steps_roam);
     dict_set(out, "meta_timeouts", log->meta_timeouts);
-    dict_set(out, "meta_eat_aborts", log->meta_eat_aborts);
-    dict_set(out, "meta_invalid", log->meta_invalid);
     dict_set(out, "meta_wait_breaks", log->meta_wait_breaks);
     dict_set(out, "meta_dec_closed", log->meta_dec_closed);
     dict_set(out, "meta_dec_open", log->meta_dec_open);
     dict_set(out, "meta_dec_known_closed", log->meta_dec_known_closed);
     dict_set(out, "meta_eat_known_closed", log->meta_eat_known_closed);
-    dict_set(out, "meta_dec_closed_eatable", log->meta_dec_closed_eatable);
-    dict_set(out, "meta_dec_open_eatable", log->meta_dec_open_eatable);
     dict_set(out, "meta_dec_known_closed_eatable", log->meta_dec_known_closed_eatable);
     dict_set(out, "meta_bite_offtarget", log->meta_bite_offtarget);
     dict_set(out, "meta_timeouts_eat", log->meta_timeouts_eat);
@@ -6144,6 +6152,10 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "n", log->n);
 #ifdef WEF_META
     wef_log_meta(log, out);
+    dict_set(out, "meta_dec_closed_eatable", log->meta_dec_closed_eatable);
+    dict_set(out, "meta_dec_open_eatable", log->meta_dec_open_eatable);
+    dict_set(out, "meta_invalid", log->meta_invalid);
+    dict_set(out, "meta_eat_aborts", log->meta_eat_aborts);
     wef_log_meta_tail(log, out);
 #endif
 }
@@ -6164,7 +6176,15 @@ void puf_log(Log* log, Dict* out) {
     wef_log_inst(log, out);  // 4-fish institution build (Commons arms): on the dashboard
 #endif
 #ifdef WEF_META
+    // options build: the denominators of P(EAT | closed / open, EAT available), invalid choices, stopped EATs, the
+    // ban share and collapse inside the 30-key dashboard (evals print only the dashboard); Commons-dead keys after
     wef_log_meta(log, out);
+    dict_set(out, "meta_dec_closed_eatable", log->meta_dec_closed_eatable);
+    dict_set(out, "meta_dec_open_eatable", log->meta_dec_open_eatable);
+    dict_set(out, "meta_invalid", log->meta_invalid);
+    dict_set(out, "meta_eat_aborts", log->meta_eat_aborts);
+    dict_set(out, "banned_frac", log->banned_frac);
+    dict_set(out, "collapsed", log->collapsed);
 #endif
     dict_set(out, "waste_frac", log->waste_frac);
     dict_set(out, "frac_open", log->frac_open);
@@ -6183,8 +6203,10 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "eater_frac", log->eater_frac);
     dict_set(out, "defector_frac", log->defector_frac);
     dict_set(out, "frozen_frac", log->frozen_frac);
+#ifndef WEF_META
     dict_set(out, "banned_frac", log->banned_frac);
     dict_set(out, "collapsed", log->collapsed);
+#endif
     dict_set(out, "survival_frac", log->survival_frac);
     dict_set(out, "policy_0_score", log->policy_0_score);
     dict_set(out, "policy_1_score", log->policy_1_score);
